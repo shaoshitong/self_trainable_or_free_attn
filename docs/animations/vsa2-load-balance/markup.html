@@ -1,0 +1,50 @@
+<div class="vlb">
+  <h3>VSA2 负载均衡 · 16 对一对不删</h3>
+  <div class="vlb-controls">
+    <div class="vlb-group" role="group" aria-label="场景">
+      <button class="btn" type="button" data-scene="uniform" aria-pressed="false">均匀</button>
+      <button class="btn" type="button" data-scene="hotQ" aria-pressed="true">热 Q</button>
+      <button class="btn" type="button" data-scene="hotKV" aria-pressed="false">热 KV</button>
+      <button class="btn" type="button" data-scene="both" aria-pressed="false">都热</button>
+    </div>
+    <div class="vlb-group" role="group" aria-label="方向">
+      <button class="btn" type="button" data-dir="F" aria-pressed="true">前向 F</button>
+      <button class="btn" type="button" data-dir="B" aria-pressed="false">反向 B</button>
+    </div>
+  </div>
+  <div class="vlb-transport">
+    <button class="btn btn-primary" type="button" data-act="play">播放</button>
+    <button class="btn" type="button" data-act="step">单步</button>
+    <label class="vlb-progress">
+      <span class="text-small tabular-nums" data-out="time">t = 0</span>
+      <input class="form-range" type="range" min="0" max="8" step="0.05" value="0" data-act="seek" aria-label="时间进度（教学时间单位）">
+    </label>
+  </div>
+  <div class="vlb-pipe" data-slot="pipe"></div>
+  <div class="vlb-main">
+    <div class="vlb-panel">
+      <div class="vlb-head">
+        <span>选中对矩阵</span>
+        <span class="vlb-group" role="group" aria-label="矩阵跟随的时间线">
+          <button class="btn" type="button" data-follow="orig" aria-pressed="false">跟随原始</button>
+          <button class="btn" type="button" data-follow="bal" aria-pressed="true">跟随 chunk</button>
+        </span>
+      </div>
+      <div data-slot="matrix"></div>
+    </div>
+    <div class="vlb-panel">
+      <div data-slot="router"></div>
+      <div data-slot="math"></div>
+    </div>
+  </div>
+  <div data-slot="timeline"></div>
+  <p class="text-small vlb-note" data-slot="bnote" hidden></p>
+  <div class="vlb-legend text-small" aria-hidden="true">
+    <span><i class="vlb-swatch vlb-c1"></i>普通任务</span>
+    <span><i class="vlb-swatch vlb-c2"></i>热列表任务</span>
+    <span><i class="vlb-swatch vlb-c3"></i>规划/合并·Σ 开销</span>
+    <span><i class="vlb-swatch vlb-idle"></i>空闲</span>
+  </div>
+  <p class="text-small vlb-note">教学时间单位，不是 ms，也不是 H100 benchmark。每对代价 = 1、4 个工人、chunk = 2、开销 0.5 都是简化；toy token 与任务，不代表 CUDA tile 尺寸，也不是模型质量结论。</p>
+  <div class="vlb-sr" aria-live="polite" data-slot="live"></div>
+</div>

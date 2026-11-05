@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+*.wav
+*.mp4
+third_party/ThunderKittens/
+*.so
