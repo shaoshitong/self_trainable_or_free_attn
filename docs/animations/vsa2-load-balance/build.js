@@ -9,7 +9,8 @@ const outDir = path.join(here, "..");
 const read = (name) => fs.readFileSync(path.join(here, name), "utf8");
 
 function generate() {
-  const code = (read("model.js") + "\n" + read("view.js")).split("\n").filter((l) => !l.includes("// node-only")).join("\n").trim();
+  const measured = JSON.stringify(JSON.parse(read("h100-results.json")));
+  const code = (read("model.js") + "\nconst H100_RESULTS = " + measured + ";\n" + read("view.js")).split("\n").filter((l) => !l.includes("// node-only")).join("\n").trim();
   const inner = "<style>\n" + read("style.css").trim() + "\n</style>\n" + read("markup.html").trim();
   if (/[`\\]|\$\{/.test(inner)) throw new Error("markup and style must stay free of backticks and backslashes");
   if (/<\/script/i.test(code)) throw new Error("script must not contain a closing script tag");

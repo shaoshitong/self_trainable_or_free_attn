@@ -7,7 +7,7 @@ function mount(root) {
   model.SCENES.forEach((s) => { views[s.id] = model.sceneView(s.id); numerics[s.id] = model.numericExample(s.id); });
   const state = { scene: "hotQ", dir: "F", follow: "bal", t: 0, playing: false };
   const slot = (name) => root.querySelector('[data-slot="' + name + '"]');
-  const slots = { pipe: slot("pipe"), matrix: slot("matrix"), router: slot("router"), math: slot("math"), timeline: slot("timeline"), bnote: slot("bnote"), live: slot("live") };
+  const slots = { pipe: slot("pipe"), matrix: slot("matrix"), router: slot("router"), math: slot("math"), timeline: slot("timeline"), bnote: slot("bnote"), live: slot("live"), measured: slot("measured") };
   const playBtn = root.querySelector('[data-act="play"]');
   const seek = root.querySelector('[data-act="seek"]');
   const timeOut = root.querySelector('[data-out="time"]');
@@ -34,6 +34,30 @@ function mount(root) {
   const chunkName = () => (routedSplit() ? "均衡" : "强制 chunk 反例");
   const endTime = () => Math.max(timelines().orig.makespan, timelines().bal.makespan);
   const allEvents = () => [...new Set([...timelines().orig.events, ...timelines().bal.events])].sort((a, b) => a - b);
+
+  // Historical full-operator measurements, never used to set the toy timeline's timing.
+  function renderMeasured() {
+    const names = { uniform: "均匀对照", hotq_extreme: "hot-Q · 大量重行", straggler_q: "hot-Q · 稀有长行", hotkv: "hot-KV", hotqkv: "hot-Q + hot-KV" };
+    function measuredCase(c, armName) {
+      const baseline = c.arms.find((a) => a.arm === "tk");
+      const arm = c.arms.find((a) => a.arm === armName);
+      const method = armName === "tk_auto_c64" ? "Auto C64" : "Manual C64 双向";
+      const diagnostic = c.shape_role === "diagnostic" ? " · 诊断 H2/K4，非模型配置" : "";
+      const padded = c.L !== c.tokens ? "，补齐 L=" + c.L.toLocaleString("en-US") : "";
+      const plan = "拆分列表 F/B = " + arm.actual_plan.fwd.split_rows + "/" + arm.actual_plan.bwd_kv.split_rows;
+      const phases = [["fwd", "FWD · 前向"], ["bwd", "BWD · 反向"], ["fwd_bwd", "F+B · 合计"]].map(([key, label]) => {
+        const oldMs = baseline.median_ms[key], newMs = arm.median_ms[key];
+        const pct = 100 * (1 - newMs / oldMs);
+        const change = (pct >= 0 ? "快 " : "慢 ") + Math.abs(pct).toFixed(1) + "%";
+        return '<div data-measured-phase="' + key + '"><dt class="text-small">' + label + '</dt><dd class="tabular-nums"><span class="vlb-measured-times"><span>' + oldMs.toFixed(3) + ' →</span><span>' + newMs.toFixed(3) + ' ms</span></span><span data-measured-change>' + change + "</span></dd></div>";
+      }).join("");
+      return '<section class="vlb-measured-case" data-measured-case="' + c.id + '" data-measured-arm="' + armName + '"><div>' + names[c.case] + " · L=" + c.tokens.toLocaleString("en-US") + diagnostic + padded + '</div><div class="text-small vlb-small">' + method + " · " + plan + '</div><dl class="vlb-measured-phases">' + phases + "</dl></section>";
+    }
+    const anchors = ["long/220000/straggler_q", "short/32768/hotq_extreme", "short/32768/hotkv", "long/220000/hotkv"];
+    const primary = anchors.map((id) => measuredCase(H100_RESULTS.cases.find((c) => c.id === id), "tk_auto_c64")).join("");
+    const all = H100_RESULTS.cases.flatMap((c) => ["tk_split_c64", "tk_auto_c64"].map((a) => measuredCase(c, a))).join("");
+    slots.measured.innerHTML = '<div class="vlb-measured-list">' + primary + '</div><details class="vlb-measured-details"><summary>全部 12 个 case：Manual / Auto、长序列及诊断对照</summary><div class="vlb-measured-list">' + all + '</div></details><div class="text-small vlb-small">来源：已有 job ' + H100_RESULTS.job_id + '，同一批实验；每项均与同 case 的 TK 未拆基线比较。以上均为固定选块测试。</div>';
+  }
 
   // --- pipeline
   const SHAPES = { "8xD": [12, 24], "Dx8": [24, 12], "8x8": [24, 24] };
@@ -441,6 +465,7 @@ function mount(root) {
     });
     observer.observe(slots.timeline);
   }
+  renderMeasured();
   rebuildAll();
   announce();
   return () => {

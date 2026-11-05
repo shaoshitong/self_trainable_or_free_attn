@@ -9,6 +9,7 @@ const vm = require("vm");
 const { execFileSync } = require("child_process");
 const { createModel } = require("./model.js");
 const { generate, ROOT_ID } = require("./build.js");
+const measured = require("./h100-results.json");
 
 const model = createModel();
 const SCENE_IDS = model.SCENES.map((s) => s.id);
@@ -241,11 +242,12 @@ check("generated files are current, small, and self-contained", () => {
     assert.ok(!/\bfetch\s*\(|XMLHttpRequest|WebSocket|EventSource|sendBeacon|https?:\/\/|\bimport\s*\(/.test(text), name + " reaches for the network");
     assert.ok(!/document\.currentScript|tabindex|position:\s*fixed/i.test(text), name);
     assert.ok(text.includes("教学时间单位"), name);
-    assert.ok(!/TFLOP|MFU|\d\s*ms\b/i.test(text), name + " carries a performance claim");
-    // H100 appears only to say what this model is not.
+    assert.ok(!/TFLOP|MFU/i.test(text), name + " carries an unmeasured utilization claim");
+    // Toy timing and historical H100 measurements must remain explicitly separated.
     const h100 = ["不是 H100 benchmark", "H100 TK 直接 reduce-add，没有单独的 dK/dV 合并 kernel"];
     h100.forEach((s) => assert.ok(text.includes(s), name + " lost: " + s));
-    assert.ok(!h100.reduce((rest, s) => rest.split(s).join(""), text).includes("H100"), name + " other H100 wording");
+    assert.ok(text.includes("H100 实测 · FWD / BWD") && text.includes("H100_RESULTS ="), name + " lacks historical results");
+    ["与上方教学时间轴分开", "F+B 不能由两个中位数相加", "router 不计", "诊断 H2/K4 另标"].forEach((s) => assert.ok(text.includes(s), name + " lost measurement scope: " + s));
     // Literal colors only as light-dark() last resorts behind theme variables.
     const bare = text.replace(/light-dark\([^)]*\)/g, "").match(/#[0-9a-f]{3,8}\b/gi) || [];
     assert.deepStrictEqual(bare, [], name + " hardcoded color");
@@ -452,7 +454,54 @@ function auditGeometry(host, label) {
 }
 const WIDTHS = [320, 360, 736];
 
+check("historical H100 phases preserve matched baselines, signs and actual split counts", () => {
+  assert.strictEqual(measured.job_id, "802632");
+  assert.strictEqual(measured.repeats, 10);
+  assert.strictEqual(measured.cases.length, 12);
+  let count = 0;
+  for (const c of measured.cases) {
+    assert.strictEqual(c.includes_router, false);
+    assert.strictEqual(c.selection_mode, "frozen");
+    const baseline = c.arms.find((a) => a.arm === "tk");
+    assert.strictEqual(c.arms.length, 3);
+    for (const a of c.arms) for (const key of measured.phases) {
+      const oldMs = baseline.median_ms[key], newMs = a.median_ms[key];
+      assert.ok(Number.isFinite(oldMs) && oldMs > 0 && Number.isFinite(newMs) && newMs > 0);
+      assert.ok(Math.abs(a.latency_reduction_pct_vs_tk[key] - 100 * (1 - newMs / oldMs)) < 1e-10);
+      assert.ok(Math.abs(a.speedup_vs_tk[key] - oldMs / newMs) < 1e-10);
+      count++;
+    }
+    if (c.tokens === 220000) assert.strictEqual(c.L, 220032);
+    if (c.shape_role === "diagnostic") assert.strictEqual(c.H, 2);
+  }
+  const kv = measured.cases.find((c) => c.id === "short/32768/hotkv").arms.find((a) => a.arm === "tk_auto_c64");
+  assert.ok(kv.latency_reduction_pct_vs_tk.fwd < 0 && kv.latency_reduction_pct_vs_tk.bwd > 33);
+  const q = measured.cases.find((c) => c.id === "short/32768/hotq_extreme").arms.find((a) => a.arm === "tk_auto_c64");
+  assert.strictEqual(q.actual_plan.fwd.split_rows, 0);
+  assert.ok(q.latency_reduction_pct_vs_tk.fwd_bwd < -4);
+  return count + " finite phase medians and ratios";
+});
+
 for (const [artifact, mountOne] of [["HTML fragment", mountHtml], ["Canvas component", mountCanvas]]) {
+  check(artifact + ": measured FWD and BWD both render all cases with correct fast/slow signs", () => {
+    const host = mountOne(320);
+    const cases = q(host, '[data-slot="measured"]').querySelectorAll("[data-measured-case]");
+    assert.strictEqual(cases.length, 28);
+    for (const el of cases) {
+      const c = measured.cases.find((c) => c.id === el.getAttribute("data-measured-case"));
+      const arm = c.arms.find((a) => a.arm === el.getAttribute("data-measured-arm"));
+      const baseline = c.arms.find((a) => a.arm === "tk");
+      for (const key of measured.phases) {
+        const text = el.querySelector('[data-measured-phase="' + key + '"]').textContent;
+        assert.ok(text.includes(baseline.median_ms[key].toFixed(3)) && text.includes(arm.median_ms[key].toFixed(3)), text);
+        const pct = 100 * (1 - arm.median_ms[key] / baseline.median_ms[key]);
+        assert.ok(text.includes((pct >= 0 ? "快 " : "慢 ") + Math.abs(pct).toFixed(1) + "%"), text);
+      }
+      if (c.shape_role === "diagnostic") assert.ok(el.textContent.includes("诊断 H2/K4，非模型配置"));
+    }
+    if (host.unmount) host.unmount();
+    return "84 visible or expandable phase comparisons";
+  });
   check(artifact + ": every scene and direction renders the right router, totals and equivalence", () => {
     let frames = 0;
     for (const width of WIDTHS) {

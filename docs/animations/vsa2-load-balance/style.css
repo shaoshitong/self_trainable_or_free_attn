@@ -47,6 +47,16 @@
 #vsa2-load-balance-root .vlb-idle { background: repeating-linear-gradient(45deg, var(--vlb-muted) 0 2px, transparent 2px 5px); opacity: 0.6; }
 #vsa2-load-balance-root .vlb-note { color: var(--vlb-muted); margin: 0; }
 #vsa2-load-balance-root .vlb-note[hidden] { display: none; }
+#vsa2-load-balance-root .vlb-measured,
+#vsa2-load-balance-root .vlb-measured-list { display: flex; flex-direction: column; gap: var(--vlb-gap); }
+#vsa2-load-balance-root .vlb-measured-case { display: flex; flex-direction: column; gap: calc(var(--vlb-gap) * 0.25); min-width: 0; }
+#vsa2-load-balance-root .vlb-measured-phases { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: calc(var(--vlb-gap) * 0.5); margin: 0; }
+#vsa2-load-balance-root .vlb-measured-phases dt,
+#vsa2-load-balance-root .vlb-measured-phases dd { margin: 0; font-weight: 400; }
+#vsa2-load-balance-root .vlb-measured-times { display: flex; flex-wrap: wrap; gap: 0 calc(var(--vlb-gap) * 0.25); }
+#vsa2-load-balance-root .vlb-measured-times span { white-space: nowrap; }
+#vsa2-load-balance-root .vlb-measured-details { margin-top: var(--vlb-gap); }
+#vsa2-load-balance-root .vlb-measured-details > summary { margin-bottom: calc(var(--vlb-gap) * 0.5); }
 #vsa2-load-balance-root .vlb-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 #vsa2-load-balance-root svg.vlb-svg { display: block; max-width: 100%; font-variant-numeric: tabular-nums; }
 #vsa2-load-balance-root .vlb-svg text { fill: var(--vlb-fg); font-size: 12px; pointer-events: none; }

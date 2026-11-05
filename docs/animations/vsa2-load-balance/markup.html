@@ -46,5 +46,12 @@
     <span><i class="vlb-swatch vlb-idle"></i>空闲</span>
   </div>
   <p class="text-small vlb-note">教学时间单位，不是 ms，也不是 H100 benchmark。每对代价 = 1、4 个工人、chunk = 2、开销 0.5 都是简化；toy token 与任务，不代表 CUDA tile 尺寸，也不是模型质量结论。</p>
+  <section class="vlb-measured" aria-label="已有 H100 前向反向实测">
+    <h3>H100 实测 · FWD / BWD</h3>
+    <p class="text-small vlb-note">下面是此前真实测得的毫秒数，与上方教学时间轴分开。TK 未拆 → Auto C64；同时显示加速和减速。</p>
+    <div data-slot="measured"></div>
+    <p class="text-small vlb-note">H100 80GB，BF16，B1/H20/D128/K64/R16（诊断 H2/K4 另标）。固定合成选块、每组相同选中对，router 不计；含完整算子的规划、任务和合并开销。预热 3 次、计时 10 次取中位数。FWD、BWD、F+B 分别计时，F+B 不能由两个中位数相加。小幅差异不代表稳定收益；不是模型端到端加速。</p>
+    <p class="text-small vlb-note">Manual C64：双向手动拆分，scratch 上限 4 GiB；Auto C64：自动选方向，前向 partial 上限 64 MiB。拆分为 0 仍有规划开销。实际策略与上方玩具规则不同。</p>
+  </section>
   <div class="vlb-sr" aria-live="polite" data-slot="live"></div>
 </div>
