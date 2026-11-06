@@ -33,6 +33,11 @@
 //                    lists (hot kv columns) do not reduce into the same dQ tiles in lockstep. Same pairs; only
 //                    the fp32 summation order of dK/dV within a CTA and of dQ across CTAs changes.
 //   kSkipDq     (4): DIAGNOSTIC ONLY, dQ is not written (wrong gradients): measures the dQ reduce cost.
+//   kMinb3      (8): host-side launch-bound probe, not read by the kernel: the row_ptr (non-task) launch uses
+//                    the MINB = 3 instantiation (__launch_bounds__(128, 3): a 168-register cap) instead of the
+//                    default (2 at D = 128; at D = 64 the default is already 3, the same kernel). At D = 128
+//                    the 113,000 B of dynamic shared memory still allows only 2 CTAs per SM, so the probe
+//                    measures the register cap alone, not a third resident CTA.
 
 #include "kittens.cuh"
 #include <cooperative_groups.h>
@@ -322,7 +327,7 @@ struct bwd_globals {
   const int opts;                 // kDqReadWait | kRotate | kSkipDq
 };
 
-constexpr int kDqReadWait = 1, kRotate = 2, kSkipDq = 4;
+constexpr int kDqReadWait = 1, kRotate = 2, kSkipDq = 4, kMinb3 = 8;
 
 __device__ static inline void stream_tile(auto& reg_tile, auto& smem_vec, int tic) {
 #pragma unroll
@@ -346,8 +351,9 @@ __device__ static inline void stream_sub_tile(auto& reg_tile, auto& smem_vec, in
   }
 }
 
-template <int D, bool TASK>
-__global__ __launch_bounds__(128, (D == 64) ? 3 : 2) void bwd_attend_ker(const __grid_constant__ bwd_globals<D> g) {
+// MINB: CTAs per SM for the register budget; the default is the kernel's tuned value, kMinb3 selects 3.
+template <int D, bool TASK, int MINB = (D == 64) ? 3 : 2>
+__global__ __launch_bounds__(128, MINB) void bwd_attend_ker(const __grid_constant__ bwd_globals<D> g) {
 #if VSA2_TK_HOPPER
   constexpr float SCALE = (D == 64) ? 0.125f : 0.08838834764f;
   constexpr float SCALE_LOG2 = 1.44269504089f * SCALE;
@@ -607,8 +613,13 @@ static void tk_bwd_impl(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch
     if (n_tasks > 0) bwd_attend_ker<D, true><<<n_tasks, 128, mem_size, stream>>>(g);
     return;
   }
-  cudaFuncSetAttribute(bwd_attend_ker<D, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size);
   dim3 grid(NB, H, B);
+  if (opts & kMinb3) {  // launch-bound probe; same body, same shared memory
+    cudaFuncSetAttribute(bwd_attend_ker<D, false, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size);
+    bwd_attend_ker<D, false, 3><<<grid, 128, mem_size, stream>>>(g);
+    return;
+  }
+  cudaFuncSetAttribute(bwd_attend_ker<D, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size);
   bwd_attend_ker<D, false><<<grid, 128, mem_size, stream>>>(g);
 }
 

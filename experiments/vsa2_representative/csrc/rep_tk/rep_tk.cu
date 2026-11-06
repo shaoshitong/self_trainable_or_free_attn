@@ -1531,7 +1531,7 @@ inline bf16* bfp(const torch::Tensor& t) { return reinterpret_cast<bf16*>(t.data
 inline int words_of(int nb) { return (nb + 31) >> 5; }
 inline cudaStream_t stream() { return at::cuda::getCurrentCUDAStream().stream(); }
 // REP_TK_FWD_CFG, read once. Forward-only values are dispatched in fwd_impl; 21 / 22 select the tier-C
-// backward split (previous "wave" policy / 4), each with
+// backward split (previous "wave" policy / 4) and 23 the tier-A backward launch-bound probe, each with
 // the default forward, so every one of them differs from cfg 1 (13) in one backward choice only.
 inline int rep_cfg() {
   static const int cfg = [] {
@@ -1816,6 +1816,7 @@ void tk_native_bwd(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Ten
                    torch::Tensor delta, torch::Tensor row_ptr, torch::Tensor col_idx, torch::Tensor blk_cnt,
                    torch::Tensor qg, torch::Tensor kg, torch::Tensor vg) {
   check_bf16(q, "q");
-  vsa2_tk_fine_bwd(q, k, v, dout_f, lse, delta, row_ptr, col_idx, blk_cnt, qg, kg, vg, 0);
+  // REP_TK_FWD_CFG=23: VSA2's kMinb3 (8), its tier-A backward at __launch_bounds__(128, 3); else unchanged
+  vsa2_tk_fine_bwd(q, k, v, dout_f, lse, delta, row_ptr, col_idx, blk_cnt, qg, kg, vg, rep_cfg() == 23 ? 8 : 0);
   check_launch("native bwd");
 }
