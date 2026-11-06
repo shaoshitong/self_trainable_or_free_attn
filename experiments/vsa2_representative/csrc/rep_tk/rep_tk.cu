@@ -959,6 +959,298 @@ __global__ __launch_bounds__(128, 3) void fwd_kdb_ker(const __grid_constant__ fw
 #endif
 }
 
+// ---------------------------------------------------------------- forward, two-stage softmax (cfg 24)
+// fwd_kdb_ker (cfg 11) software-pipelined: tile j + 1's QK is issued into a second score tile before tile
+// j's softmax and left in flight while that softmax runs, so the tensor core works on QK(j + 1) during
+// softmax(j). Same tiles, biases, masks, arithmetic, grid, block and shared memory as cfg 11; the second
+// rt_fl<16, 64> costs about 32 registers per thread, so the launch bounds ask for 2 CTAs per SM instead of
+// capping at 168 registers with spills (3 CTAs per SM need <= 168).
+//
+// Step j (pipe_step), entered with S(j) complete in r.att:
+//   1. K(j + 2) into tile j's K buffer (QK(j) has completed);
+//   2. wait K(j + 1); issue QK(j + 1) into r.att_n (committed, not waited);
+//   3. softmax(j) on r.att: scale, bias / mask, m / l update and o rescale, P(j) into r.att_mma;
+//   4. wait V(j); issue PV(j) (o += P(j) V(j));
+//   5. mma_async_wait<0>: QK(j + 1) and PV(j) complete;
+//   6. V(j + 1) into the V buffer (PV(j) has read it); S(j + 1) moves into r.att.
+// m, l and o are therefore updated by tile j (3, 4) before anything reads S(j + 1) (step j + 1's 3), and o
+// is touched by softmax(j + 1)'s rescale only after PV(j) has completed (5). r.att and r.att_n are distinct
+// registers; the in-flight QK only writes r.att_n. pin_regs (empty asm with the registers as in/out
+// operands, as CUTLASS's warpgroup_fence_operand) keeps softmax(j)'s reads of r.att after the QK(j + 1)
+// issue and every read of r.att_n / o after the wait.
+//
+// Barriers and parity as in fwd_kdb_ker: tile t's K in buffer t & 1, one barrier per K buffer whose parity
+// bit flips when a TMA-delivered tile is consumed from it (at the QK issue, step 2 of step t - 1), V's
+// parity `it`. The cp.async commit order is unchanged, K0, K1, V0, K2, V1, K3, ... (K(j + 2) in step 1, V(j
+// + 1) in step 6), so: the prologue's K0 wait leaves 1 + [1 is B] younger groups (K1, V0); step j's K(j +
+// 1) wait leaves [j is B] + [j + 2 is B] (V(j), K(j + 2)); its V(j) wait leaves [j + 2 is B] (K(j + 2)).
+//
+// Whether nvcc kept the overlap is visible in the SASS of fwd_pipe_ker: each step should show the HGMMA
+// group of QK(j + 1) (after its WARPGROUP.ARRIVE) *before* softmax(j)'s FMNMX / MUFU.EX2 / FMUL run, and
+// the WARPGROUP.DEPBAR.LE gsb0 wait only after them, just behind PV(j)'s HGMMA. A DEPBAR directly after
+// the QK(j + 1) HGMMA means the overlap was lost; the timing is the final word either way.
+template <typename RT>
+__device__ __forceinline__ void pin_regs(RT& t) {
+#pragma unroll
+  for (int i = 0; i < RT::height; ++i)
+#pragma unroll
+    for (int j = 0; j < RT::width; ++j)
+#pragma unroll
+      for (int k = 0; k < t.packed_per_tile; ++k) {
+        asm volatile("" : "+f"(t.tiles[i][j].data[k].x)::"memory");
+        asm volatile("" : "+f"(t.tiles[i][j].data[k].y)::"memory");
+      }
+}
+
+template <int D>
+struct pipe_regs {
+  rt_fl<16, 64> att;    // S(j), consumed by softmax(j)
+  rt_fl<16, 64> att_n;  // S(j + 1), written by the in-flight QK
+  rt_bf<16, 64> att_mma;
+  rt_fl<16, D> o;
+  col_vec<rt_fl<16, 64>> m, l;  // log2-domain running max (bias included) and row sum
+};
+
+template <int D, bool BC>
+__device__ __forceinline__ void pipe_step(const fwd_globals<D>& g, kdb_ctx<D>& c, pipe_regs<D>& r, int2 tile,
+                                          int2 nxt, int2 nxt2, int kcA, const TileBias& cb, const int (&nsl)[4],
+                                          const int (&nsl2)[4]) {
+  constexpr float SL2 = kLog2e * (D == 64 ? 0.125f : 0.08838834764f);
+  const int kb = c.kt & 1, nb = kb ^ 1, warp = warpid();
+  const bool cp_cur = tile.x == kTierB;
+  const int none[2] = {g.NB, g.NB};  // issue_tile's slot argument, unused for A/C tiles
+  typename fwd_globals<D>::tile& kbuf = kb ? *c.k1 : *c.k0;
+  typename fwd_globals<D>::tile& nbuf = nb ? *c.k1 : *c.k0;
+  semaphore& kbar = kb ? *c.kbar1 : *c.kbar0;
+  semaphore& nbar = nb ? *c.kbar1 : *c.kbar0;
+
+  // 1. K(j + 2) into this tile's buffer
+  if (nxt2.x == kTierB) issue_tier_b_cta<D>(kb ? c.k1_s : c.k0_s, c.ksw, nsl2, g.NB, g.RM);
+  else if (nxt2.x != kTierNone && warp == 0)
+    issue_tile<D>(nxt2, kbuf, g.k, g.kt, c.ksw, none, c.b, c.h, g.NB, g.RM, kbar);
+  // 2. QK(j + 1), left in flight
+  if (nxt.x != kTierNone) {
+    if (nxt.x == kTierB) {
+      cp_async_wait_n((int)cp_cur + (nxt2.x == kTierB));
+      fence_async_smem();
+      __syncthreads();
+    } else {
+      wait(nbar, (c.kph >> nb) & 1);
+      c.kph ^= 1 << nb;
+    }
+    warpgroup::mm_ABt(r.att_n, *c.q, nbuf);
+  }
+  pin_regs(r.att);
+
+  // 3. softmax(j): log2 domain, then each column's + log2(c) bias (or -inf mask) before the row max
+  mul(r.att, r.att, SL2);
+  if constexpr (BC) {
+    if (cb.masked && !(tile.x == kTierB && (g.diag & 1))) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          float2& e = r.att.tiles[0][i].data[j];
+          e.x += cb.v[i][(j >> 1) * 2];
+          e.y += cb.v[i][(j >> 1) * 2 + 1];
+        }
+    }
+  } else if (kcA < kB) {  // partial tier-A block: VSA2's own column mask
+    right_fill(r.att, r.att, kcA, base_types::constants<float>::neg_infty());
+  }
+  online_softmax_tk<D>(r.att, r.m, r.l, r.o);
+  copy(r.att_mma, r.att);
+
+  // 4. PV(j)
+  if (cp_cur) {
+    cp_async_wait_n(nxt2.x == kTierB);
+    fence_async_smem();
+    __syncthreads();
+  } else {
+    wait(*c.vbar, c.it & 1);
+  }
+  warpgroup::mma_AB(r.o, r.att_mma, *c.v);
+  // 5. QK(j + 1) and PV(j) complete
+  warpgroup::mma_async_wait();
+  pin_regs(r.att_n);
+  pin_regs(r.o);
+  // 6. V(j + 1); S(j + 1) becomes the current score tile
+  if (nxt.x == kTierB) issue_tier_b_cta<D>(c.v_s, c.vsw, nsl, g.NB, g.RM);
+  else if (nxt.x != kTierNone && warp == 0)
+    issue_tile<D>(nxt, *c.v, g.v, g.vt, c.vsw, none, c.b, c.h, g.NB, g.RM, *c.vbar);
+  if (!cp_cur) ++c.it;
+  ++c.kt;
+  copy(r.att, r.att_n);
+}
+
+template <int D>
+__global__ __launch_bounds__(128, 2) void fwd_pipe_ker(const __grid_constant__ fwd_globals<D> g) {
+#if REP_TK_HOPPER
+  constexpr int ND = D / 16;
+  using tile_t = typename fwd_globals<D>::tile;
+  const int qb = blockIdx.x, h = blockIdx.y, b = blockIdx.z;
+  const int bh = b * g.H + h;
+  const int warp = warpid(), lane = laneid(), gq = lane >> 2;
+
+  Stream s;
+  {
+    const size_t r = (size_t)bh * (g.NB + 1) + qb;
+    const int a0 = g.a_ptr[r], b0 = g.b_ptr[r];
+    s.a_idx = g.a_idx + a0;
+    s.na = g.a_ptr[r + 1] - a0;
+    s.b_idx = g.b_idx + b0;
+    s.nb_list = g.b_ptr[r + 1] - b0;
+    s.ab_row = g.bits_ab + ((size_t)bh * g.NB + qb) * g.W;
+    s.G = kB / g.RM;
+    s.nbt_tiles = (s.nb_list + s.G - 1) / s.G;
+    s.nc_tiles = g.NBt / kB;
+    s.NB = g.NB;
+    s.W = g.W;
+    s.phases = g.phases;
+    s.ia = s.ib = s.tc = 0;
+  }
+  const float* lc_tail = g.lc_tail + (size_t)bh * g.NBt;
+  const float* lcb = g.lcb + (size_t)(s.b_idx - g.b_idx) * g.RM;  // this row's entries
+  const bf16* ksw = g.k_sw + (size_t)bh * num_phases(g.RM) * (g.NB + 1) * (D / 64) * g.RM * 64;
+  const bf16* vsw = g.v_sw + (size_t)bh * num_phases(g.RM) * (g.NB + 1) * (D / 64) * g.RM * 64;
+  const int qcnt = g.blk_cnt[qb];
+
+  int2 cur = s.next();
+  if (cur.x == kTierNone) {
+    bf16* o = g.o.raw_ptr + ((size_t)bh * g.L + (size_t)qb * kB) * D;
+    for (int i = threadIdx.x; i < kB * D / 8; i += blockDim.x) reinterpret_cast<uint4*>(o)[i] = make_uint4(0, 0, 0, 0);
+    if (threadIdx.x < kB) g.lse[(size_t)bh * g.L + (size_t)qb * kB + threadIdx.x] = ninf();
+    return;
+  }
+
+  extern __shared__ int __shm[];
+  tma_swizzle_allocator al((int*)&__shm[0]);
+  tile_t(&q_smem) = al.allocate<tile_t>();
+  tile_t(&k0_smem) = al.allocate<tile_t>();
+  tile_t(&v_smem) = al.allocate<tile_t>();
+  tile_t(&k1_smem) = al.allocate<tile_t>();  // last, so q/k/v keep fwd_ker's offsets
+  __shared__ semaphore q_bar, k_bar0, v_bar, k_bar1;
+  if (threadIdx.x == 0) {
+    init_semaphore(q_bar, 0, 1);
+    init_semaphore(k_bar0, 0, 1);
+    init_semaphore(v_bar, 0, 1);
+    init_semaphore(k_bar1, 0, 1);
+    tma::expect_bytes(q_bar, sizeof(tile_t));
+    coord<tile_t> qc = {b, h, qb, 0};
+    tma::load_async(q_smem, g.q, qc, q_bar);
+  }
+  __syncthreads();  // barriers initialized before warp 0's other lanes use them
+  kdb_ctx<D> c;
+  c.q = &q_smem;
+  c.k0 = &k0_smem;
+  c.k1 = &k1_smem;
+  c.v = &v_smem;
+  c.k0_s = static_cast<uint32_t>(__cvta_generic_to_shared(&k0_smem.data[0]));
+  c.k1_s = static_cast<uint32_t>(__cvta_generic_to_shared(&k1_smem.data[0]));
+  c.v_s = static_cast<uint32_t>(__cvta_generic_to_shared(&v_smem.data[0]));
+  c.kbar0 = &k_bar0;
+  c.kbar1 = &k_bar1;
+  c.vbar = &v_bar;
+  c.ksw = ksw;
+  c.vsw = vsw;
+  c.b = b;
+  c.h = h;
+  c.it = c.kt = c.kph = 0;
+
+  // prologue: K(cur) -> buffer 0, K(nxt) -> buffer 1, V(cur) (fwd_kdb_ker's order), then S(cur) = QK(cur)
+  int2 nxt = s.next(), nxt2 = make_int2(kTierNone, 0);
+  int sl_cur[4] = {g.NB, g.NB, g.NB, g.NB}, nsl[4] = {g.NB, g.NB, g.NB, g.NB}, nsl2[4] = {g.NB, g.NB, g.NB, g.NB};
+  const int none[2] = {g.NB, g.NB};
+  if (cur.x == kTierB) slot_blocks_cta(s.b_idx, s.nb_list, cur.y, g.NB, g.RM, sl_cur);
+  if (nxt.x == kTierB) slot_blocks_cta(s.b_idx, s.nb_list, nxt.y, g.NB, g.RM, nsl);
+  if (cur.x == kTierB) issue_tier_b_cta<D>(c.k0_s, ksw, sl_cur, g.NB, g.RM);
+  else if (warp == 0) issue_tile<D>(cur, k0_smem, g.k, g.kt, ksw, none, b, h, g.NB, g.RM, k_bar0);
+  if (nxt.x == kTierB) issue_tier_b_cta<D>(c.k1_s, ksw, nsl, g.NB, g.RM);
+  else if (nxt.x != kTierNone && warp == 0) issue_tile<D>(nxt, k1_smem, g.k, g.kt, ksw, none, b, h, g.NB, g.RM, k_bar1);
+  if (cur.x == kTierB) issue_tier_b_cta<D>(c.v_s, vsw, sl_cur, g.NB, g.RM);
+  else if (warp == 0) issue_tile<D>(cur, v_smem, g.v, g.vt, vsw, none, b, h, g.NB, g.RM, v_bar);
+
+  pipe_regs<D> r;
+  zero(r.o);
+  neg_infty(r.m);
+  zero(r.l);
+  TileBias cb;
+  cb.masked = false;
+  cb.kc = kB;
+  wait(q_bar, 0);
+  if (cur.x == kTierB) {
+    cp_async_wait_n(1 + (nxt.x == kTierB));  // K1 (if tier B) and V0 may stay pending
+    fence_async_smem();
+    __syncthreads();
+  } else {
+    wait(k_bar0, 0);
+    c.kph ^= 1;
+  }
+  warpgroup::mm_ABt(r.att, q_smem, k0_smem);
+  warpgroup::mma_async_wait();
+  pin_regs(r.att);
+
+  // The stream runs two tiles ahead: nxt2 and its slot blocks are read before each step, then rolled.
+  // Tier A: no bias state, as in fwd_ker.
+  while (cur.x == kTierA) {
+    nxt2 = s.next();
+    if (nxt2.x == kTierB) slot_blocks_cta(s.b_idx, s.nb_list, nxt2.y, g.NB, g.RM, nsl2);
+    pipe_step<D, false>(g, c, r, cur, nxt, nxt2, g.blk_cnt[cur.y], cb, nsl, nsl2);
+    cur = nxt;
+    nxt = nxt2;
+#pragma unroll
+    for (int u = 0; u < 4; ++u) nsl[u] = nsl2[u];
+  }
+  // Tiers B and C: biases one tile ahead, as in fwd_ker.
+  if (cur.x != kTierNone) cb = tile_bias(cur, s, g.blk_cnt, lcb, lc_tail, g.RM);
+  while (cur.x != kTierNone) {
+    nxt2 = s.next();
+    if (nxt2.x == kTierB) slot_blocks_cta(s.b_idx, s.nb_list, nxt2.y, g.NB, g.RM, nsl2);
+    const TileBias nb_ = tile_bias(nxt, s, g.blk_cnt, lcb, lc_tail, g.RM);
+    pipe_step<D, true>(g, c, r, cur, nxt, nxt2, kB, cb, nsl, nsl2);
+    cur = nxt;
+    nxt = nxt2;
+#pragma unroll
+    for (int u = 0; u < 4; ++u) nsl[u] = nsl2[u];
+    cb = nb_;
+  }
+
+  // epilogue, fwd_ker's vector-softmax one: o = o / l (padded query rows -> 0), natural lse (finite on
+  // padded rows); r.m / r.l: .x = row gq, .y = row gq + 8 of each warp
+  static_assert(decltype(r.m)::outer_dim == 1 && decltype(r.m)::inner_dim == 1, "col_vec layout");
+  const float m_row[2] = {r.m.data[0][0].x, r.m.data[0][0].y};
+  const float l_row[2] = {r.l.data[0][0].x, r.l.data[0][0].y};
+  float inv[2], lse[2];
+#pragma unroll
+  for (int i = 0; i < 2; ++i) {
+    const float l = l_row[i];
+    const int row = 16 * warp + gq + 8 * i;
+    inv[i] = (row < qcnt && l > 0.f) ? 1.f / l : 0.f;
+    lse[i] = l > 0.f ? (m_row[i] + __log2f(l)) * kLn2 : ninf();
+  }
+#pragma unroll
+  for (int n = 0; n < ND; ++n)
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      r.o.tiles[0][n].data[j].x *= inv[j & 1];
+      r.o.tiles[0][n].data[j].y *= inv[j & 1];
+    }
+  if ((lane & 3) == 0) {
+    float* gl_ = g.lse + (size_t)bh * g.L + (size_t)qb * kB + 16 * warp + gq;
+    gl_[0] = lse[0];
+    gl_[8] = lse[1];
+  }
+  __syncthreads();  // every warp is done with q_smem
+  warpgroup::store(q_smem, r.o);
+  __syncthreads();
+  if (warp == 0) {  // TK's store/wait helpers are warp-collective
+    coord<tile_t> oc = {b, h, qb, 0};
+    tma::store_async(g.o, q_smem, oc);
+    tma::store_async_wait();
+  }
+#endif
+}
+
 // ---------------------------------------------------------------- backward, tier C (KV-owner)
 // One CTA per (tail tile t, h, b): it owns block means 64t..64t+63, keeps their dK/dV in registers over
 // every query block that has a tier-C column in the tile, and reduces each pair's dQ into the shared fp32
@@ -1651,6 +1943,12 @@ static void fwd_impl(torch::Tensor q, torch::Tensor k, torch::Tensor v, const st
     constexpr int mem_kdb = 4 * 64 * D * 2 + 1024;  // q, two K, v tiles + alignment slack
     cudaFuncSetAttribute(rep_tk::fwd_kdb_ker<D>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_kdb);
     rep_tk::fwd_kdb_ker<D><<<dim3(NB, H, B), 128, mem_kdb, stream()>>>(g);
+  }
+  // cfg 24: fwd_pipe_ker, cfg 11 with QK(j + 1) in flight during softmax(j) (second score tile, 2 CTAs/SM)
+  else if (cfg == 24) {
+    constexpr int mem_pipe = 4 * 64 * D * 2 + 1024;  // as cfg 11
+    cudaFuncSetAttribute(rep_tk::fwd_pipe_ker<D>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_pipe);
+    rep_tk::fwd_pipe_ker<D><<<dim3(NB, H, B), 128, mem_pipe, stream()>>>(g);
   }
   // cfg 1 / 10: tier-B tiles loaded by CTA-wide cp.async (issue_tier_b_cta) instead of bulk copies
   else launch(rep_tk::fwd_ker<D, 3, false, false, true>);
