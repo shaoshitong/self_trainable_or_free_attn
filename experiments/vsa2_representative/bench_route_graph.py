@@ -18,7 +18,9 @@ import sys
 import time
 from pathlib import Path
 
-from bench_compare import HERE, NOTE, active_fwd_cfg, sha256_file
+from bench_compare import HERE, active_fwd_cfg, sha256_file
+
+NOTE = "measurement_only: not a performance claim; do not add to kernel rows"
 
 ROWS = ("route.eager", "route.replay", "route.replay_with_copy", "route.graph_host_call")
 
