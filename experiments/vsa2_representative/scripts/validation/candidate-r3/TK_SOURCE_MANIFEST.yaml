@@ -1,0 +1,692 @@
+{
+  "schema": "tk-code-pin-v1",
+  "git_commit": "6c27e28c8115d1839d9eeeb530913c184a75fc87",
+  "files": [
+    {
+      "path": "LICENSE",
+      "bytes": 1069,
+      "sha256": "0f7b4b87d5790cdaf16f97fc7e98d7481a80f06c8f7b07b7677eb4d38e6fe0e4"
+    },
+    {
+      "path": "include/common/base_ops.cuh",
+      "bytes": 17093,
+      "sha256": "4537822ebb354f3779be7a4c3227802e76527e2bd358b39d18695b6aa11b76ce"
+    },
+    {
+      "path": "include/common/base_types.cuh",
+      "bytes": 19282,
+      "sha256": "d34e107983c9643d4256c22522f1536a7ab3a5f6ea506aaf4a5c0584017a121a"
+    },
+    {
+      "path": "include/common/common.cuh",
+      "bytes": 179,
+      "sha256": "ee66f4c51eb00d4739bf5490120f99faba6e8345f41187ec2c6bbe084e5b72b0"
+    },
+    {
+      "path": "include/common/debug.cuh",
+      "bytes": 1545,
+      "sha256": "0924809d50559ecedbff73ce6c8643034644258b55610123905074cc073bac0c"
+    },
+    {
+      "path": "include/common/util.cuh",
+      "bytes": 9666,
+      "sha256": "ebf35439cf93bd26441714656f1d0003df9a285b2e2d50678da58b05709a046c"
+    },
+    {
+      "path": "include/kittens.cuh",
+      "bytes": 310,
+      "sha256": "d7a9e0a36e23834509ac63337ab161f2a4c5356723bef71784d48b00faf13677"
+    },
+    {
+      "path": "include/ops/gang/gang.cuh",
+      "bytes": 8062,
+      "sha256": "b22eaece806eafad36576e49efc3db8607dd0970a7349032eb8bc126365edf74"
+    },
+    {
+      "path": "include/ops/group/group.cuh",
+      "bytes": 2617,
+      "sha256": "f76b9a1786cec6dbe612bc1049a62099c2ed9ff1512793728304e7f652c105b6"
+    },
+    {
+      "path": "include/ops/group/memory/memory.cuh",
+      "bytes": 169,
+      "sha256": "1962ac280c6be0b288d979aca01fe3ee89a94823c79a2c9ef6aa5aa1141aef18"
+    },
+    {
+      "path": "include/ops/group/memory/tile/complex/complex_global_to_register.cuh",
+      "bytes": 2341,
+      "sha256": "04233a64cb27a3509e28efe5051ae5372e7ede7e086cd78607bf492e1ae9dd42"
+    },
+    {
+      "path": "include/ops/group/memory/tile/complex/complex_global_to_shared.cuh",
+      "bytes": 2578,
+      "sha256": "2f7fb802ef46cb9362e35d402b4f3711a5f435e4738d703ea06fe6fdf23a5dfe"
+    },
+    {
+      "path": "include/ops/group/memory/tile/complex/complex_shared_to_register.cuh",
+      "bytes": 1047,
+      "sha256": "62d4db32b771f9d560f17534c66d8831f673baf08ae4d085a53d5ce9fa11768c"
+    },
+    {
+      "path": "include/ops/group/memory/tile/global_to_register.cuh",
+      "bytes": 10428,
+      "sha256": "16ed0fd24add326698ba9a7d782d525fe2b61da093289bb4a88bcbcd13f5d9a5"
+    },
+    {
+      "path": "include/ops/group/memory/tile/global_to_shared.cuh",
+      "bytes": 1764,
+      "sha256": "fc154ff1977005e2a0f5340f6500b7a7c1046b4fdde96dbdc49db9a69dcb4688"
+    },
+    {
+      "path": "include/ops/group/memory/tile/pgl_to_register.cuh",
+      "bytes": 10877,
+      "sha256": "6f866a0cb1c926823184df4cd52d61c1c3f35c6586b518836457c79e9f191dea"
+    },
+    {
+      "path": "include/ops/group/memory/tile/pgl_to_shared.cuh",
+      "bytes": 4808,
+      "sha256": "a309b5e7f03d396e3bf8f4d93ce6f4b25e45956930b9119615ac545eef4878c3"
+    },
+    {
+      "path": "include/ops/group/memory/tile/shared_to_register.cuh",
+      "bytes": 16546,
+      "sha256": "8e514af56ae7341c5631656ed82a316fa926dcb155b0140ee3099f2039242fd7"
+    },
+    {
+      "path": "include/ops/group/memory/tile/tile.cuh",
+      "bytes": 396,
+      "sha256": "47c03a2ee8716b28798cfccb1d6f8518a552a91db39e3de0f81e0553aa29307c"
+    },
+    {
+      "path": "include/ops/group/memory/util/util.cuh",
+      "bytes": 282,
+      "sha256": "c093345c29427dc03055bb624b683e52c8f3e951e91ef7cd4e6133d924489776"
+    },
+    {
+      "path": "include/ops/group/memory/vec/global_to_register.cuh",
+      "bytes": 1438,
+      "sha256": "70bd1a7a6d671ddc587a3b2c8b59e0dfc358c384642ea3fa85f025f306497ffd"
+    },
+    {
+      "path": "include/ops/group/memory/vec/global_to_shared.cuh",
+      "bytes": 4369,
+      "sha256": "2f94da7415ee739f9c3efa6778246ce818ce6077ae6c1b2a2e3a5f6dabe88c55"
+    },
+    {
+      "path": "include/ops/group/memory/vec/pgl_to_register.cuh",
+      "bytes": 3701,
+      "sha256": "e45e22b3461e4c58c5dc309e65cdc4c7fef504daeeedc18f834895aedb6a9442"
+    },
+    {
+      "path": "include/ops/group/memory/vec/pgl_to_shared.cuh",
+      "bytes": 6056,
+      "sha256": "f38c955d98cfebcef2e987ecf24926e5b3db2441325ee8a3f648caf6afe1f563"
+    },
+    {
+      "path": "include/ops/group/memory/vec/shared_to_register.cuh",
+      "bytes": 1717,
+      "sha256": "b5b2d98152c2a1373c48df2748a63ff4cde0537202c56a1d637d1012cad1e027"
+    },
+    {
+      "path": "include/ops/group/memory/vec/vec.cuh",
+      "bytes": 246,
+      "sha256": "814bebae845e2f7b6fe071f72acf00d7809373eaa07ab1f6cdd02f47b26e6809"
+    },
+    {
+      "path": "include/ops/group/register/register.cuh",
+      "bytes": 113,
+      "sha256": "4bff093521df70c80f0682a1a418b2a223eda44bc32998f9609757e72140b900"
+    },
+    {
+      "path": "include/ops/group/register/tile/conversions.cuh",
+      "bytes": 6328,
+      "sha256": "6a974fadef754ce96401139aa56966c36526c35b3e0e224f0d897ccff80f4d39"
+    },
+    {
+      "path": "include/ops/group/register/tile/tile.cuh",
+      "bytes": 114,
+      "sha256": "7ff2e1495a3350a533f297e1c3e087256320f5af33bf78e4fc65558ddcb2d15d"
+    },
+    {
+      "path": "include/ops/group/shared/shared.cuh",
+      "bytes": 140,
+      "sha256": "30f76466d094e2de794b9fbd6a9030259d65bc0219a75b0a095ab6cd799da47f"
+    },
+    {
+      "path": "include/ops/group/shared/tile/conversions.cuh",
+      "bytes": 988,
+      "sha256": "05fabe7ab21447c9ae1e780ce325f0c8bd73813a02b36edd4a305eb573d969cf"
+    },
+    {
+      "path": "include/ops/group/shared/tile/maps.cuh",
+      "bytes": 20345,
+      "sha256": "f54c03f5d53c37aebec21dbcb150fdba5f234d710fce56de829fca366e69060f"
+    },
+    {
+      "path": "include/ops/group/shared/tile/reductions.cuh",
+      "bytes": 12697,
+      "sha256": "52179be9ae55cca65c5baa66c869e36d0713e696eb2eecfeb2a74cd9fee0f672"
+    },
+    {
+      "path": "include/ops/group/shared/tile/tile.cuh",
+      "bytes": 158,
+      "sha256": "1a62630b1ca6a18a5d4230ce685ce4af2b17dfc83127bc798a3323434cc07c8d"
+    },
+    {
+      "path": "include/ops/group/shared/vec/conversions.cuh",
+      "bytes": 1291,
+      "sha256": "272f60e390a5368e7cd051c374f1b191f2019ed13d7777ac0cc8325cbfd14550"
+    },
+    {
+      "path": "include/ops/group/shared/vec/maps.cuh",
+      "bytes": 9203,
+      "sha256": "794075651fd562709e24481061aba13b6c682dd38f386282149a5582943f02c0"
+    },
+    {
+      "path": "include/ops/group/shared/vec/vec.cuh",
+      "bytes": 349,
+      "sha256": "05bf15735b04b23e6f924a71ca4d592dd43e3da09a7890dde15f8afa28798273"
+    },
+    {
+      "path": "include/ops/group/wgmma/base/64x112.impl",
+      "bytes": 20208,
+      "sha256": "a9aaff495dc01203d7703e90bc935fcdb1c5df389444c436c4c9b96280af6a01"
+    },
+    {
+      "path": "include/ops/group/wgmma/base/64x128.impl",
+      "bytes": 49615,
+      "sha256": "3e4289b5b804df791e834694d3d80f8169f5d8d11398ac9403e9143f6688e7d7"
+    },
+    {
+      "path": "include/ops/group/wgmma/base/64x144.impl",
+      "bytes": 24552,
+      "sha256": "32caa22b864a25809b5010847a1a3e6473e4029324f8a44854c3503820b6f61d"
+    },
+    {
+      "path": "include/ops/group/wgmma/base/64x16.impl",
+      "bytes": 8271,
+      "sha256": "026bcbd592559a85166a761c023837bb29b798fe10f106444309931fbbd27fa2"
+    },
+    {
+      "path": "include/ops/group/wgmma/base/64x160.impl",
+      "bytes": 45305,
+      "sha256": "1b5632e554e18b8d75006cd4e3767dc236621beebd336c4373479071cbe69078"
+    },
+    {
+      "path": "include/ops/group/wgmma/base/64x176.impl",
+      "bytes": 28616,
+      "sha256": "13db564d000d2b9105cd83c5a82bece3d401cf442d5d3f3105cbf966209034d6"
+    },
+    {
+      "path": "include/ops/group/wgmma/base/64x192.impl",
+      "bytes": 47091,
+      "sha256": "f5e01a7042dd1c8c1b0e754882177c4433d6398eacad564269bfbda13d3bd61f"
+    },
+    {
+      "path": "include/ops/group/wgmma/base/64x208.impl",
+      "bytes": 32724,
+      "sha256": "18285f84e7978678a1dc26d4c71ef7b6ef0fb6c3cade0e62db4a945c5f9169c8"
+    },
+    {
+      "path": "include/ops/group/wgmma/base/64x224.impl",
+      "bytes": 59618,
+      "sha256": "f0c77bf1acc790b4ef740cc85c07762aecef9c6f29b0ef31cb2d7752727cd9bb"
+    },
+    {
+      "path": "include/ops/group/wgmma/base/64x240.impl",
+      "bytes": 36852,
+      "sha256": "0210555fa309989ef50854476ec1d84edbd4d837ca5b2e8a809d4b67eb797d67"
+    },
+    {
+      "path": "include/ops/group/wgmma/base/64x256.impl",
+      "bytes": 87328,
+      "sha256": "7a9d28d9962b91e71aebcd05723104f4ff4217e3c4728a4512eac5fb55cfc498"
+    },
+    {
+      "path": "include/ops/group/wgmma/base/64x32.impl",
+      "bytes": 21253,
+      "sha256": "40b7ce914e7f54abf7bcda7834bf388722c72aca4362b5d41af29b40bd36a2d4"
+    },
+    {
+      "path": "include/ops/group/wgmma/base/64x48.impl",
+      "bytes": 12255,
+      "sha256": "0dfca5903898b10ee55c262cb71ab5df9a931b0e95c641bb49696c6388569c33"
+    },
+    {
+      "path": "include/ops/group/wgmma/base/64x64.impl",
+      "bytes": 31648,
+      "sha256": "2446cb3c4c468322d84a3282d3c8b4d6f80f3b41de5b95791692b8602031de31"
+    },
+    {
+      "path": "include/ops/group/wgmma/base/64x80.impl",
+      "bytes": 16215,
+      "sha256": "bd752a13579a9f3c88d390770777de99820998f80df12e1ca6c9ae08354507b1"
+    },
+    {
+      "path": "include/ops/group/wgmma/base/64x96.impl",
+      "bytes": 40636,
+      "sha256": "0f120f41b9cdd474a5149f60457e78b3b5b5f0361cd0546c5dcc88e45f986a4f"
+    },
+    {
+      "path": "include/ops/group/wgmma/base/base.cuh",
+      "bytes": 5720,
+      "sha256": "8b002181d1dab0e80f84d9b2e36ca2edaa8a6781a33562653055a5ada45f241f"
+    },
+    {
+      "path": "include/ops/group/wgmma/wgmma.cuh",
+      "bytes": 44499,
+      "sha256": "ecda479628959c17fffa74b3fdb6ae09be1da461c1c0a88359ca3b2caa7581f1"
+    },
+    {
+      "path": "include/ops/ops.cuh",
+      "bytes": 185,
+      "sha256": "7b5d3c5882e218b832d864a36510dde6813abd315116f715583186d50dcd07f0"
+    },
+    {
+      "path": "include/ops/warp/memory/memory.cuh",
+      "bytes": 217,
+      "sha256": "237f28474d9892108da3ad6e7cee51b095858f89a2e5569a48a135a986d00a47"
+    },
+    {
+      "path": "include/ops/warp/memory/tile/complex/complex_global_to_register.cuh",
+      "bytes": 2721,
+      "sha256": "47422936c232ebe8cc681292877b5883f6807f356c4b18ff99e8a99fef04a8f0"
+    },
+    {
+      "path": "include/ops/warp/memory/tile/complex/complex_global_to_shared.cuh",
+      "bytes": 3556,
+      "sha256": "57f1888c7ee87ff73496512ba61bcbfcb46f2ebdc096629f4aa5b034043f7361"
+    },
+    {
+      "path": "include/ops/warp/memory/tile/complex/complex_shared_to_register.cuh",
+      "bytes": 1232,
+      "sha256": "ab277618e55cb20949089830bfc6346a42d5b0f3d16d86f0c1f68799fdb30967"
+    },
+    {
+      "path": "include/ops/warp/memory/tile/global_to_register.cuh",
+      "bytes": 11070,
+      "sha256": "b905a8b626da7e4f375a95d67a7fc6df1847af4c1b9a808318b6e5122ead263b"
+    },
+    {
+      "path": "include/ops/warp/memory/tile/global_to_shared.cuh",
+      "bytes": 7794,
+      "sha256": "ac7faade8a14b041de70f08f8d8244688280321c525ccb2dea6f39ef0242b094"
+    },
+    {
+      "path": "include/ops/warp/memory/tile/pgl_to_register.cuh",
+      "bytes": 10993,
+      "sha256": "13fbca10b8def94d6b1a413d8d4d71830e2f2e13f0122b3253582f66e70a84e6"
+    },
+    {
+      "path": "include/ops/warp/memory/tile/pgl_to_shared.cuh",
+      "bytes": 10436,
+      "sha256": "c3dd25a64450e054f3723960b707e61398c56cbe69c98cd157aa845f4cb9287b"
+    },
+    {
+      "path": "include/ops/warp/memory/tile/shared_to_register.cuh",
+      "bytes": 16050,
+      "sha256": "301a60786f024d4025a449702a4fe8905bf4a0b622719e7cfa889b04cadf4147"
+    },
+    {
+      "path": "include/ops/warp/memory/tile/tile.cuh",
+      "bytes": 508,
+      "sha256": "23e3346fcb7a30ba71bc47fa320db4ed3da5cdf071e36c648035bb5ff209cf4f"
+    },
+    {
+      "path": "include/ops/warp/memory/tile/tma.cuh",
+      "bytes": 27891,
+      "sha256": "abfbd5f068c39fe254842d9f288efae8ae9517606a347d4087472666f7d8a452"
+    },
+    {
+      "path": "include/ops/warp/memory/util/reduce.cuh",
+      "bytes": 9599,
+      "sha256": "62f893356f136aa375579278c067a86230ba8dee8dbfca03a96c177545d9ba52"
+    },
+    {
+      "path": "include/ops/warp/memory/util/tma.cuh",
+      "bytes": 8747,
+      "sha256": "7d67c040bb68bed3b3ec1c9222d6676147fa916c3c80d80f49581bddb61f8116"
+    },
+    {
+      "path": "include/ops/warp/memory/util/util.cuh",
+      "bytes": 17115,
+      "sha256": "b6c16c28900b4742387577ef89ce782b1f95b15e93c3d7c77d782ef688797edf"
+    },
+    {
+      "path": "include/ops/warp/memory/vec/global_to_register.cuh",
+      "bytes": 5841,
+      "sha256": "0b5efe8ac022a083aa92559f6598f39a81a4ee71e427a75e7bce7f11d3daacc8"
+    },
+    {
+      "path": "include/ops/warp/memory/vec/global_to_shared.cuh",
+      "bytes": 4090,
+      "sha256": "25eb85a68542c948b17d06dd4953b794132cb324482e06a110a4fc69be0347c4"
+    },
+    {
+      "path": "include/ops/warp/memory/vec/pgl_to_register.cuh",
+      "bytes": 10601,
+      "sha256": "50e0db403bb89e5ec43683f7318a26b95ca812cbc127016047ee03d5cda0b350"
+    },
+    {
+      "path": "include/ops/warp/memory/vec/pgl_to_shared.cuh",
+      "bytes": 5842,
+      "sha256": "7ef2d3d63a1cc1413fe6bc9a6259e0f9eb798082749a52059d3fc69f1e52121b"
+    },
+    {
+      "path": "include/ops/warp/memory/vec/shared_to_register.cuh",
+      "bytes": 6296,
+      "sha256": "86c12d724bc5b35ed102b4c8e03caffdc0e8328b9e484d53395c66b3d6df88f4"
+    },
+    {
+      "path": "include/ops/warp/memory/vec/tma.cuh",
+      "bytes": 25012,
+      "sha256": "2c7ee98a18b5dfa7bbd056c28f6f56bb9fb2aaea9fb0ff9e144ed5a24250a667"
+    },
+    {
+      "path": "include/ops/warp/memory/vec/vec.cuh",
+      "bytes": 361,
+      "sha256": "3d5cf8221e4da8f45c4fea40a0250c6231d3f7708e595850263a4ae71c67ec30"
+    },
+    {
+      "path": "include/ops/warp/register/register.cuh",
+      "bytes": 158,
+      "sha256": "2f2b310b2760c25d255a9298db0e32da07f99cb7a3361934ecfa4e652189b79e"
+    },
+    {
+      "path": "include/ops/warp/register/tile/complex/complex_conversions.cuh",
+      "bytes": 4701,
+      "sha256": "4cd5c698979c0d2e81c61545d1eaa6e587dc8585d73a656742dc4a1597ffaea9"
+    },
+    {
+      "path": "include/ops/warp/register/tile/complex/complex_maps.cuh",
+      "bytes": 4061,
+      "sha256": "80468bdd3574c4b2cf42c038d113596d93f59c09831eb5e7b723c95dac1683f3"
+    },
+    {
+      "path": "include/ops/warp/register/tile/complex/complex_mma.cuh",
+      "bytes": 3253,
+      "sha256": "89811372f68f24a791a2bd953a2f39bd0eb651e38373311ea4415c868ec2fe2c"
+    },
+    {
+      "path": "include/ops/warp/register/tile/conversions.cuh",
+      "bytes": 40310,
+      "sha256": "2078ac101dc1a8c95ab6fe84660946c6031844ea5e8aafc26ce61ac6b8263192"
+    },
+    {
+      "path": "include/ops/warp/register/tile/maps.cuh",
+      "bytes": 36804,
+      "sha256": "9529f302a87dc1e85e5441446ca9b2cf7de8c5c36c658531af878a4b7135accc"
+    },
+    {
+      "path": "include/ops/warp/register/tile/mma.cuh",
+      "bytes": 37230,
+      "sha256": "f8235d23605aac383f9b75600cccb9572693638ed4a736ab1cc00830f58bf89d"
+    },
+    {
+      "path": "include/ops/warp/register/tile/reductions.cuh",
+      "bytes": 27330,
+      "sha256": "82d639f150482afdd1fb5212ae6c1b4ab07670132593d30226e6a155eacc3fa3"
+    },
+    {
+      "path": "include/ops/warp/register/tile/tile.cuh",
+      "bytes": 310,
+      "sha256": "c73a46562d27d2e27ded88e4269f15d5064fc8b250573aade436638c26664424"
+    },
+    {
+      "path": "include/ops/warp/register/vec/conversions.cuh",
+      "bytes": 7034,
+      "sha256": "9dbc774af7f74a9b54ef8b0f2a55cdc29798a50ed95010ea8ae3b43a9f7dc4ca"
+    },
+    {
+      "path": "include/ops/warp/register/vec/maps.cuh",
+      "bytes": 12400,
+      "sha256": "bfdb1b6304adc63d70fba540fb393017a306f43da27a737e095d76c3b949d5aa"
+    },
+    {
+      "path": "include/ops/warp/register/vec/reductions.cuh",
+      "bytes": 12753,
+      "sha256": "460e73a3a0e6042e01764eeb29857d76087d39b0e9f9a96d4ab9ae69f7f4c154"
+    },
+    {
+      "path": "include/ops/warp/register/vec/vec.cuh",
+      "bytes": 175,
+      "sha256": "99fa8b7e3bda1bebc9cf3a974b4b3ff2a24e1d497328b67529fdec6242dfaa5b"
+    },
+    {
+      "path": "include/ops/warp/shared/shared.cuh",
+      "bytes": 153,
+      "sha256": "a94dd2790c82513de5f89195d0210ad4b81bdd9a3e03817bd32c5af6c62f6009"
+    },
+    {
+      "path": "include/ops/warp/shared/tile/conversions.cuh",
+      "bytes": 2399,
+      "sha256": "69197ed7063d9e3a8fb45706b554439301c10a97a63c39c266552dfb91a7bacb"
+    },
+    {
+      "path": "include/ops/warp/shared/tile/maps.cuh",
+      "bytes": 22830,
+      "sha256": "0eb7cd68dd3e0d1ee27a82fa78d4581f3a90a95926aeb26946a71d53e16ceffe"
+    },
+    {
+      "path": "include/ops/warp/shared/tile/reductions.cuh",
+      "bytes": 14681,
+      "sha256": "126249609cf288e2434ebe08b142ea45628f5abf15c7ca36fd85728aec3d4892"
+    },
+    {
+      "path": "include/ops/warp/shared/tile/tile.cuh",
+      "bytes": 171,
+      "sha256": "9997263442de2d3e9fddd1b25ede9df04e5cd21169ddf32ac400d8cb726a2c8e"
+    },
+    {
+      "path": "include/ops/warp/shared/vec/conversions.cuh",
+      "bytes": 2124,
+      "sha256": "3838bd2f9fa54b2109a0379153cee586fd36d7ea6b1cbd1f94ad7ed15d6a040d"
+    },
+    {
+      "path": "include/ops/warp/shared/vec/maps.cuh",
+      "bytes": 11586,
+      "sha256": "3656be065f388fb2ed636e5237dbc3e151f5f7cdf01b2854b1f5c840e56e4b8b"
+    },
+    {
+      "path": "include/ops/warp/shared/vec/reductions.cuh",
+      "bytes": 8935,
+      "sha256": "18a915da20398cc8ebd25a04b4f31f05fa9a1c4bc67ea964f5575dd58f57016d"
+    },
+    {
+      "path": "include/ops/warp/shared/vec/vec.cuh",
+      "bytes": 187,
+      "sha256": "6ebfc5a933909b8065f28ba3ae65f0de8a056b039ec2bb8ff7d530f8f6220d5e"
+    },
+    {
+      "path": "include/ops/warp/warp.cuh",
+      "bytes": 283,
+      "sha256": "e38ac9e3c45279363c6db861cf9a786d9df1be635e1786d3c1bb204401c206a5"
+    },
+    {
+      "path": "include/pyutils/club.cuh",
+      "bytes": 3194,
+      "sha256": "5f6fcff2b77375066139990391ed7737c19e5219cbe4cdb0ee6b82f6750990a9"
+    },
+    {
+      "path": "include/pyutils/pyutils.cuh",
+      "bytes": 3110,
+      "sha256": "bd1ab9b8fe12b0316c038e0575faa22ddde953be8350b41b12853a05dfb97373"
+    },
+    {
+      "path": "include/pyutils/torch_helpers.cuh",
+      "bytes": 271,
+      "sha256": "d8aea826ac33d0e1c0e057d3f5585f0d5b9bd51b6e0fac18b68ecbdaca68afc7"
+    },
+    {
+      "path": "include/pyutils/util.cuh",
+      "bytes": 519,
+      "sha256": "4c2834600e4f0e727af3599132dd1a4ff940088517bf7eb665eaac409385439a"
+    },
+    {
+      "path": "include/types/device/detail/helpers.cuh",
+      "bytes": 2161,
+      "sha256": "b0d13a588ae1294b4760a5094f668df807ce805430647dcebb08dbcb41fad0fe"
+    },
+    {
+      "path": "include/types/device/device.cuh",
+      "bytes": 140,
+      "sha256": "6831d869d808cec831006b49542c46e646bc928742560a937f48ca33a39524c2"
+    },
+    {
+      "path": "include/types/device/pgl.cuh",
+      "bytes": 15679,
+      "sha256": "79b973e08fac6ddf88391011e9f670341e5448baffff24880b6a927fa92e5698"
+    },
+    {
+      "path": "include/types/device/sync_manager.cuh",
+      "bytes": 4276,
+      "sha256": "7cc6716d2ba8c336f8d2a498784bd7f6f7062ff190ca83bcd1bcd05f7986622b"
+    },
+    {
+      "path": "include/types/global/cgl.cuh",
+      "bytes": 1310,
+      "sha256": "05eca00a40f2504ad886c2002f1c465bf6a9fdb0395b7e05058dc7b29c49cfe2"
+    },
+    {
+      "path": "include/types/global/gl.cuh",
+      "bytes": 9911,
+      "sha256": "f2f983e78f6c605cf364eae3c839c56db0309e5f503dd0849ce496e5b39451fa"
+    },
+    {
+      "path": "include/types/global/global.cuh",
+      "bytes": 224,
+      "sha256": "3d1a8bedc83149a336ef70fae6ca411074885952d3bd8365c220f32f72de5616"
+    },
+    {
+      "path": "include/types/global/tma.cuh",
+      "bytes": 14230,
+      "sha256": "eef62260c6e18eafd2c29823d72543933726093f0e496d3b2a1fe35dc64f5e53"
+    },
+    {
+      "path": "include/types/global/util.cuh",
+      "bytes": 4848,
+      "sha256": "e6393e7b4f3c41781e8b052d6396704b3c007258890222c6d3ef791b8d549b61"
+    },
+    {
+      "path": "include/types/register/crt.cuh",
+      "bytes": 3694,
+      "sha256": "c376a18576fe72cc1b99535bf438f9e06f247310773969a4d7ddfa61761c0c01"
+    },
+    {
+      "path": "include/types/register/crv.cuh",
+      "bytes": 3527,
+      "sha256": "342996a4bbffa22f891f1b929e069fd0f29bc33af17e56181bcf13f2981a90bf"
+    },
+    {
+      "path": "include/types/register/register.cuh",
+      "bytes": 245,
+      "sha256": "5102ec7e7aa6b66312297c24f7df9b27395e9122fe549fc024b0bf8d17b8d666"
+    },
+    {
+      "path": "include/types/register/rt.cuh",
+      "bytes": 6827,
+      "sha256": "de670c88656b74d81b2bbd9bc8f82f70acc50722c8830ca9a1c165a41d7b5a6e"
+    },
+    {
+      "path": "include/types/register/rt_base.cuh",
+      "bytes": 4749,
+      "sha256": "91425f5bb697c07f80abbae9b4116096d9deaceaeef0401e347c76916e645f10"
+    },
+    {
+      "path": "include/types/register/rt_layout.cuh",
+      "bytes": 962,
+      "sha256": "8f27d8b9f3516269b09b24195eb2fb382fd63daf770534b6285696c925d649b6"
+    },
+    {
+      "path": "include/types/register/rv.cuh",
+      "bytes": 5567,
+      "sha256": "3672d530b17e6df6ec843bd219e1e9592bf00efd88babca1a193b0f660d59241"
+    },
+    {
+      "path": "include/types/register/rv_layout.cuh",
+      "bytes": 1022,
+      "sha256": "8205aa7b6941852c093e32a113be35390fd292a440b69c6be357fd7cb3003d30"
+    },
+    {
+      "path": "include/types/shared/cst.cuh",
+      "bytes": 2653,
+      "sha256": "ab2bb408750dcb5849eba95ff29da9f635b47c8bdb21ab45c1989844cc04c712"
+    },
+    {
+      "path": "include/types/shared/csv.cuh",
+      "bytes": 2393,
+      "sha256": "fbe1b757a7f19831a4c2ebca1f9b0e2c55c3e0a274cd3c1c38f5c52a83b0d5d6"
+    },
+    {
+      "path": "include/types/shared/shared.cuh",
+      "bytes": 193,
+      "sha256": "716ad1f195a6663f996c81898bb397238a729c6df7136798806359d1b666b939"
+    },
+    {
+      "path": "include/types/shared/st.cuh",
+      "bytes": 12565,
+      "sha256": "6ebf57a645ca273d84e7a31f8522c7ba7df890aa015aa2a55a851e9ceb8e97f3"
+    },
+    {
+      "path": "include/types/shared/sv.cuh",
+      "bytes": 4338,
+      "sha256": "b8317d84800b5d97be351a6f10ad1f58035590363a3975d563d94ae0a12adf0e"
+    },
+    {
+      "path": "include/types/types.cuh",
+      "bytes": 1581,
+      "sha256": "b78c130f89b69374d0bf8dd0655f1670cfc4c2fd48b128d5c67eb528d10253c5"
+    },
+    {
+      "path": "prototype/common/common.cuh",
+      "bytes": 58,
+      "sha256": "c931530fa7af6f7c9358c4e8a3a2a05924ef6691b55eac8ee4ba7d85be8f1e1e"
+    },
+    {
+      "path": "prototype/common/templates.cuh",
+      "bytes": 4834,
+      "sha256": "3d8248d399cdc546f3f6ed492ea0d46affec22927f13d3da0003a1e4259e2369"
+    },
+    {
+      "path": "prototype/common/util.cuh",
+      "bytes": 808,
+      "sha256": "2e508ebf6277d8c633151a4dee875aad91d2b435920cdd28d42e5558e3d525c0"
+    },
+    {
+      "path": "prototype/interpreter/interpreter.cuh",
+      "bytes": 23530,
+      "sha256": "77e10a5e221c3cf2f9baaf0758afeae598bbfadfaaff6e1911cf6f248bd8fb11"
+    },
+    {
+      "path": "prototype/interpreter/templates.cuh",
+      "bytes": 5839,
+      "sha256": "bdfd4323075b33b41cc985e6f15b10f6ac00f686024837d04f6ce078dd37b47b"
+    },
+    {
+      "path": "prototype/lcf/lcf.cuh",
+      "bytes": 10601,
+      "sha256": "d9d093d123dfd6cdcd30f4b17c95ed05016cb5ef7033fa4f26bb93e55a011ee1"
+    },
+    {
+      "path": "prototype/lcf/templates.cuh",
+      "bytes": 3807,
+      "sha256": "eb077c3776d809c21f4783c66a456b47b56adfc09d5149271b12c18d1efda286"
+    },
+    {
+      "path": "prototype/lcsf/lcsf.cuh",
+      "bytes": 14317,
+      "sha256": "a1fb62399f5b306a5174a46f90aa80e9e6db0fb673aeb8e6509c4d7ebbac8a3f"
+    },
+    {
+      "path": "prototype/lcsf/templates.cuh",
+      "bytes": 4659,
+      "sha256": "f7894918edb3d194f53788b223c4ead83818056794f9d52a15c7ec2b12ab5ebb"
+    },
+    {
+      "path": "prototype/prototype.cuh",
+      "bytes": 294,
+      "sha256": "f7484b718e53d9c7e568a9ad4acff8b7681abbb9a1cd313d9594c25e2f82929a"
+    }
+  ],
+  "scope": "headers and license used by the build, not a full TK repository export"
+}

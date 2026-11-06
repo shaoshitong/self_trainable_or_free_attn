@@ -1,0 +1,35 @@
+{
+  "schema": "portable-r3-control-v1",
+  "files": [
+    {
+      "path": "SOURCE_MANIFEST.yaml",
+      "bytes": 11790,
+      "sha256": "a5488a0ab9a21f3753a927d86cbcdb05b57a690eaea3fd2e753df9561dc8dbab"
+    },
+    {
+      "path": "check_compare.py",
+      "bytes": 4375,
+      "sha256": "4b317f31a7390716c37628b3f744f8fff20fd418444e4f02d05d59eadf769fcd"
+    },
+    {
+      "path": "TK_SOURCE_MANIFEST.yaml",
+      "bytes": 23932,
+      "sha256": "8bff31ad17918f9b6ccb61277bc6d2b3edf614e8aa4d14ca6ff0adac21bce31e"
+    },
+    {
+      "path": "probe.py",
+      "bytes": 2168,
+      "sha256": "abafb84ef08c2c5ac5736742346a6626b6146decb35d94f42024ce83c4986752"
+    },
+    {
+      "path": "job.sh",
+      "bytes": 4996,
+      "sha256": "d58d3c034ff2294d2b7a63c5b67f6ff5139295d61ef2a6431a0433fb2e42616d"
+    },
+    {
+      "path": "check_suites.py",
+      "bytes": 953,
+      "sha256": "2a47f39287c39ee95a6b3aa7ecef47da81ae36211383c3f408643ef095fc801d"
+    }
+  ]
+}
