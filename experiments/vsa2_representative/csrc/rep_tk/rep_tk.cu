@@ -354,7 +354,9 @@ __device__ __forceinline__ void online_softmax_tk(rt_fl<16, 64>& att, col_vec<rt
 // this kernel carries more live state (the tile stream, a tile of biases ahead) and measured 0.723 ms at
 // MINB 4 vs 0.521 ms at MINB 3 for tier A alone (L=16k H=16 D=128; native TK 0.487). REP_TK_FWD_CFG=0
 // selects 4 for comparison. HAND_SM = true keeps the previous hand-written softmax (log2 domain, deferred
-// row sums) as a same-build control, REP_TK_FWD_CFG=6.
+// row sums) as a same-build control, REP_TK_FWD_CFG=6. At MINB 3 the D=128 A|B|C path sits on the
+// 168-register cap and spills; REP_TK_FWD_CFG=8 / 9 are the same two kernels at MINB 2 (cap 255), to
+// measure that cap against the occupancy it buys.
 template <int D, int MINB, bool A_ONLY = false, bool HAND_SM = false>
 __global__ __launch_bounds__(128, MINB) void fwd_ker(const __grid_constant__ fwd_globals<D> g) {
 #if REP_TK_HOPPER
@@ -1243,7 +1245,7 @@ static void fwd_impl(torch::Tensor q, torch::Tensor k, torch::Tensor v, const st
       b_idx.data_ptr<int>(), reinterpret_cast<const uint32_t*>(bits_ab.data_ptr<int>()), blk_cnt.data_ptr<int>(),
       (int)H, (int)L, NB, NBt, RM, words_of(NB), phases, diag};
   constexpr int mem = 3 * 64 * D * 2 + 1024;  // q, k, v tiles + alignment slack
-  static int cfg = -1;  // 0: MINB 4, else MINB 3 (default, measured best); 2-7 diagnostics
+  static int cfg = -1;  // 0: MINB 4, else MINB 3 (default, measured best); 2-9 diagnostics
   if (cfg < 0) {
     const char* e = std::getenv("REP_TK_FWD_CFG");
     cfg = e ? std::atoi(e) : 1;
@@ -1263,6 +1265,9 @@ static void fwd_impl(torch::Tensor q, torch::Tensor k, torch::Tensor v, const st
   else if (cfg == 3 && phases == 1) launch(rep_tk::fwd_ker<D, 3, true>);
   // cfg 6: the default kernel with the previous hand-written softmax (same-build control, all tiers)
   else if (cfg == 6) launch(rep_tk::fwd_ker<D, 3, false, true>);
+  // cfg 8 / 9: cfg 1 / cfg 6 at MINB 2 (register-cap control; same grid, block, shared memory, tile work)
+  else if (cfg == 8) launch(rep_tk::fwd_ker<D, 2>);
+  else if (cfg == 9) launch(rep_tk::fwd_ker<D, 2, false, true>);
   else launch(rep_tk::fwd_ker<D, 3>);
   check_launch("fwd");
 }
