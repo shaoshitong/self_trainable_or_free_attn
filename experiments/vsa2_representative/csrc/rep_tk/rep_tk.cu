@@ -322,11 +322,35 @@ __device__ __forceinline__ void issue_tile(int2 tile, typename fwd_globals<D>::t
   }
 }
 
+// One tile of the online softmax with TK's vector ops. `att` holds log2-domain logits with every bias and
+// mask already applied (-inf = absent column); m is the running row max, l the running row sum, o is
+// rescaled to the new max. m stays -inf until a row sees a valid column -- an all-masked tile can precede
+// valid work (a zero-count tier-A block, an empty tier-B group) -- so the subtrahend is m clamped to the
+// lowest finite float: the baseline's `mn == -inf ? 0 : mn` guard, giving exp2(-inf - lowest) = 0
+// instead of -inf - -inf = NaN. Where m is finite the clamp is the identity.
+template <int D>
+__device__ __forceinline__ void online_softmax_tk(rt_fl<16, 64>& att, col_vec<rt_fl<16, 64>>& m,
+                                                  col_vec<rt_fl<16, 64>>& l, rt_fl<16, D>& o) {
+  constexpr float kLowest = -3.40282347e38f;
+  col_vec<rt_fl<16, 64>> alpha, mu;
+  copy(alpha, m);
+  row_max(m, att, m);
+  kittens::max(mu, m, kLowest);
+  sub_row(att, att, mu);
+  exp2(att, att);
+  sub(alpha, alpha, mu);
+  exp2(alpha, alpha);
+  mul(l, l, alpha);
+  row_sum(l, att, l);
+  mul_row(o, o, alpha);
+}
+
 // MINB: CTAs per SM the register budget is sized for. 4 is VSA2's TK forward, capping at 128 registers;
 // this kernel carries more live state (the tile stream, a tile of biases ahead) and measured 0.723 ms at
 // MINB 4 vs 0.521 ms at MINB 3 for tier A alone (L=16k H=16 D=128; native TK 0.487). REP_TK_FWD_CFG=0
-// selects 4 for comparison.
-template <int D, int MINB, bool A_ONLY = false>
+// selects 4 for comparison. HAND_SM = true keeps the previous hand-written softmax (log2 domain, deferred
+// row sums) as a same-build control, REP_TK_FWD_CFG=6.
+template <int D, int MINB, bool A_ONLY = false, bool HAND_SM = false>
 __global__ __launch_bounds__(128, MINB) void fwd_ker(const __grid_constant__ fwd_globals<D> g) {
 #if REP_TK_HOPPER
   constexpr float SL2 = kLog2e * (D == 64 ? 0.125f : 0.08838834764f);
@@ -395,8 +419,11 @@ __global__ __launch_bounds__(128, MINB) void fwd_ker(const __grid_constant__ fwd
   rt_fl<16, 64> att;
   rt_bf<16, 64> att_mma;
   rt_fl<16, D> o_reg;
+  col_vec<rt_fl<16, 64>> m_vec, l_vec;  // log2-domain running max (bias included) and row sum
   zero(o_reg);
-  float m_r[2] = {ninf(), ninf()}, l_r[2] = {0.f, 0.f};
+  neg_infty(m_vec);
+  zero(l_vec);
+  float m_r[2] = {ninf(), ninf()}, l_r[2] = {0.f, 0.f};  // HAND_SM only
   wait(q_bar, 0);
 
   // One pipeline step: S = Q K^T for `cur`, online softmax, O += P V, with the loads of `nxt` issued as
@@ -412,55 +439,75 @@ __global__ __launch_bounds__(128, MINB) void fwd_ker(const __grid_constant__ fwd
     if (nxt.x != kTierNone && warp == 0)
       issue_tile<D>(nxt, k_smem, g.k, g.kt, ksw, nsl, b, h, g.NB, g.RM, k_bar, g.diag & 2, g.diag & 4);
 
-    // online softmax in the log2 domain; rows gq (data 0, 2) and gq + 8 (data 1, 3)
-    float mx[2] = {ninf(), ninf()};
+    if constexpr (!HAND_SM) {
+      // log2 domain, then each column's + log2(c) bias (or -inf mask) before the row max
+      mul(att, att, SL2);
+      if constexpr (BC) {
+        if (masked) {
 #pragma unroll
-    for (int i = 0; i < 4; ++i)
+          for (int i = 0; i < 4; ++i)
 #pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        float2& e = att.tiles[0][i].data[j];
-        float b0 = 0.f, b1 = 0.f;
-        if constexpr (BC) {
-          if (masked) {
-            b0 = cb.v[i][(j >> 1) * 2];
-            b1 = cb.v[i][(j >> 1) * 2 + 1];
-          }
-        } else if (kcA < kB) {  // partial tier-A block
-          const int c = 16 * i + 2 * (lane & 3) + 8 * (j >> 1);
-          b0 = c < kcA ? 0.f : ninf();
-          b1 = c + 1 < kcA ? 0.f : ninf();
+            for (int j = 0; j < 4; ++j) {
+              float2& e = att.tiles[0][i].data[j];
+              e.x += cb.v[i][(j >> 1) * 2];
+              e.y += cb.v[i][(j >> 1) * 2 + 1];
+            }
         }
-        e.x = e.x * SL2 + b0;
-        e.y = e.y * SL2 + b1;
-        mx[j & 1] = fmaxf(mx[j & 1], fmaxf(e.x, e.y));
+      } else if (kcA < kB) {  // partial tier-A block: VSA2's own column mask
+        right_fill(att, att, kcA, base_types::constants<float>::neg_infty());
       }
-    float mu[2], alpha[2];
+      online_softmax_tk<D>(att, m_vec, l_vec, o_reg);
+    } else {
+      // the previous hand-written softmax; rows gq (data 0, 2) and gq + 8 (data 1, 3)
+      float mx[2] = {ninf(), ninf()};
 #pragma unroll
-    for (int r = 0; r < 2; ++r) {
-      float v2 = fmaxf(mx[r], __shfl_xor_sync(0xffffffffu, mx[r], 1));
-      v2 = fmaxf(v2, __shfl_xor_sync(0xffffffffu, v2, 2));
-      const float mn = fmaxf(m_r[r], v2);
-      mu[r] = mn == ninf() ? 0.f : mn;
-      alpha[r] = exp2f(m_r[r] - mu[r]);
-      m_r[r] = mn;
-      l_r[r] *= alpha[r];
+      for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          float2& e = att.tiles[0][i].data[j];
+          float b0 = 0.f, b1 = 0.f;
+          if constexpr (BC) {
+            if (masked) {
+              b0 = cb.v[i][(j >> 1) * 2];
+              b1 = cb.v[i][(j >> 1) * 2 + 1];
+            }
+          } else if (kcA < kB) {  // partial tier-A block
+            const int c = 16 * i + 2 * (lane & 3) + 8 * (j >> 1);
+            b0 = c < kcA ? 0.f : ninf();
+            b1 = c + 1 < kcA ? 0.f : ninf();
+          }
+          e.x = e.x * SL2 + b0;
+          e.y = e.y * SL2 + b1;
+          mx[j & 1] = fmaxf(mx[j & 1], fmaxf(e.x, e.y));
+        }
+      float mu[2], alpha[2];
+#pragma unroll
+      for (int r = 0; r < 2; ++r) {
+        float v2 = fmaxf(mx[r], __shfl_xor_sync(0xffffffffu, mx[r], 1));
+        v2 = fmaxf(v2, __shfl_xor_sync(0xffffffffu, v2, 2));
+        const float mn = fmaxf(m_r[r], v2);
+        mu[r] = mn == ninf() ? 0.f : mn;
+        alpha[r] = exp2f(m_r[r] - mu[r]);
+        m_r[r] = mn;
+        l_r[r] *= alpha[r];
+      }
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          float2& e = att.tiles[0][i].data[j];
+          e.x = exp2f(e.x - mu[j & 1]);
+          e.y = exp2f(e.y - mu[j & 1]);
+          l_r[j & 1] += e.x + e.y;
+        }
+#pragma unroll
+      for (int n = 0; n < ND; ++n)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          o_reg.tiles[0][n].data[j].x *= alpha[j & 1];
+          o_reg.tiles[0][n].data[j].y *= alpha[j & 1];
+        }
     }
-#pragma unroll
-    for (int i = 0; i < 4; ++i)
-#pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        float2& e = att.tiles[0][i].data[j];
-        e.x = exp2f(e.x - mu[j & 1]);
-        e.y = exp2f(e.y - mu[j & 1]);
-        l_r[j & 1] += e.x + e.y;
-      }
-#pragma unroll
-    for (int n = 0; n < ND; ++n)
-#pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        o_reg.tiles[0][n].data[j].x *= alpha[j & 1];
-        o_reg.tiles[0][n].data[j].y *= alpha[j & 1];
-      }
     copy(att_mma, att);
 
     wait(v_bar, it & 1);
@@ -495,15 +542,31 @@ __global__ __launch_bounds__(128, MINB) void fwd_ker(const __grid_constant__ fwd
 
 epilogue:
   // epilogue: o = o / l (padded query rows -> 0), natural lse = (m + log2 l) * ln 2 (finite on padded
-  // rows, which the TK backward relies on, like the native kernel)
+  // rows, which the TK backward relies on, like the native kernel). Rows gq and gq + 8 of each warp.
+  float m_row[2], l_row[2];
+  if constexpr (HAND_SM) {
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+      m_row[r] = m_r[r];
+      l_row[r] = l_r[r] + __shfl_xor_sync(0xffffffffu, l_r[r], 1);
+      l_row[r] += __shfl_xor_sync(0xffffffffu, l_row[r], 2);
+    }
+  } else {
+    // row_max / row_sum leave a row's value in every lane of its quad: TK's ortho col_vec of a row-layout
+    // tile, .x = row gq, .y = row gq + 8
+    static_assert(decltype(m_vec)::outer_dim == 1 && decltype(m_vec)::inner_dim == 1, "col_vec layout");
+    m_row[0] = m_vec.data[0][0].x;
+    m_row[1] = m_vec.data[0][0].y;
+    l_row[0] = l_vec.data[0][0].x;
+    l_row[1] = l_vec.data[0][0].y;
+  }
   float inv[2], lse[2];
 #pragma unroll
   for (int r = 0; r < 2; ++r) {
-    float l = l_r[r] + __shfl_xor_sync(0xffffffffu, l_r[r], 1);
-    l += __shfl_xor_sync(0xffffffffu, l, 2);
+    const float l = l_row[r];
     const int row = 16 * warp + gq + 8 * r;
     inv[r] = (row < qcnt && l > 0.f) ? 1.f / l : 0.f;
-    lse[r] = l > 0.f ? (m_r[r] + __log2f(l)) * kLn2 : ninf();
+    lse[r] = l > 0.f ? (m_row[r] + __log2f(l)) * kLn2 : ninf();
   }
 #pragma unroll
   for (int n = 0; n < ND; ++n)
@@ -1151,7 +1214,7 @@ static void fwd_impl(torch::Tensor q, torch::Tensor k, torch::Tensor v, const st
       b_idx.data_ptr<int>(), reinterpret_cast<const uint32_t*>(bits_ab.data_ptr<int>()), blk_cnt.data_ptr<int>(),
       (int)H, (int)L, NB, NBt, RM, words_of(NB), phases, diag};
   constexpr int mem = 3 * 64 * D * 2 + 1024;  // q, k, v tiles + alignment slack
-  static int cfg = -1;  // 0: MINB 4, else MINB 3 (default, measured best); 2-5 diagnostics
+  static int cfg = -1;  // 0: MINB 4, else MINB 3 (default, measured best); 2-6 diagnostics
   if (cfg < 0) {
     const char* e = std::getenv("REP_TK_FWD_CFG");
     cfg = e ? std::atoi(e) : 1;
@@ -1167,6 +1230,8 @@ static void fwd_impl(torch::Tensor q, torch::Tensor k, torch::Tensor v, const st
   else if (cfg == 0) launch(rep_tk::fwd_ker<D, 4>);
   else if (cfg == 2 && phases == 1) launch(rep_tk::fwd_ker<D, 4, true>);
   else if (cfg == 3 && phases == 1) launch(rep_tk::fwd_ker<D, 3, true>);
+  // cfg 6: the default kernel with the previous hand-written softmax (same-build control, all tiers)
+  else if (cfg == 6) launch(rep_tk::fwd_ker<D, 3, false, true>);
   else launch(rep_tk::fwd_ker<D, 3>);
   check_launch("fwd");
 }
