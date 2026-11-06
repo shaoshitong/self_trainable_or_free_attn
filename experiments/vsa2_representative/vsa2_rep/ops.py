@@ -190,7 +190,7 @@ def _pooled_tables_enabled() -> bool:
     rounded to bf16 before the block mean is formed.
     """
     import os
-    return os.environ.get("REP_TK_FWD_CFG") == _POOLED_TABLES_CFG
+    return os.environ.get("REP_TK_FWD_CFG") != "43"  # 42 is the accepted alias, 43 rebuilds from K/V
 
 
 _ROUTE_GRAPH_CACHE = {}
