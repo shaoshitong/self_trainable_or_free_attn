@@ -82,6 +82,7 @@ def rep_fine_reference(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, blk_cn
     vis = torch.cat([tier_a.repeat_interleave(64, dim=3) & valid_tok[None, None, None, :],
                      tier_b.repeat_interleave(RM, dim=3),
                      tier_c], dim=3)                                  # [B, H, NB, C]
+    vis = vis & (bias > neg)[None, None, None, :]                     # an empty group is not a column
     vis = vis.repeat_interleave(64, dim=2)                            # [B, H, L, C]
 
     logits = (q.to(dtype) @ Kc.transpose(-1, -2)) * (D ** -0.5) + bias

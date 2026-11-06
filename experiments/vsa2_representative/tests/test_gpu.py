@@ -9,6 +9,8 @@ Needs the built extension. Each test states what it pins down:
   backward     dQ, dK, dV match the reference's autograd
   unpool       a representative's gradient is spread as drep / c over the tokens it averaged
   partial      a partial last block (blk_cnt < 64) is handled in every tier and in the gradients
+  masked       zero-count and partial blocks, all-masked first/intermediate tiles and empty selections:
+               forward, lse and all three gradients per tier, padded slots exactly zero
 
 Run: /opt/venv/bin/python tests/test_gpu.py
 """
@@ -55,6 +57,10 @@ def rand_sel(nb, H, B, pa, pb, seed):
     g = torch.Generator(device=DEV).manual_seed(seed)
     ma = torch.rand(B, H, nb, nb, device=DEV, generator=g) < pa
     mab = ma | (torch.rand(B, H, nb, nb, device=DEV, generator=g) < pb)
+    return sel_from_masks(ma, mab)
+
+
+def sel_from_masks(ma, mab):
     ba, bab = pack_bits(ma), pack_bits(mab)
     # tier A also needs its CSR lists (the kernels walk them, and the KV-owner backward inverts them)
     qp, qi = _csr(ma)
@@ -228,12 +234,98 @@ def test_end_to_end_operator():
         FAILED.append("end-to-end operator")
 
 
+def _rows(nb, H, picks, fill_ab=False):
+    """Tier masks from {query block: (tier-A kv blocks, tier-B kv blocks)}; other rows are all tier C."""
+    ma = torch.zeros(1, H, nb, nb, dtype=torch.bool, device=DEV)
+    mab = torch.full_like(ma, fill_ab)
+    for qb, (a, b) in picks.items():
+        if a:
+            ma[..., qb, a] = True
+        if a + b:
+            mab[..., qb, a + b] = True
+    return ma, mab
+
+
+def masked_cases():
+    """(name, blk_cnt, D, RM, H, tier masks, phases). A tier-C tile is only walked if some of its blocks
+    are tier C for the row, so an all-masked C tile needs zero-count blocks, not just A|B bits."""
+    every = (("A", PHASE_A), ("B", PHASE_B), ("C", PHASE_C), ("A|B|C", PHASE_ALL))
+    cnts = [0, 64, 64, 0, 64, 64, 37, 64]
+    picks = {0: ([1], [2]),                     # zero-count query block
+             1: ([0], []),                      # first tile masked (A), then valid C
+             2: ([0, 3], []),                   # two masked A tiles, then valid C
+             4: ([0, 1, 3, 5], [2]),            # masked first and intermediate A tiles
+             5: ([1, 3], [0]),                  # masked last A tile, zero-count B entry
+             6: ([3], [0, 1, 2, 4, 5, 6, 7]),   # no tier-C column at all
+             7: ([], [0, 3])}                   # only zero-count B entries, valid C
+    for D, rm in ((64, 4), (128, 4), (128, 2)):
+        yield f"zero-count D={D} RM={rm}", cnts, D, rm, 2, _rows(8, 2, picks), every
+    part = [64, 23, 64, 1, 64, 64, 64, 9]
+    yield "no tier A or B", part, 128, 4, 2, _rows(8, 2, {}), every
+    yield "no tier C", part, 128, 4, 2, _rows(8, 2, {0: ([1, 2], [3])}, fill_ab=True), every
+    yield "every block zero-count", [0] * 8, 128, 4, 2, _rows(8, 2, picks), every
+    # Tiles of 64 kv blocks (A, C) or 16 list entries (B at RM=4): blocks 64..127 hold no tokens.
+    cnts = [64] * 129
+    cnts[64:128] = [0] * 64
+    cnts[40], cnts[128] = 13, 9
+    tiles = {0: ([1, 70, 128], []),                                        # masked intermediate A tile
+             1: ([], list(range(16)) + list(range(64, 80)) + [128]),       # masked intermediate B tile
+             3: ([], list(range(64)))}                                     # first walked C tile masked
+    # row 2 is all tier C: valid, all masked, valid
+    yield "all-masked tiles", cnts, 128, 4, 1, _rows(129, 1, tiles), (("A|B|C", PHASE_ALL),)
+
+
+def _cmp(name, got, want, m, tol):
+    """`got` against `want` on valid slots; padded slots must be exactly zero. NaN fails either check."""
+    if m.any():
+        check(name, got.float()[m], want.float()[m], tol)
+    if not m.all():
+        check(f"{name} padded", got.float()[~m], torch.zeros_like(got.float()[~m]), 0.0)
+
+
+def check_masked_cases(backend):
+    """Forward, lse and dQ/dK/dV of `backend` against the fp64 reference, with the suite's tolerances."""
+    for name, cnts, D, rm, H, (ma, mab), phases in masked_cases():
+        q, k, v, cnt, valid = make(len(cnts), cnts, H=H, D=D, seed=len(cnts) + D + rm)
+        sel = sel_from_masks(ma, mab)
+        torch.manual_seed(99)
+        dout = torch.randn_like(q)
+        dout[:, :, ~valid] = 0
+        m = valid[None, None, :, None].expand_as(q)
+        for pn, ph in phases:
+            tag = f"{backend} {name} {pn}"
+            o, lse = rep_fine_attention(q, k, v, cnt, sel, mid_reps=rm, phases=ph, backend=backend)
+            ro, rlse = rep_fine_reference(q, k, v, cnt, sel.bits_a, sel.bits_ab, rm, ph, torch.float64)
+            _cmp(f"{tag} o", o, ro.float().to(DT), m, 3e-2)
+            rlse = rlse.float()
+            fin = torch.isfinite(rlse) & valid[None, None]
+            same = torch.equal(torch.isfinite(lse) & valid[None, None], fin) and not torch.isnan(lse).any().item()
+            print(f"{'ok ' if same else 'FAIL'} {tag} lse: same empty rows ({int((~fin & valid[None, None]).sum())})")
+            if not same:
+                FAILED.append(f"{tag} empty rows")
+            if fin.any():
+                check(f"{tag} lse", lse[fin], rlse[fin], 3e-3)
+            qg, kg, vg = (t.detach().clone().requires_grad_(True) for t in (q, k, v))
+            o, _ = rep_fine_attention(qg, kg, vg, cnt, sel, mid_reps=rm, phases=ph, backend=backend)
+            o.backward(dout)
+            qr, kr, vr = (t.detach().double().clone().requires_grad_(True) for t in (q, k, v))
+            ro, _ = rep_fine_reference(qr, kr, vr, cnt, sel.bits_a, sel.bits_ab, rm, ph, torch.float64,
+                                       round_reps=False)
+            ro.backward(dout.double())
+            for n, g, r in (("dQ", qg, qr), ("dK", kg, kr), ("dV", vg, vr)):
+                _cmp(f"{tag} {n}", g.grad, r.grad, m, 4e-2)
+
+
+def test_masked_and_empty():
+    check_masked_cases("generic")
+
+
 if __name__ == "__main__":
     assert torch.cuda.is_available(), "these tests need a GPU"
     print(f"device: {torch.cuda.get_device_name(0)}  capability {torch.cuda.get_device_capability(0)}")
     print(f"torch {torch.__version__}\n")
     for fn in (test_routing, test_rep_build, test_forward_per_tier, test_tier_a_matches_vsa2,
-               test_backward, test_unpool_spreads_representative_gradient, test_end_to_end_operator):
+               test_backward, test_unpool_spreads_representative_gradient, test_end_to_end_operator, test_masked_and_empty):
         print(f"--- {fn.__name__}")
         fn()
         torch.cuda.synchronize()

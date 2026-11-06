@@ -8,6 +8,7 @@ VSA2's native TK kernel. Needs a VSA2_REP_TK=1 build on an sm_90 GPU.
   backward    dQ, dK, dV vs the reference's autograd, and vs the generic backend
   routed      the full operator on a routed selection, TK vs generic
   zero_count  zero-count kv blocks whose all-masked A/B/C tiles precede valid work in the tile stream
+  masked      zero-count and partial blocks, all-masked tiles and empty selections, per tier
 
 Run: /opt/venv/bin/python tests/test_gpu_tk.py
 """
@@ -23,7 +24,7 @@ from vsa2_rep.ops import (PHASE_A, PHASE_ALL, PHASE_B, PHASE_C, RepTiers, TierSe
 from vsa2_rep.reference import build_representatives, pack_bits, rep_fine_reference
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from test_gpu import FAILED, _csr, check, make, rand_sel  # noqa: E402
+from test_gpu import FAILED, _csr, check, check_masked_cases, make, rand_sel  # noqa: E402
 
 DEV = "cuda"
 
@@ -221,11 +222,15 @@ def test_zero_count_blocks():
                   grads["generic"][i].float()[m], 2e-2)
 
 
+def test_masked_and_empty():
+    check_masked_cases("tk")
+
+
 if __name__ == "__main__":
     assert ext().has_tk(), "needs a VSA2_REP_TK=1 build"
     print(f"device: {torch.cuda.get_device_name(0)}\n")
     for fn in (test_tables, test_forward, test_native_and_generic, test_backward, test_routed_operator,
-               test_zero_count_blocks):
+               test_zero_count_blocks, test_masked_and_empty):
         print(f"--- {fn.__name__}")
         fn()
         torch.cuda.synchronize()

@@ -136,6 +136,20 @@ def test_phase_masks_select_tiers():
     print("ok  phase mask selects tiers (A alone == attention over the tier-A columns)")
 
 
+def test_row_with_only_empty_columns():
+    """A row whose visible columns all hold zero tokens is empty: o = 0, lse = -inf, no gradient."""
+    nb, H = 2, 1
+    q, k, v, cnt, _ = make(nb, [0, 64], H=H, seed=13)
+    ma = torch.zeros(1, H, nb, nb, dtype=torch.bool)
+    mab = ma.clone()
+    mab[..., 1] = True                      # tiers: kv block 1 is B, the zero-count kv block 0 is C
+    q = q.requires_grad_(True)
+    o, lse = rep_fine_reference(q, k, v, cnt, pack_bits(ma), pack_bits(mab), 4, PHASE_C, DT, False)
+    o.sum().backward()
+    assert (o == 0).all() and torch.isinf(lse).all() and (q.grad == 0).all(), "empty row was not empty"
+    print("ok  a row with only empty columns gives o = 0, lse = -inf and zero gradient")
+
+
 if __name__ == "__main__":
     test_pack_unpack_roundtrip()
     test_tier_a_is_dense()
@@ -143,4 +157,5 @@ if __name__ == "__main__":
     test_tier_b_exact_on_uniform_groups()
     test_mixed_tiers_partition_and_normalize()
     test_phase_masks_select_tiers()
+    test_row_with_only_empty_columns()
     print("\nall CPU reference tests passed")
