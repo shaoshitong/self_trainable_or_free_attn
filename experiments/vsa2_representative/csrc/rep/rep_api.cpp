@@ -10,6 +10,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <vector>
 
 #include "rep_kernels.h"
@@ -224,6 +226,26 @@ std::vector<torch::Tensor> route_tiers(torch::Tensor qr, torch::Tensor kr, torch
   auto* bits_a_p = reinterpret_cast<uint32_t*>(bits_a.data_ptr<int>());
   auto* bits_ab_p = reinterpret_cast<uint32_t*>(bits_ab.data_ptr<int>());
 
+  // REP_TK_FWD_CFG=44: the two budget chains are independent once `scores` exists, and each is fourteen tiny
+  // kernels, so run the A|B chain on a second stream to fill the other's launch gaps. That needs its own
+  // workspace and its own kv->q scratch (both chains otherwise share `k2q_buf`), plus events to order it
+  // against the score pass and to join before the next iteration rewrites `scores`.
+  const bool parallel = std::getenv("REP_TK_FWD_CFG") != nullptr &&
+                        std::strcmp(std::getenv("REP_TK_FWD_CFG"), "44") == 0 && (keff_ab != keff_a);
+  torch::Tensor ws2, ab_k2q_buf2;
+  vsa2::TopkWorkspace w2{};
+  cudaStream_t s2 = nullptr;
+  cudaEvent_t ev_scores = nullptr, ev_ab = nullptr;
+  if (parallel) {
+    ws2 = torch::empty({(long long)vsa2::topk_workspace_bytes(chunk, NB)}, qr.options().dtype(torch::kUInt8));
+    vsa2::topk_carve_workspace(ws2.data_ptr(), chunk, NB, &w2);
+    ab_k2q_buf2 = torch::empty_like(k2q_buf);
+    cudaStreamCreateWithFlags(&s2, cudaStreamNonBlocking);
+    cudaEventCreateWithFlags(&ev_scores, cudaEventDisableTiming);
+    cudaEventCreateWithFlags(&ev_ab, cudaEventDisableTiming);
+    check_launch();
+  }
+
   for (int bh0 = 0; bh0 < BH; bh0 += chunk) {
     const int cnt = std::min(chunk, BH - bh0);
     p.scores = scores.data_ptr<float>();
@@ -237,10 +259,18 @@ std::vector<torch::Tensor> route_tiers(torch::Tensor qr, torch::Tensor kr, torch
     if (keff_ab != keff_a) {
       vsa2::TopkParams ab{scores.data_ptr<float>(), NB,  bh0,                      cnt,
                           keff_ab,                  ab_ptr.data_ptr<int>(), ab_idx.data_ptr<int>(),
-                          ab_k2q_ptr.data_ptr<int>(), k2q_buf.data_ptr<int>()};
-      vsa2::launch_global_topk(ab, w, cur_stream());
-      cudaMemcpyAsync(bits_ab_p + (size_t)bh0 * NB * W, w.selbits, bits_bytes, cudaMemcpyDeviceToDevice,
-                      cur_stream());
+                          ab_k2q_ptr.data_ptr<int>(),
+                          (parallel ? ab_k2q_buf2 : k2q_buf).data_ptr<int>()};
+      if (parallel) {  // the A|B chain waits for the scores it reads, then runs beside the tier-A chain
+        cudaEventRecord(ev_scores, cur_stream());
+        cudaStreamWaitEvent(s2, ev_scores, 0);
+        vsa2::launch_global_topk(ab, w2, s2);
+        cudaMemcpyAsync(bits_ab_p + (size_t)bh0 * NB * W, w2.selbits, bits_bytes, cudaMemcpyDeviceToDevice, s2);
+      } else {
+        vsa2::launch_global_topk(ab, w, cur_stream());
+        cudaMemcpyAsync(bits_ab_p + (size_t)bh0 * NB * W, w.selbits, bits_bytes, cudaMemcpyDeviceToDevice,
+                        cur_stream());
+      }
     }
     // Tier A second, so the CSR buffers end up holding the tier-A lists.
     vsa2::TopkParams a{scores.data_ptr<float>(), NB,  bh0,                      cnt,
@@ -251,7 +281,16 @@ std::vector<torch::Tensor> route_tiers(torch::Tensor qr, torch::Tensor kr, torch
     if (keff_ab == keff_a)
       cudaMemcpyAsync(bits_ab_p + (size_t)bh0 * NB * W, w.selbits, bits_bytes, cudaMemcpyDeviceToDevice,
                       cur_stream());
+    if (parallel) {  // join before the next iteration rewrites `scores`, and before tier-B lists read A|B
+      cudaEventRecord(ev_ab, s2);
+      cudaStreamWaitEvent(cur_stream(), ev_ab, 0);
+    }
     check_launch();
+  }
+  if (parallel) {
+    cudaEventDestroy(ev_scores);
+    cudaEventDestroy(ev_ab);
+    cudaStreamDestroy(s2);  // the join above already ordered the main stream behind every A|B kernel
   }
   const long long used = std::max<long long>(1, (long long)BH * keff_a);
   auto b_ptr = torch::empty({B, H, NB + 1}, i32);
