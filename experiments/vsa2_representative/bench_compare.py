@@ -81,6 +81,7 @@ FWD_CFGS = {
                        "of CFG37"),
     "36": ("operator", "alias of CFG1 since the single-writer dK/dV store became the default"),
     "37": ("operator", "CFG1 forward; the pre-round-11 tier-A backward: zeros(kg), zeros(vg) and the reduce-add kernel"),
+    "38": ("operator", "CFG1 with the representative-table build overlapped with route_tiers on a second stream"),
     "2": ("tier_a_path", "tier-A-only specialisation at MINB 4; other phases run the default kernel"),
     "3": ("tier_a_path", "tier-A-only specialisation at MINB 3; other phases run the default kernel"),
     "4": ("timing_only", "copied native loop, native softmax"),
@@ -93,7 +94,7 @@ PROFILES = {
                                candidate="REP_TK_FWD_CFG=5"),
 }
 BACKWARD_ARMS = {"21": "C", "22": "C", "23": "A", "37": "A"}  # the only backward tier each one's setting reaches
-ALIASES = ("1", "10", "13", "36")  # no dispatch line of their own needed
+ALIASES = ("1", "10", "13", "36", "38")  # no dispatch line of their own needed
 OWN_FORWARD = ("20", "24", "32", "33")  # meaningless if they launch the default kernel
 RUNTIME_ARMS = {"34", "35"}  # deliberately the default kernel; a host-set diag flag selects the behaviour
 DISTINCT_FROM = {"24": ("11",), "32": ("11", "24"), "33": ("11", "24", "32"), "35": ("34",)}  # nor if they repeat an arm

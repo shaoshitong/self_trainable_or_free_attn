@@ -238,6 +238,40 @@ def tk_tables(C, k, v, blk_cnt, sel: TierSelection, mid_reps: int):
     return tab + [C.rep_tk_lcb(tab[2], sel.b_ptr, sel.b_idx, k.shape[2] // 64, mid_reps)]
 
 
+_SIDE_STREAM = None
+
+
+def _side_stream():
+    """One extra stream, created lazily; only the representative-table build uses it."""
+    global _SIDE_STREAM
+    if _SIDE_STREAM is None:
+        _SIDE_STREAM = torch.cuda.Stream()
+    return _SIDE_STREAM
+
+
+def _overlap_tables() -> bool:
+    """REP_TK_FWD_CFG=38: build the representative tables on a side stream while routing runs.
+
+    The build depends only on K/V and blk_cnt; only the flattened tier-B log counts need the selection, so the
+    expensive part can overlap route_tiers (a chain of eighteen small kernels that does not saturate the GPU).
+    """
+    import os
+    return os.environ.get("REP_TK_FWD_CFG") == "38"
+
+
+def _rep_fwd_tk_prebuilt(C, q, k, v, blk_cnt, sel: TierSelection, mid_reps: int, phases: int, tab0):
+    """The TK forward with the selection-independent part of the tables already built on a side stream."""
+    stream = torch.cuda.current_stream()
+    stream.wait_stream(_side_stream())
+    for t in tab0:
+        t.record_stream(stream)
+    sel = sel.with_tier_b()
+    tab = tab0 + [C.rep_tk_lcb(tab0[2], sel.b_ptr, sel.b_idx, q.shape[2] // 64, mid_reps)]
+    o, lse = C.rep_tk_fwd(q, k, v, tab, sel.q2k_ptr, sel.q2k_idx, sel.b_ptr, sel.b_idx, sel.bits_ab, blk_cnt,
+                          mid_reps, phases, 0)
+    return tab, o, lse
+
+
 def _rep_fwd_tk(C, q, k, v, blk_cnt, sel: TierSelection, mid_reps: int, phases: int):
     """TK + TMA forward. tab = tk_tables(...), see csrc/rep_tk/rep_tk.cu."""
     sel = sel.with_tier_b()
@@ -354,13 +388,23 @@ class _RepAttentionFunction(torch.autograd.Function):
         qr, kr, qc, kc, vc = C.pool_fwd(q, k, v, blk_cnt, R)
         c_cnt, c_ptr, c_idx = _coarse_meta(B, H, nb, qc.shape[2], q.device)
         oc, lse_c = C.attn_fwd(qc, kc, vc, c_ptr, c_idx, c_cnt)
+        overlap = use_tk and sel_in is None and _overlap_tables()
+        tab0 = None
+        if overlap:  # the means and swizzled tables need only K/V and blk_cnt, so start them before routing
+            side = _side_stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                tab0 = C.rep_tk_build(k, v, blk_cnt, tiers.mid_reps)
         if sel_in is None:
             ba, bab = tiers.budgets(nb)
             sel = TierSelection(*C.route_tiers(qr, kr, blk_cnt, R, ba, bab, row_norm, max_score_bytes))
         else:
             sel = sel_in
         if use_tk:
-            tab, of, lse_f = _rep_fwd_tk(C, q, k, v, blk_cnt, sel, tiers.mid_reps, phases)
+            if overlap:
+                tab, of, lse_f = _rep_fwd_tk_prebuilt(C, q, k, v, blk_cnt, sel, tiers.mid_reps, phases, tab0)
+            else:
+                tab, of, lse_f = _rep_fwd_tk(C, q, k, v, blk_cnt, sel, tiers.mid_reps, phases)
         else:
             tab, of, lse_f = _rep_fwd(C, q, k, v, blk_cnt, sel, tiers.mid_reps, phases)
         o = C.fuse_fwd(of, oc, gate, blk_cnt, gate_act)
