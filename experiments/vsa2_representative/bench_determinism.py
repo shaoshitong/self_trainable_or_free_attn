@@ -59,8 +59,8 @@ def main():
     B, H, L, D, R, rm = 1, 16, 16384, 128, 16, 4
     nb = L // 64
     torch.manual_seed(0)
-    q, k, v = (torch.randn(B, H, L, D, device=dev, dtype=dt).contiguous() for _ in range(3))
-    gate = torch.randn(B, H, nb, device=dev, dtype=torch.float32)
+    q, k, v = (torch.randn(B, H, L, D, device=dev, dtype=dt).contiguous().requires_grad_(True) for _ in range(3))
+    gate = torch.randn(B, H, nb, device=dev, dtype=torch.float32).requires_grad_(True)
     cnt = torch.full((nb,), 64, dtype=torch.int32, device=dev)
     tiers = RepTiers(0.10, 0.20, rm)
 
