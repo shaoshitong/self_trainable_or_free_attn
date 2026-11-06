@@ -237,7 +237,9 @@ def _route_tiers_graphed(C, qr, kr, blk_cnt, R, ba, bab, norm, max_bytes):
     kr_s.copy_(kr)
     cnt_s.copy_(blk_cnt)
     graph.replay()
-    return tuple(t.clone() for t in outs)  # a caller may keep the selection past the next call
+    # No clone: the selection tensors are the captured buffers, so a caller must consume them before the next
+    # call. Cloning them cost ~8 launches, which is exactly the launch saving this path exists to recover.
+    return tuple(outs)
 
 
 _COARSE_META_CACHE = {}
