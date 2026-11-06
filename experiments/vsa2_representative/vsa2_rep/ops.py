@@ -472,7 +472,11 @@ class _RepAttentionFunction(torch.autograd.Function):
         C = ext()
         B, H, L, D = q.shape
         nb = L // 64
-        pooled = use_tk and _pooled_tables_enabled() and 64 // tiers.mid_reps == R
+        # The pooled tables are valid when the router's group size equals the tier-B representative span
+        # (64 / mid_reps == R) and the pooled row count is 64-aligned, which is what the builder asserts;
+        # otherwise the standard build from K/V is the only correct path.
+        pooled = (use_tk and _pooled_tables_enabled() and 64 // tiers.mid_reps == R
+                  and (nb * tiers.mid_reps) % 64 == 0)
         if pooled:
             qr, kr, vrl, qc, kc, vc = C.pool_fwd_vr(q, k, v, blk_cnt, R)
         else:
