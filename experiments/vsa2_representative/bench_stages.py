@@ -50,10 +50,14 @@ def compare_stages(a, b):
     for key in ("build", "inputs", "shape", "timing", "hardware"):
         if a[key] != b[key]:
             raise ValueError(f"runs differ in {key}; stage times are only comparable within one build")
-    med = lambda r: statistics.median(r["ms"])
-    return dict(measured_rows=True, note=NOTE, fwd_cfgs=[a["fwd_cfg"], b["fwd_cfg"]],
-                rows=[dict(id=x["id"], reads_fwd_cfg=x.get("reads_fwd_cfg"), a_ms=med(x), b_ms=med(y), b_over_a=med(y) / med(x))
-                      for x, y in zip(a["rows"], b["rows"], strict=True)])
+    med = {side: {r["id"]: statistics.median(r["ms"]) for r in run["rows"]} for side, run in (("a", a), ("b", b))}
+    reads = {r["id"]: r.get("reads_fwd_cfg") for r in a["rows"] + b["rows"]}
+    ids = [r["id"] for r in a["rows"]] + [r["id"] for r in b["rows"] if r["id"] not in med["a"]]
+    rows = []
+    for n in ids:  # a row only one configuration has reads as zero in the other, never as a dropped row
+        x, y = med["a"].get(n, 0.0), med["b"].get(n, 0.0)
+        rows.append(dict(id=n, reads_fwd_cfg=reads[n], a_ms=x, b_ms=y, b_over_a=y / x if x else None))
+    return dict(measured_rows=True, note=NOTE, fwd_cfgs=[a["fwd_cfg"], b["fwd_cfg"]], rows=rows)
 
 
 def attribute(rows):
@@ -85,7 +89,8 @@ def main():
         print(f"{NOTE}\nCFG{res['fwd_cfgs'][0]} vs CFG{res['fwd_cfgs'][1]}, same build")
         for r in res["rows"]:
             tag = "" if r["reads_fwd_cfg"] else "  does not read the config"
-            print(f"{r['id']:20s} {r['a_ms']:9.3f} {r['b_ms']:9.3f} {r['b_over_a']:7.3f}{tag}")
+            ratio = "n/a" if r["b_over_a"] is None else f"{r['b_over_a']:.3f}"
+            print(f"{r['id']:20s} {r['a_ms']:9.3f} {r['b_ms']:9.3f} {ratio:>7s}{tag}")
         return
     if not a.out:
         ap.error("--out is required")

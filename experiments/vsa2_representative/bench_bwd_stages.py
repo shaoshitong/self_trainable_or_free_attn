@@ -1,14 +1,18 @@
 """Measurement-only breakdown of one backward() call, one REP_TK_FWD_CFG per run.
 
 Each step row comes from a real backward(), not a replay. For that call only, the operator module's handle on the
-native extension is replaced by a proxy that records a CUDA event before and after every native call. The kernels,
-their arguments and their order do not change. There is no synchronize inside a timed region: each sample finishes
+native extension is replaced by a proxy that records a CUDA event before and after every native call, and its torch
+by one that does the same around zeros and zeros_like. The kernels, their arguments and their order do not change.
+There is no synchronize inside a timed region: each sample finishes
 its forward and synchronizes before its first event, and synchronizes again after its last one. Inputs are
 bench_compare.py's deterministic 16K/H16/D128/RM4 draws; the recorded digests can be checked against its result.
 
   call.X        between the events around native call X, which includes its launch and any allocation inside it
-  gap.X->Y      everything Python does between two native calls. torch.zeros cannot be split from its allocator,
-                nor one zeros call from the next, so a zeroing gap is the closest honest grouping for table zeroing
+  call.zeros.*  one zeros or zeros_like and its fill, named by shape: token (qg, then kg, then vg), mid (dk_mid, dv_mid),
+                tail (kgt, vgt), other (the coarse dq). The allocator cannot be split from the fill. A table a
+                configuration no longer zeroes keeps its row, at 0.000 with present=false; a torch.empty in its place
+                falls in the neighbouring gap
+  gap.X->Y      everything else Python does between two of those calls
   total         backward() with only two events, first and last; the spread of its batches is this run's floor
   isolated.*    the three tier kernels back to back with fixed intermediates, as in bench_compare's kernel rows
   context.*     forward and F+B loops without any synchronize, for the F+B - F estimate
@@ -23,7 +27,9 @@ so part of the distance between total and isolated kernels may come from how eac
 
 Stage times are not a performance claim and must not be added to bench_compare's kernel rows.
 
-  REP_TK_FWD_CFG=1 <gpu-runner> python bench_bwd_stages.py --out bwd-stages.json
+  REP_TK_FWD_CFG=1 <gpu-runner> python bench_bwd_stages.py --out bwd-stages-cfg1.json
+  REP_TK_FWD_CFG=36 <gpu-runner> python bench_bwd_stages.py --out bwd-stages-cfg36.json
+  python bench_bwd_stages.py --compare bwd-stages-cfg1.json bwd-stages-cfg36.json
 """
 import argparse
 import hashlib
@@ -33,38 +39,48 @@ import sys
 from pathlib import Path
 
 from bench_compare import HERE, active_fwd_cfg, sha256_file
-from bench_stages import NOTE
+from bench_stages import NOTE, compare_stages
 
-ZEROING_GAPS = {
-    "gap.row_dot->tk_native_bwd": "fine: torch.zeros of qg, kg, vg, with allocator",
-    "gap.attn_bwd->tk_native_bwd": "full: torch.zeros of qg, kg, vg, with allocator",
-    "gap.fuse_bwd->attn_bwd": "full: torch.zeros of the coarse dq, with allocator",
-    "gap.tk_native_bwd->rep_tk_bwd_b": "torch.zeros of dk_mid, dv_mid, with allocator",
-    "gap.rep_tk_bwd_b->rep_tk_bwd_c": "torch.zeros of kgt, vgt, with allocator",
+ZEROS = {
+    "call.zeros.token": "qg, in ops.py's order, with allocator",
+    "call.zeros.token#2": "kg, in ops.py's order, with allocator",
+    "call.zeros.token#3": "vg, in ops.py's order, with allocator",
+    "call.zeros.mid": "dk_mid, with allocator",
+    "call.zeros.mid#2": "dv_mid, with allocator",
+    "call.zeros.tail": "kgt, with allocator",
+    "call.zeros.tail#2": "vgt, with allocator",
 }
-OTHER_GAPS = {
+OTHER_ROWS = {
+    "call.zeros.other": "full: the coarse dq, with allocator",
     "gap.start->row_dot": "dout.contiguous and _row_mask",
     "gap.start->fuse_bwd": "dout.contiguous",
     "gap.rep_tk_bwd_c->finalize": "full: adds the coarse block gradients into kgt, vgt; fine: nothing",
     "gap.finalize->rep_unpool": "nothing between the calls",
     "gap.rep_unpool->end": "return to autograd and gradient accumulation",
 }
+HOST_QUERIES = ("tk_bwd_store_kv", "has_tk")  # launch nothing, so they get no row
 TIER_KERNELS = ("call.tk_native_bwd", "call.rep_tk_bwd_b", "call.rep_tk_bwd_c")
 
 
 def intervals(labels):
     """Row names of consecutive marks; a repeated name gets #2. `labels` are start, begin:x, end:x, ..., end."""
     bare = lambda m: m.split(":", 1)[-1]
-    names = []
+    names, seen = [], {}
     for a, b in zip(labels, labels[1:]):
         name = f"call.{bare(a)}" if a == f"begin:{bare(b)}" and b.startswith("end:") else f"gap.{bare(a)}->{bare(b)}"
-        names.append(name if name not in names else f"{name}#{names.count(name) + 1}")
+        seen[name] = seen.get(name, 0) + 1
+        names.append(name if seen[name] == 1 else f"{name}#{seen[name]}")
     return names
 
 
 def batches(samples, per_batch):
     """Median of each consecutive batch of single-call samples."""
     return [statistics.median(samples[i:i + per_batch]) for i in range(0, len(samples), per_batch)]
+
+
+def fill_absent(samples, n):
+    """Every expected zeroing row stays in the result: a table this configuration does not zero reads as 0.000."""
+    return {**samples, **{name: [0.0] * n for name in ZEROS if name not in samples}}
 
 
 def attribute(rows, scope):
@@ -78,10 +94,12 @@ def attribute(rows, scope):
     sum_steps = sum(med[n] for n in steps)
     floor = max(per_batch) - min(per_batch)
     kernels = sum(med[n] for n in TIER_KERNELS)
+    zeros = [n for n in med if n.startswith("call.zeros.")]
     return dict(measured=False, note=NOTE, total_ms=total, steps=steps, sum_of_steps_ms=sum_steps,
                 residual_ms=total - sum_steps, floor_ms=floor, sum_within_floor=abs(total - sum_steps) <= floor,
                 tier_kernels_in_place_ms=kernels, outside_tier_kernels_ms=total - kernels,
-                table_zeroing_and_allocator_ms=sum(med.get(n, 0.0) for n in ZEROING_GAPS),
+                table_zeroing_and_allocator_ms=sum(med[n] for n in zeros),
+                qg_kg_vg_zeroing_ms=sum(med[n] for n in zeros if n.startswith("call.zeros.token")),
                 floor_method="max - min of the total batch medians of this run")
 
 
@@ -90,8 +108,22 @@ def main():
     ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument("--iters", type=int, default=30)
     ap.add_argument("--batches", type=int, default=3)
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--out")
+    ap.add_argument("--compare", nargs=2, metavar=("A.json", "B.json"))
     a = ap.parse_args()
+    if a.compare:
+        x, y = (json.loads(Path(p).read_text()) for p in a.compare)
+        try:
+            res = compare_stages(x, y)
+        except ValueError as e:
+            sys.exit(str(e))
+        print(f"{NOTE}\nCFG{res['fwd_cfgs'][0]} vs CFG{res['fwd_cfgs'][1]}, same build")
+        for r in res["rows"]:
+            ratio = "n/a" if r["b_over_a"] is None else f"{r['b_over_a']:.3f}"
+            print(f"{r['id']:46s} {r['a_ms']:9.3f} {r['b_ms']:9.3f} {ratio:>7s}")
+        return
+    if not a.out:
+        ap.error("--out is required")
     out = Path(a.out)
     if out.exists():
         ap.error(f"{out} exists; results are not overwritten")
@@ -136,6 +168,8 @@ def main():
 
         def __getattr__(self, name):
             fn = getattr(self.native, name)
+            if name in HOST_QUERIES:
+                return fn
 
             def call(*args):
                 self.mark(f"begin:{name}")
@@ -143,6 +177,26 @@ def main():
                 self.mark(f"end:{name}")
                 return res
             return call
+
+    class TorchRecorder:
+        """Stands in for ops.py's torch during one backward(), recording around each table zeroing."""
+
+        def __getattr__(self, name):
+            return getattr(torch, name)
+
+        def _timed(self, shape, fn, *args, **kwargs):
+            label = f"zeros.{ZERO_SHAPES.get(tuple(shape), 'other')}"
+            rec.mark(f"begin:{label}")
+            res = fn(*args, **kwargs)
+            rec.mark(f"end:{label}")
+            return res
+
+        def zeros(self, *args, **kwargs):
+            shape = args[0] if len(args) == 1 else args
+            return self._timed(shape, torch.zeros, *args, **kwargs)
+
+        def zeros_like(self, t, **kwargs):
+            return self._timed(t.shape, torch.zeros_like, t, **kwargs)
 
     C = ext()
     if not torch.cuda.is_available() or not C.has_tk():
@@ -162,11 +216,12 @@ def main():
     tab = tk_tables(C, k, v, cnt, sel, rm)
     qq, kk, vv, gg = (t.detach().clone().requires_grad_(True) for t in (q, k, v, gate))
     rec = Recorder(C)
+    ZERO_SHAPES = {tuple(q.shape): "token", (B, H, nb * rm, D): "mid", tuple(tab[3].shape): "tail"}
 
-    def row(name, ms, per_batch=None, in_sum=False, note=None):
+    def row(name, ms, per_batch=None, in_sum=False, note=None, present=True):
         medians = batches(ms, per_batch) if per_batch else ms
         return dict(id=name, ms=ms, batch_medians_ms=medians, spread_ms=max(medians) - min(medians), in_sum=in_sum,
-                    label="measurement_only", measured=True, note=note or NOTE)
+                    label="measurement_only", measured=True, note=note or NOTE, present=present)
 
     def total(graph, leaves):
         """Same boundaries as bench_compare's b_direct."""
@@ -194,11 +249,11 @@ def main():
             torch.cuda.synchronize()
             rec.labels = []
             rec.mark("start")
-            ops._C = rec
+            ops._C, ops.torch = rec, TorchRecorder()
             try:
                 o.backward(dout)
             finally:
-                ops._C = C
+                ops._C, ops.torch = C, torch
             rec.mark("end")
             torch.cuda.synchronize()
             now = intervals(rec.labels)
@@ -211,7 +266,7 @@ def main():
             del o
             for t in leaves:
                 t.grad = None
-        return samples
+        return fill_absent(samples, a.iters * a.batches)
 
     def scope_rows(scope, graph, leaves):
         def fb():
@@ -220,7 +275,8 @@ def main():
                 t.grad = None
         rows = [row(f"{scope}.total", total(graph, leaves), a.iters)]
         for n, ms in steps(graph, leaves).items():
-            rows.append(row(f"{scope}.{n}", ms, a.iters, in_sum=True, note=ZEROING_GAPS.get(n) or OTHER_GAPS.get(n)))
+            rows.append(row(f"{scope}.{n}", ms, a.iters, in_sum=True, note=ZEROS.get(n) or OTHER_ROWS.get(n),
+                            present=any(ms)))
         rows.append(row(f"{scope}.total.repeat", total(graph, leaves), a.iters, note="second measurement, for the floor"))
         rows.append(row(f"context.{scope}.f", loop(graph)))
         rows.append(row(f"context.{scope}.f_plus_b", loop(fb), note="measured F+B with no synchronize inside the loop"))
@@ -273,7 +329,7 @@ def main():
     out.write_text(json.dumps(res, indent=1) + "\n")
     print(f"{NOTE}\nREP_TK_FWD_CFG={cfg}: {meaning}\n{'row':46s} {'median ms':>10s} {'spread':>8s}")
     for r in rows:
-        print(f"{r['id']:46s} {med[r['id']]:10.3f} {r['spread_ms']:8.3f}")
+        print(f"{r['id']:46s} {med[r['id']]:10.3f} {r['spread_ms']:8.3f}{'' if r['present'] else '  not run by this configuration'}")
     for s, t in attribution.items():
         print(f"{s}, derived, not timed: total {t['total_ms']:.3f}  steps {t['sum_of_steps_ms']:.3f}  residual "
               f"{t['residual_ms']:+.3f}  floor {t['floor_ms']:.3f}  within floor: {t['sum_within_floor']}  outside tier kernels "

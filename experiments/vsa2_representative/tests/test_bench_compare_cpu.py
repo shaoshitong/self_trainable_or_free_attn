@@ -8,7 +8,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bench_bwd_stages import ZEROING_GAPS, attribute as attribute_backward, batches, intervals
+from bench_bwd_stages import ZEROS, attribute as attribute_backward, batches, fill_absent, intervals
 from bench_stages import attribute, compare_stages
 from bench_compare import (BACKWARD_READ_ROWS, launch_bound, FWD_CFGS, PROFILES, abba, active_fwd_cfg, arms_error, assemble,
                            backward_row_is_control, cfg_error, claims, forward_must_match, fwd_dispatch, fwd_kernel_name,
@@ -38,11 +38,11 @@ def test_configs_keep_their_semantics():
         {"REP_TK_FWD_CFG": "1", "REP_TK_BWDC_SPLITS": "8"}
     for cfg in "23457":
         assert rejected(f"REP_TK_FWD_CFG={cfg}", "representative"), "a diagnostic passed as production"
-    for cfg in ("0", "1", "2", "6", "8", "9", "10", "11", "13", "20", "21", "22", "23", "24", "32", "33", "34", "35"):
+    for cfg in ("0", "1", "2", "6", "8", "9", "10", "11", "13", "20", "21", "22", "23", "24", "32", "33", "34", "35", "36"):
         assert rejected(f"REP_TK_FWD_CFG={cfg}", "controlled-softmax"), "only CFG 4/5/7 are this diagnostic"
     for cfg in "457":
         assert parse_config(f"REP_TK_FWD_CFG={cfg}", "controlled-softmax")
-    for cfg in ("8", "9", "10", "11", "13", "20", "21", "22", "23", "24", "32", "33", "34", "35"):
+    for cfg in ("8", "9", "10", "11", "13", "20", "21", "22", "23", "24", "32", "33", "34", "35", "36"):
         assert parse_config(f"REP_TK_FWD_CFG={cfg}", "representative")
     assert rejected("REP_TK_FWD_CFG=25", "representative"), "the kernel would silently run its default path"
     assert parse_config("REP_TK_FWD_CFG=1,REP_TK_BWDC_SPLITS=wave", "representative"), "the kernel accepts wave"
@@ -84,10 +84,11 @@ def test_arm_meanings_hold_in_the_source():
     assert cfg_error("13", ROUND5) is None, "the heuristic is the default now"
     braced = kernel(BULK, "(cfg == 11) {\n    set(rep_tk::fwd_kdb_ker<D>, mem);\n    rep_tk::fwd_kdb_ker<D><<<g>>>(x);\n  }")
     assert fwd_dispatch(braced)["11"] == "rep_tk::fwd_kdb_ker<D>", "a braced branch must not read as the default"
-    for value in ("13", "21", "22", "23"):
+    for value in ("13", "21", "22", "23", "36"):
         change = kernel(BULK, f"(cfg == {value}) launch(rep_tk::fwd_ker<D, 4>);")
         assert cfg_error(value, change), f"forward change under backward arm CFG{value}"
         assert cfg_error(value, kernel(BULK, f"(cfg == {value}) {{\n    rep_tk::fwd_kdb_ker<D><<<g>>>(x);\n  }}"))
+    assert cfg_error("36", ROUND6 + "int s() { return rep_cfg() == 36 ? 16 : 0; }\n") is None
     for value in ("21", "22", "23"):
         assert cfg_error(value, ROUND6) is None
         assert cfg_error(value, ROUND5), "must not pass before the kernel has it"
@@ -169,7 +170,9 @@ def test_softmax_reductions_stay_on_the_default_path():
 def test_backward_arm_is_single_variable():
     cfg = lambda v, **kw: dict(REP_TK_FWD_CFG=v, **kw)
     pair = lambda a, b: {"baseline": a, "candidate": b}
-    for value in ("21", "22", "23"):
+    assert cfg_error("36", ROUND6), "must not pass before the kernel has it"
+    assert arms_error(pair(cfg("23"), cfg("36"))), "launch bound and store path at once"
+    for value in ("21", "22", "23", "36"):
         assert arms_error(pair(cfg("1"), cfg(value))) is None
         assert arms_error(pair(cfg("11"), cfg(value))), "a forward change alongside a backward arm"
         assert arms_error(pair(cfg("1"), cfg(value, REP_TK_BWDC_SPLITS="4"))), "forced split on top of a backward arm"
@@ -182,7 +185,8 @@ def test_backward_arm_reaches_only_its_tier():
     env = lambda v, **kw: dict(REP_TK_FWD_CFG=v, **kw)
     for value in ("21", "22"):
         assert not backward_row_is_control("C", env(value)) and backward_row_is_control("A", env(value))
-    assert not backward_row_is_control("A", env("23")) and backward_row_is_control("C", env("23"))
+    for value in ("23", "36"):
+        assert not backward_row_is_control("A", env(value)) and backward_row_is_control("C", env(value))
     assert backward_row_is_control("B", env("23")) and backward_row_is_control("C", env("13")), "13 is an alias"
     assert not backward_row_is_control("C", env("1", REP_TK_BWDC_SPLITS="4"))
 
@@ -218,12 +222,16 @@ def test_backward_steps_are_named_and_counted_once():
     names = intervals(labels)
     assert names[:3] == ["gap.start->row_dot", "call.row_dot", "gap.row_dot->tk_native_bwd"]
     assert names[-1] == "gap.rep_tk_bwd_c->end" and len(names) == len(labels) - 1
-    assert intervals(["begin:x", "end:x", "begin:x", "end:x"]) == ["call.x", "gap.x->x", "call.x#2"]
-    assert "gap.row_dot->tk_native_bwd" in ZEROING_GAPS
+    assert intervals(["begin:x", "end:x", "begin:x", "end:x", "begin:x", "end:x"]) == \
+        ["call.x", "gap.x->x", "call.x#2", "gap.x->x#2", "call.x#3"], "three zeroings must not merge into two rows"
+    full = {n: [0.1] for n in ZEROS}
+    without = {n: ms for n, ms in full.items() if n not in ("call.zeros.token#2", "call.zeros.token#3")}
+    assert fill_absent(without, 1)["call.zeros.token#2"] == [0.0], "a removed memset reads as zero, not as a dropped row"
+    assert set(fill_absent(without, 1)) == set(ZEROS)
     assert batches([1.0, 2.0, 3.0, 9.0, 9.0, 9.0], 3) == [2.0, 9.0]
     row = lambda n, ms: dict(id=f"fine.{n}", ms=[ms] * 3, batch_medians_ms=[ms])
     rows = [dict(id="fine.total", ms=[3.0] * 3, batch_medians_ms=[3.0, 3.1]), row("call.row_dot", 0.1),
-            row("gap.row_dot->tk_native_bwd", 0.2), row("call.tk_native_bwd", 1.5), row("call.rep_tk_bwd_b", 0.5),
+            row("call.zeros.token", 0.2), row("call.tk_native_bwd", 1.5), row("call.rep_tk_bwd_b", 0.5),
             row("call.rep_tk_bwd_c", 0.3), dict(id="fine.total.repeat", ms=[3.0] * 3, batch_medians_ms=[3.0, 2.9]),
             dict(id="full.total", ms=[99.0], batch_medians_ms=[99.0]), dict(id="context.fine.f", ms=[9.0], batch_medians_ms=[9.0])]
     t = attribute_backward(rows, "fine")
@@ -231,6 +239,7 @@ def test_backward_steps_are_named_and_counted_once():
     assert abs(t["sum_of_steps_ms"] - 2.6) < 1e-9 and abs(t["residual_ms"] - 0.4) < 1e-9, "total or context was summed"
     assert t["sum_within_floor"] is False, "a residual above the floor must show"
     assert abs(t["outside_tier_kernels_ms"] - 0.7) < 1e-9 and abs(t["table_zeroing_and_allocator_ms"] - 0.2) < 1e-9
+    assert abs(t["qg_kg_vg_zeroing_ms"] - 0.2) < 1e-9
 
 
 def test_stage_runs_compare_only_within_one_build():
@@ -242,6 +251,14 @@ def test_stage_runs_compare_only_within_one_build():
     except ValueError:
         return
     raise AssertionError("runs from two builds compared")
+
+
+def test_stage_compare_keeps_rows_only_one_run_has():
+    run = lambda cfg, ids: dict(fwd_cfg=cfg, build={}, inputs={}, shape={}, timing={}, hardware={},
+                                rows=[dict(id=n, ms=[ms]) for n, ms in ids])
+    rows = {r["id"]: r for r in compare_stages(run("1", [("x", 1.0), ("old", 2.0)]), run("36", [("x", 0.5), ("new", 3.0)]))["rows"]}
+    assert rows["x"]["b_over_a"] == 0.5 and rows["old"]["b_ms"] == 0.0 and rows["new"]["a_ms"] == 0.0
+    assert rows["new"]["b_over_a"] is None
 
 
 def test_abba_is_balanced():
@@ -327,6 +344,7 @@ if __name__ == "__main__":
     test_backward_arm_reaches_only_its_tier()
     test_forward_change_under_backward_arm_is_invalid()
     test_stage_runs_compare_only_within_one_build()
+    test_stage_compare_keeps_rows_only_one_run_has()
     test_backward_steps_are_named_and_counted_once()
     test_abba_is_balanced()
     test_estimate_is_labelled_and_stages_are_not_summed()

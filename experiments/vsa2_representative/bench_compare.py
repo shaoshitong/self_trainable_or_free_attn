@@ -77,6 +77,8 @@ FWD_CFGS = {
     "21": ("operator", "CFG1 forward; tier-C backward split by the old wave policy"),
     "22": ("operator", "CFG1 forward; tier-C backward split forced to 4"),
     "23": ("operator", "CFG1 forward; tier-A backward __launch_bounds__(128, 3) occupancy probe"),
+    "36": ("operator", "CFG1 forward; tier-A dK/dV stored by each kv block's owner CTA instead of reduce-added, without "
+                       "the kg and vg memsets; the default keeps them"),
     "2": ("tier_a_path", "tier-A-only specialisation at MINB 4; other phases run the default kernel"),
     "3": ("tier_a_path", "tier-A-only specialisation at MINB 3; other phases run the default kernel"),
     "4": ("timing_only", "copied native loop, native softmax"),
@@ -88,7 +90,7 @@ PROFILES = {
     "controlled-softmax": dict(warmup=10, iters=50, kind="timing_only", baseline="REP_TK_FWD_CFG=4",
                                candidate="REP_TK_FWD_CFG=5"),
 }
-BACKWARD_ARMS = {"21": "C", "22": "C", "23": "A"}  # the only backward tier each one's setting reaches
+BACKWARD_ARMS = {"21": "C", "22": "C", "23": "A", "36": "A"}  # the only backward tier each one's setting reaches
 ALIASES = ("1", "10", "13")  # no dispatch line of their own needed
 OWN_FORWARD = ("20", "24", "32", "33")  # meaningless if they launch the default kernel
 RUNTIME_ARMS = {"34", "35"}  # deliberately the default kernel; a host-set diag flag selects the behaviour
@@ -196,8 +198,8 @@ def arms_error(configs):
     backward = arms & BACKWARD_ARMS.keys()
     if backward and not arms <= FORWARD_EQUAL:
         return f"CFG{min(backward)} changes only the backward; compare it with CFG1, not {sorted(arms)}"
-    if len({BACKWARD_ARMS[a] for a in backward}) > 1:
-        return f"{sorted(backward)} change different backward tiers; compare each with CFG1"
+    if len({BACKWARD_ARMS[a] for a in backward}) > 1 or {"23", "36"} <= backward:
+        return f"{sorted(backward)} change different things in the backward; compare each with CFG1"
     if any(c.get("REP_TK_FWD_CFG") in FORWARD_EQUAL - {"1", "10"} and "REP_TK_BWDC_SPLITS" in c for c in configs.values()):
         return "REP_TK_BWDC_SPLITS would override or add to what a backward arm measures"
     return None

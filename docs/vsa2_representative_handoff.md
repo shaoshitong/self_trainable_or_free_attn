@@ -364,6 +364,7 @@ from a build containing CFG 20.
 | 21 | CFG 1 forward; tier-C backward split by the old wave policy | as CFG 1 | 3 | as CFG 1 | as CFG 1 | as CFG 1 |
 | 22 | CFG 1 forward; tier-C backward split forced to 4 | as CFG 1 | 3 | as CFG 1 | as CFG 1 | as CFG 1 |
 | 23 | CFG 1 forward; tier-A backward `__launch_bounds__(128, 3)` probe | as CFG 1 | 3 | as CFG 1 | as CFG 1 | as CFG 1 |
+| 36 | CFG 1 forward; tier-A dK/dV stored by each kv block's owner CTA instead of reduce-added, without the `kg` and `vg` memsets | as CFG 1 | 3 | as CFG 1 | as CFG 1 | as CFG 1 |
 | 11 | measured negative arm: `fwd_kdb_ker`, CFG 1 plus a double-buffered K tile | TK vector | 3 | `cp.async` | not recorded here | not recorded here |
 | 24 | measured negative arm: `fwd_pipe_ker`, CFG 11's K double buffer plus a two-stage softmax, the next tile's QK issued before the current softmax finishes | TK vector | 2 | `cp.async` | not recorded here | not recorded here |
 | 32 | measured negative arm: `fwd_ring_ker`, two CTAs/SM, K and V both double-buffered | TK vector | 2 | `cp.async` | not recorded here | not recorded here |
@@ -506,7 +507,7 @@ ThunderKittens commit are recorded.
 | `control=true` | does not read the compared setting; a ratio away from 1 is run drift |
 
 Backward kernels and table builds read no forward setting, so their kernel rows are controls, with two exceptions:
-CFG 21, CFG 22 and a forced split reach `kernel.tk.bwd.C`, and CFG 23 reaches `kernel.tk.bwd.A`. Between CFG 1, its
+CFG 21, CFG 22 and a forced split reach `kernel.tk.bwd.C`, and CFG 23 and 36 reach `kernel.tk.bwd.A`. Between CFG 1, its
 aliases and the backward arms, one forward kernel by definition, the forward-only rows are controls.
 
 The forward-identical check for those arms has three parts. The forward dispatch in `fwd_impl` must launch the
@@ -612,16 +613,35 @@ Next: split the backward with `bench_bwd_stages.py`, below. The reported figures
 F+B, with the three tier kernels at 2.36 ms (A 1.55, B 0.50, C 0.31), leaving about 0.62 ms. Those kernel figures are
 back-to-back loops and 2.98 ms has synchronize gaps around it, so some of that 0.62 ms may be measurement mode.
 
+CFG 36 is a backward-only arm. The routed backward zeroes `qg`, `kg` and `vg`, 128 MiB each at this shape and 384 MiB in
+all, reported at about 0.13 ms. On the `row_ptr` path each kv block has one owner CTA, so `kStoreKV` stores tier-A dK/dV
+instead of reduce-adding them, and `ops.py` allocates `kg` and `vg` with `torch.empty`. `qg` is still zeroed, because dQ
+is still reduce-added. The default keeps the memset path, so CFG 1 vs CFG 36 is one variable, and CFG 36 is held to the
+same forward-identical check as CFG 21/22/23.
+
+The kernel writes zeros itself for a kv block with an empty list, which used to rely on the memset. Results differ
+only in one sign of zero, by its comment. The output check and the TK suite under CFG 36 must pass before its timing is
+read.
+
 ```bash
+REP_TK_FWD_CFG=36 <gpu-runner> python tests/test_gpu_tk.py
 REP_TK_FWD_CFG=1 <gpu-runner> python bench_bwd_stages.py --out results/raw/bwd-stages-cfg1.json
+REP_TK_FWD_CFG=36 <gpu-runner> python bench_bwd_stages.py --out results/raw/bwd-stages-cfg36.json
+python bench_bwd_stages.py --compare results/raw/bwd-stages-cfg1.json results/raw/bwd-stages-cfg36.json
+<gpu-runner> python bench_compare.py --candidate REP_TK_FWD_CFG=1 --out results/raw/aa-16k.json
+<gpu-runner> python bench_compare.py --candidate REP_TK_FWD_CFG=36 --out results/raw/cfg1-cfg36-16k.json
 ```
+
+Read `fine_op` and `full_op` `b_direct` and `f_plus_b`, and `kernel.tk.bwd.A`, which is not a control here and excludes
+the memsets. The result that matters is measured fine-op and full-op F+B against the A/A displacement.
 
 ### Backward stages
 
 `bench_bwd_stages.py` splits one real `backward()` on one configuration, for `fine` (`rep_fine_attention`) and `full`
 (routed `rep_attention`). Every row is `measurement_only`: these times are not a performance claim and must not be added
-to the kernel rows. For that call only, the module's handle on the extension is a proxy that records a CUDA event before
-and after each native call, with no synchronize inside the timed region. No kernel, argument or call order changes.
+to the kernel rows. For that call only, the module's handles on the extension and on torch are proxies that record a CUDA
+event before and after each native call and each `zeros` or `zeros_like`, with no synchronize inside the timed region.
+No kernel, argument or call order changes.
 
 | Row | In the sum | Contents |
 |---|---:|---|
@@ -629,16 +649,24 @@ and after each native call, with no synchronize inside the timed region. No kern
 | `call.tk_native_bwd`, `call.rep_tk_bwd_b`, `call.rep_tk_bwd_c` | yes | the tier kernels in place |
 | `call.finalize`, `call.rep_unpool` | yes | dQ finalize, and the unpool with its allocations |
 | `call.fuse_bwd`, `call.attn_bwd` | yes | `full` only: fusion, and the coarse backward |
-| `gap.*` | yes | Python between two native calls; each row's `note` says what runs there |
+| `call.zeros.token`, `#2`, `#3` | yes | `qg`, `kg`, `vg` in `ops.py`'s order, each with its allocator |
+| `call.zeros.mid`, `#2`, `call.zeros.tail`, `#2` | yes | `dk_mid`, `dv_mid`, `kgt`, `vgt`, each with its allocator |
+| `call.zeros.other` | yes | `full` only: the coarse `dq` |
+| `gap.*` | yes | other Python between two of those calls |
 | `total`, `total.repeat` | no | `backward()` with only two events, first and last; `bench_compare.py`'s `b_direct` boundaries |
 | `isolated.*` | no | the tier kernels back to back with fixed intermediates |
 | `context.*` | no | `f` and `f_plus_b` loops, for the F+B - F estimate |
 | `event_pair` | no | two consecutive events on an idle stream |
 
+A table a configuration no longer zeroes keeps its row, at 0.000 with `present=false`, so CFG 36's `kg` and `vg` rows read
+zero and `qg`'s does not. The token rows are named by order: if `ops.py` ever drops `qg` while keeping another, their
+labels shift. `--compare` prints per-row ratios on one build and keeps rows only one run has. `qg_kg_vg_zeroing_ms` adds
+the token rows, and `table_zeroing_and_allocator_ms` adds all of the zeroing rows.
+
 Three things cannot be separated without changing how the backward is called, so these are the closest honest groupings:
 
-- Table zeroing is the zeroing gaps: `torch.zeros` cannot be split from its allocator, or one call from the next in a gap.
-  `table_zeroing_and_allocator_ms` adds those gaps.
+- `torch.zeros` cannot be split from its allocator, and native calls that allocate internally, such as `rep_unpool`, keep
+  that in their `call.*` row.
 - Launch overhead and allocation inside a native call stay in its `call.*` row.
 - Host work appears only when the stream has drained while it runs, so host cost behind a long kernel reads as zero.
 
