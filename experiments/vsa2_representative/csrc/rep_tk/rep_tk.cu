@@ -1251,6 +1251,303 @@ __global__ __launch_bounds__(128, 2) void fwd_pipe_ker(const __grid_constant__ f
 #endif
 }
 
+// ---------------------------------------------------------------- forward, S-deep K/V ring (cfg 32, 33)
+// The default fwd_ker<D, 3, false, false, true> (vector softmax, tier-B cp.async gather) with K and V each
+// in an S-slot ring: tile t uses slot t % S of both, and step j issues K(j + S) into its slot right after
+// QK(j) and V(j + S) right after PV(j), so both loads are issued S tiles before use (one tile for K and V
+// in fwd_ker). S = 2 (cfg 32): q + 2 K + 2 V tiles; S = 3 (cfg 33): q + 3 K + 3 V tiles. __launch_bounds__
+// (128, 2): two CTAs per SM, set by shared memory either way; the register budget is up to 255.
+//
+// Shared memory: the tiles and then the 1 + 2S mbarriers (q, K slots, V slots) all live in dynamic shared
+// memory, and the kernel declares no static shared memory, so the dynamic window starts right after the
+// 1 KB the hardware reserves per CTA and needs little or no alignment padding. That matters for S = 3: two
+// CTAs must fit 2 x (dynamic + 1 KB reserved) <= 233,472 B, which the other kernels' layout (static
+// barriers, 1 KB of slack) would exceed by 112 B. ring_smem_bytes keeps 1024 B of slack for S = 2 and 512
+// B for S = 3; if the actual padding is larger the kernel traps instead of overrunning, and fwd_impl
+// refuses to launch either arm unless the occupancy query reports 2 resident CTAs per SM.
+//
+// Barriers: one per K slot and one per V slot. Bit i of kph (vph) is the parity of K (V) slot i's next TMA
+// phase and flips only when a TMA-delivered (A or C) tile is consumed from that slot. A slot's loads and
+// consumptions strictly alternate (K(t) is loaded at step t - S after QK(t - S) has read the slot, consumed
+// at step t, and the next load K(t + S) follows it), so each barrier completes one phase per TMA tile it
+// receives, and tier-B tiles, which use neither barrier, change no parity, whatever the A/B/C order.
+//
+// cp.async groups: the prologue issues K(0), V(0), ..., K(S - 1), V(S - 1), and step j issues K(j + S) then
+// V(j + S), so groups are committed as K(t), V(t) in tile order for both depths. For a tier-B tile j,
+// with nB = number of tier-B tiles among j + 1 .. j + S - 1 (all issued before step j):
+//   K(j) wait: younger groups are V(j) and K/V of those tiles: wait_group 1 + 2 nB;
+//   V(j) wait: younger are K/V of those tiles and K(j + S): wait_group 2 nB + [j + S is B].
+// (S = 1 reduces to fwd_ker's 1 and [j + 1 is B].) Each thread then fences its generic-proxy writes and a
+// CTA barrier precedes the wgmma, as in fwd_ker. The issue order is the same for S = 2 and S = 3.
+template <int D, int S>
+struct ring_cfg {
+  static_assert(S == 2 || S == 3, "cfg 32 / 33");
+  static constexpr int tile_bytes = 64 * D * 2;
+  static constexpr int bars = 1 + 2 * S;  // q, K slots, V slots
+  static constexpr int slack = S == 2 ? 1024 : 512;
+  static constexpr int smem_bytes = (1 + 2 * S) * tile_bytes + bars * 8 + slack;
+};
+
+// cp.async.wait_group with a (block-uniform) run-time count 0..5
+__device__ __forceinline__ void cp_async_wait_le5(int n) {
+  if (n <= 0) cp_async_wait<0>();
+  else if (n == 1) cp_async_wait<1>();
+  else if (n == 2) cp_async_wait<2>();
+  else if (n == 3) cp_async_wait<3>();
+  else if (n == 4) cp_async_wait<4>();
+  else cp_async_wait<5>();
+}
+
+template <int D, int S>
+struct ring_ctx {
+  using tile_t = typename fwd_globals<D>::tile;
+  tile_t* q;
+  tile_t* k;  // [S]
+  tile_t* v;  // [S]
+  uint32_t k_s, v_s;  // shared addresses of k[0], v[0]
+  semaphore* kbar;  // [S]
+  semaphore* vbar;  // [S]
+  const bf16* ksw;
+  const bf16* vsw;
+  int b, h;
+  int slot, kph, vph;  // tile j's slot, K / V parity bit per slot
+};
+
+// Issue K(t) or V(t) into slot `sl` of a ring: tier B by every thread with cp.async, else warp 0's TMA.
+template <int D>
+__device__ __forceinline__ void ring_issue(const fwd_globals<D>& g, int2 t, typename fwd_globals<D>::tile& dst,
+                                           uint32_t dst_s, const typename fwd_globals<D>::tgl& tok,
+                                           const typename fwd_globals<D>::tgl& tail, const bf16* sw,
+                                           const int (&sl4)[4], semaphore& bar, int b, int h) {
+  const int none[2] = {g.NB, g.NB};  // issue_tile's slot argument, unused for A/C tiles
+  if (t.x == kTierB) issue_tier_b_cta<D>(dst_s, sw, sl4, g.NB, g.RM);
+  else if (t.x != kTierNone && warpid() == 0) issue_tile<D>(t, dst, tok, tail, sw, none, b, h, g.NB, g.RM, bar);
+}
+
+// One step for tile j. ahead[u] = tile j + 1 + u: u < S - 1 already in flight, ahead[S - 1] = tile j + S
+// to issue now, with its slot blocks far_sl. BC as in fwd_ker.
+template <int D, int S, bool BC>
+__device__ __forceinline__ void ring_step(const fwd_globals<D>& g, ring_ctx<D, S>& c, kdb_regs<D>& r, int2 tile,
+                                          const int2 (&ahead)[S], int kcA, const TileBias& cb,
+                                          const int (&far_sl)[4]) {
+  constexpr float SL2 = kLog2e * (D == 64 ? 0.125f : 0.08838834764f);
+  constexpr uint32_t TB = (uint32_t)ring_cfg<D, S>::tile_bytes;
+  const int sl = c.slot;
+  const bool cp_cur = tile.x == kTierB;
+  int nB = 0;
+#pragma unroll
+  for (int u = 0; u < S - 1; ++u) nB += ahead[u].x == kTierB;
+  const int2 far = ahead[S - 1];
+
+  if (cp_cur) {
+    cp_async_wait_le5(1 + 2 * nB);
+    fence_async_smem();
+    __syncthreads();
+  } else {
+    wait(c.kbar[sl], (c.kph >> sl) & 1);
+    c.kph ^= 1 << sl;
+  }
+  warpgroup::mm_ABt(r.att, *c.q, c.k[sl]);
+  warpgroup::mma_async_wait();
+  ring_issue<D>(g, far, c.k[sl], c.k_s + sl * TB, g.k, g.kt, c.ksw, far_sl, c.kbar[sl], c.b, c.h);
+
+  // log2 domain, then each column's + log2(c) bias (or -inf mask) before the row max
+  mul(r.att, r.att, SL2);
+  if constexpr (BC) {
+    if (cb.masked && !(tile.x == kTierB && (g.diag & 1))) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          float2& e = r.att.tiles[0][i].data[j];
+          e.x += cb.v[i][(j >> 1) * 2];
+          e.y += cb.v[i][(j >> 1) * 2 + 1];
+        }
+    }
+  } else if (kcA < kB) {  // partial tier-A block: VSA2's own column mask
+    right_fill(r.att, r.att, kcA, base_types::constants<float>::neg_infty());
+  }
+  online_softmax_tk<D>(r.att, r.m, r.l, r.o);
+  copy(r.att_mma, r.att);
+
+  if (cp_cur) {
+    cp_async_wait_le5(2 * nB + (far.x == kTierB));
+    fence_async_smem();
+    __syncthreads();
+  } else {
+    wait(c.vbar[sl], (c.vph >> sl) & 1);
+    c.vph ^= 1 << sl;
+  }
+  warpgroup::mma_AB(r.o, r.att_mma, c.v[sl]);
+  warpgroup::mma_async_wait();
+  ring_issue<D>(g, far, c.v[sl], c.v_s + sl * TB, g.v, g.vt, c.vsw, far_sl, c.vbar[sl], c.b, c.h);
+  c.slot = sl + 1 == S ? 0 : sl + 1;
+}
+
+template <int D, int S>
+__global__ __launch_bounds__(128, 2) void fwd_ring_ker(const __grid_constant__ fwd_globals<D> g) {
+#if REP_TK_HOPPER
+  constexpr int ND = D / 16;
+  using tile_t = typename fwd_globals<D>::tile;
+  using RC = ring_cfg<D, S>;
+  const int qb = blockIdx.x, h = blockIdx.y, b = blockIdx.z;
+  const int bh = b * g.H + h;
+  const int warp = warpid(), lane = laneid(), gq = lane >> 2;
+
+  Stream s;
+  {
+    const size_t r = (size_t)bh * (g.NB + 1) + qb;
+    const int a0 = g.a_ptr[r], b0 = g.b_ptr[r];
+    s.a_idx = g.a_idx + a0;
+    s.na = g.a_ptr[r + 1] - a0;
+    s.b_idx = g.b_idx + b0;
+    s.nb_list = g.b_ptr[r + 1] - b0;
+    s.ab_row = g.bits_ab + ((size_t)bh * g.NB + qb) * g.W;
+    s.G = kB / g.RM;
+    s.nbt_tiles = (s.nb_list + s.G - 1) / s.G;
+    s.nc_tiles = g.NBt / kB;
+    s.NB = g.NB;
+    s.W = g.W;
+    s.phases = g.phases;
+    s.ia = s.ib = s.tc = 0;
+  }
+  const float* lc_tail = g.lc_tail + (size_t)bh * g.NBt;
+  const float* lcb = g.lcb + (size_t)(s.b_idx - g.b_idx) * g.RM;  // this row's entries
+  const bf16* ksw = g.k_sw + (size_t)bh * num_phases(g.RM) * (g.NB + 1) * (D / 64) * g.RM * 64;
+  const bf16* vsw = g.v_sw + (size_t)bh * num_phases(g.RM) * (g.NB + 1) * (D / 64) * g.RM * 64;
+  const int qcnt = g.blk_cnt[qb];
+
+  int2 cur = s.next();
+  if (cur.x == kTierNone) {
+    bf16* o = g.o.raw_ptr + ((size_t)bh * g.L + (size_t)qb * kB) * D;
+    for (int i = threadIdx.x; i < kB * D / 8; i += blockDim.x) reinterpret_cast<uint4*>(o)[i] = make_uint4(0, 0, 0, 0);
+    if (threadIdx.x < kB) g.lse[(size_t)bh * g.L + (size_t)qb * kB + threadIdx.x] = ninf();
+    return;
+  }
+
+  // q, K ring, V ring (1024-aligned tiles), then the barriers; all dynamic, no static shared memory
+  extern __shared__ int __shm[];
+  tma_swizzle_allocator al((int*)&__shm[0]);
+  tile_t(&q_smem) = al.allocate<tile_t>();
+  tile_t(&k_ring)[S] = al.allocate<tile_t, S>();
+  tile_t(&v_ring)[S] = al.allocate<tile_t, S>();
+  semaphore(&bars)[RC::bars] = al.allocate<8, semaphore, RC::bars>();
+  {
+    uint32_t dyn;
+    asm volatile("mov.u32 %0, %%dynamic_smem_size;" : "=r"(dyn));
+    if ((uint32_t)(reinterpret_cast<char*>(al.ptr) - reinterpret_cast<char*>(__shm)) > dyn) __trap();
+  }
+  semaphore& q_bar = bars[0];
+  if (threadIdx.x == 0) {
+#pragma unroll
+    for (int i = 0; i < RC::bars; ++i) init_semaphore(bars[i], 0, 1);
+    tma::expect_bytes(q_bar, sizeof(tile_t));
+    coord<tile_t> qc = {b, h, qb, 0};
+    tma::load_async(q_smem, g.q, qc, q_bar);
+  }
+  __syncthreads();  // barriers initialized before warp 0's other lanes use them
+  ring_ctx<D, S> c;
+  c.q = &q_smem;
+  c.k = &k_ring[0];
+  c.v = &v_ring[0];
+  c.k_s = static_cast<uint32_t>(__cvta_generic_to_shared(&k_ring[0].data[0]));
+  c.v_s = static_cast<uint32_t>(__cvta_generic_to_shared(&v_ring[0].data[0]));
+  c.kbar = &bars[1];
+  c.vbar = &bars[1 + S];
+  c.ksw = ksw;
+  c.vsw = vsw;
+  c.b = b;
+  c.h = h;
+  c.slot = c.kph = c.vph = 0;
+
+  // prologue: tiles 0 .. S - 1 into slots 0 .. S - 1, K(t) then V(t) in tile order (the commit order the
+  // step's group counts assume); ahead[u] = tile 1 + u
+  int2 ahead[S];
+#pragma unroll
+  for (int u = 0; u < S - 1; ++u) ahead[u] = s.next();
+  ahead[S - 1] = make_int2(kTierNone, 0);
+#pragma unroll
+  for (int t = 0; t < S; ++t) {
+    int2 tt = cur;
+    if (t > 0) tt = ahead[t > 0 ? t - 1 : 0];
+    int sl4[4] = {g.NB, g.NB, g.NB, g.NB};
+    if (tt.x == kTierB) slot_blocks_cta(s.b_idx, s.nb_list, tt.y, g.NB, g.RM, sl4);
+    ring_issue<D>(g, tt, k_ring[t], c.k_s + t * RC::tile_bytes, g.k, g.kt, ksw, sl4, c.kbar[t], b, h);
+    ring_issue<D>(g, tt, v_ring[t], c.v_s + t * RC::tile_bytes, g.v, g.vt, vsw, sl4, c.vbar[t], b, h);
+  }
+
+  kdb_regs<D> r;
+  zero(r.o);
+  neg_infty(r.m);
+  zero(r.l);
+  TileBias cb;
+  cb.masked = false;
+  cb.kc = kB;
+  wait(q_bar, 0);
+
+  // Before each step: tile j + S and its slot blocks; after it, the window shifts by one tile.
+  int far_sl[4] = {g.NB, g.NB, g.NB, g.NB};
+  auto fetch_far = [&]() {
+    ahead[S - 1] = s.next();
+    if (ahead[S - 1].x == kTierB) slot_blocks_cta(s.b_idx, s.nb_list, ahead[S - 1].y, g.NB, g.RM, far_sl);
+  };
+  auto shift = [&]() {
+    cur = ahead[0];
+#pragma unroll
+    for (int u = 0; u < S - 1; ++u) ahead[u] = ahead[u + 1];
+  };
+  // Tier A: no bias state, as in fwd_ker.
+  while (cur.x == kTierA) {
+    fetch_far();
+    ring_step<D, S, false>(g, c, r, cur, ahead, g.blk_cnt[cur.y], cb, far_sl);
+    shift();
+  }
+  // Tiers B and C: biases one tile ahead, as in fwd_ker.
+  if (cur.x != kTierNone) cb = tile_bias(cur, s, g.blk_cnt, lcb, lc_tail, g.RM);
+  while (cur.x != kTierNone) {
+    fetch_far();
+    const TileBias nb_ = tile_bias(ahead[0], s, g.blk_cnt, lcb, lc_tail, g.RM);
+    ring_step<D, S, true>(g, c, r, cur, ahead, kB, cb, far_sl);
+    shift();
+    cb = nb_;
+  }
+
+  // epilogue, fwd_ker's vector-softmax one: o = o / l (padded query rows -> 0), natural lse (finite on
+  // padded rows); r.m / r.l: .x = row gq, .y = row gq + 8 of each warp
+  static_assert(decltype(r.m)::outer_dim == 1 && decltype(r.m)::inner_dim == 1, "col_vec layout");
+  const float m_row[2] = {r.m.data[0][0].x, r.m.data[0][0].y};
+  const float l_row[2] = {r.l.data[0][0].x, r.l.data[0][0].y};
+  float inv[2], lse[2];
+#pragma unroll
+  for (int i = 0; i < 2; ++i) {
+    const float l = l_row[i];
+    const int row = 16 * warp + gq + 8 * i;
+    inv[i] = (row < qcnt && l > 0.f) ? 1.f / l : 0.f;
+    lse[i] = l > 0.f ? (m_row[i] + __log2f(l)) * kLn2 : ninf();
+  }
+#pragma unroll
+  for (int n = 0; n < ND; ++n)
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      r.o.tiles[0][n].data[j].x *= inv[j & 1];
+      r.o.tiles[0][n].data[j].y *= inv[j & 1];
+    }
+  if ((lane & 3) == 0) {
+    float* gl_ = g.lse + (size_t)bh * g.L + (size_t)qb * kB + 16 * warp + gq;
+    gl_[0] = lse[0];
+    gl_[8] = lse[1];
+  }
+  __syncthreads();  // every warp is done with q_smem
+  warpgroup::store(q_smem, r.o);
+  __syncthreads();
+  if (warp == 0) {  // TK's store/wait helpers are warp-collective
+    coord<tile_t> oc = {b, h, qb, 0};
+    tma::store_async(g.o, q_smem, oc);
+    tma::store_async_wait();
+  }
+#endif
+}
+
 // ---------------------------------------------------------------- backward, tier C (KV-owner)
 // One CTA per (tail tile t, h, b): it owns block means 64t..64t+63, keeps their dK/dV in registers over
 // every query block that has a tier-C column in the tile, and reduces each pair's dQ into the shared fp32
@@ -1949,6 +2246,27 @@ static void fwd_impl(torch::Tensor q, torch::Tensor k, torch::Tensor v, const st
     constexpr int mem_pipe = 4 * 64 * D * 2 + 1024;  // as cfg 11
     cudaFuncSetAttribute(rep_tk::fwd_pipe_ker<D>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_pipe);
     rep_tk::fwd_pipe_ker<D><<<dim3(NB, H, B), 128, mem_pipe, stream()>>>(g);
+  }
+  // cfg 32 / 33: fwd_ring_ker, the default with 2- / 3-slot K and V rings at 2 CTAs per SM. Refuses to run
+  // (rather than silently dropping to 1 CTA per SM) unless the device fits two resident CTAs.
+  else if (cfg == 32 || cfg == 33) {
+    auto kern = cfg == 32 ? rep_tk::fwd_ring_ker<D, 2> : rep_tk::fwd_ring_ker<D, 3>;
+    const int bytes = cfg == 32 ? rep_tk::ring_cfg<D, 2>::smem_bytes : rep_tk::ring_cfg<D, 3>::smem_bytes;
+    static int checked[2] = {0, 0};  // per arm, once per process
+    if (!checked[cfg - 32]) {
+      cudaError_t err = cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+      if (err == cudaSuccess)
+        err = cudaFuncSetAttribute(kern, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                   (int)cudaSharedmemCarveoutMaxShared);
+      TORCH_CHECK(err == cudaSuccess, "REP_TK_FWD_CFG=", cfg, ": cannot request ", bytes,
+                  " B of dynamic shared memory: ", cudaGetErrorString(err));
+      int resident = 0;
+      err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&resident, kern, 128, bytes);
+      TORCH_CHECK(err == cudaSuccess && resident >= 2, "REP_TK_FWD_CFG=", cfg, ": ", resident,
+                  " resident CTA(s) per SM at ", bytes, " B of dynamic shared memory; this arm requires 2");
+      checked[cfg - 32] = 1;
+    }
+    kern<<<dim3(NB, H, B), 128, bytes, stream()>>>(g);
   }
   // cfg 1 / 10: tier-B tiles loaded by CTA-wide cp.async (issue_tier_b_cta) instead of bulk copies
   else launch(rep_tk::fwd_ker<D, 3, false, false, true>);
