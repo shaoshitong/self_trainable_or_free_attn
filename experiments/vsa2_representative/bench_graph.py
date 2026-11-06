@@ -195,6 +195,23 @@ def main():
         graph_rows = [row(n, reason=reason) for n in GRAPH_ROWS]
 
     rows += graph_rows
+    # What a caller with fresh inputs pays: copy the new data into the captured buffers, then replay. The
+    # measurement-only rows above reuse the captured tensors, which a real denoising step cannot do.
+    if reason is None:
+        src = [q, k, v, gate]
+
+        def replay_with_copy():
+            with torch.no_grad():
+                for dst, s in zip(leaves, src):
+                    dst.copy_(s)
+            graph.replay()
+
+        with torch.cuda.stream(stream), torch.autograd.set_multithreading_enabled(False):
+            try:
+                rows.append(row("graph.replay_with_copy", loop(replay_with_copy),
+                                note="fresh inputs copied into the captured buffers each step, then replay"))
+            except Exception as e:
+                rows.append(row("graph.replay_with_copy", reason=f"{type(e).__name__}: {e}"))
     try:
         with torch.cuda.stream(stream), torch.autograd.set_multithreading_enabled(False):
             same_stream = row("eager.same_stream", loop(eager), note="capture stream, autograd multithreading off")
