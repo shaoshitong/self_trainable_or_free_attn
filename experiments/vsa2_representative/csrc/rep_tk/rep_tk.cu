@@ -30,7 +30,11 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/extension.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdlib>
+#include <cstring>
+#include <vector>
 
 using namespace kittens;
 
@@ -1473,6 +1477,37 @@ std::vector<torch::Tensor> rep_tk_fwd(torch::Tensor q, torch::Tensor k, torch::T
 }
 
 
+// FlashAttention's num_splits_heuristic: no split once the unsplit grid nearly fills the resident slots;
+// otherwise the fewest splits whose wave efficiency (filled fraction of the last wave) is within 85% of the
+// best, skipping split counts that leave the per-split block count unchanged.
+inline int num_splits_heuristic(long long ctas, int slots, int n_blocks, int max_splits) {
+  if (ctas >= 0.8f * slots) return 1;
+  max_splits = std::min({max_splits, slots, n_blocks});
+  auto cdiv = [](int a, int b) { return (a + b - 1) / b; };
+  auto eligible = [&](int sp) { return sp == 1 || cdiv(n_blocks, sp) != cdiv(n_blocks, sp - 1); };
+  std::vector<float> eff(max_splits + 1, 0.f);
+  float best = 0.f;
+  for (int sp = 1; sp <= max_splits; ++sp) {
+    if (!eligible(sp)) continue;
+    const float waves = (float)(ctas * sp) / (float)slots;
+    eff[sp] = waves / std::ceil(waves);
+    best = std::max(best, eff[sp]);
+  }
+  for (int sp = 1; sp <= max_splits; ++sp)
+    if (eligible(sp) && eff[sp] >= 0.85f * best) return sp;
+  return 1;
+}
+
+// SM count of the current device, read from its properties once per device.
+inline int device_sms() {
+  static int cache[64] = {};
+  int dev = 0;
+  cudaGetDevice(&dev);
+  if (dev < 0 || dev >= 64) return at::cuda::getDeviceProperties(dev)->multiProcessorCount;
+  if (cache[dev] == 0) cache[dev] = at::cuda::getDeviceProperties(dev)->multiProcessorCount;
+  return cache[dev];
+}
+
 template <int D>
 static void bwd_c_impl(torch::Tensor q, torch::Tensor kt, torch::Tensor vt, torch::Tensor lc_tail, torch::Tensor dout,
                        torch::Tensor lse, torch::Tensor delta, torch::Tensor bits_ab, torch::Tensor qg,
@@ -1489,21 +1524,23 @@ static void bwd_c_impl(torch::Tensor q, torch::Tensor kt, torch::Tensor vt, torc
   decltype(G::vgt) a_vg{vgt.data_ptr<float>(), B, H, NBt, (unsigned)D};
   decltype(G::l) a_l{lse.data_ptr<float>(), B, H, 1U, L};
   decltype(G::d) a_d{delta.data_ptr<float>(), B, H, 1U, L};
-  // One CTA per tail tile would be NBt/64 * H * B CTAs (64 at L=16k, H=16: under half of an H100's SMs).
-  // Split each tile's query range so the grid fills one wave of resident CTAs (2/SM at D=128, 3 at
-  // D=64, from the launch bounds) without spilling into a second, keeping >= 16 query blocks per CTA.
-  // Measured at L=16k H=16 D=128 (64 tiles, 264 slots): 1 split 0.792 ms, 4 (= one wave) 0.247 ms,
-  // 8 0.254, 9 (2.2 waves) 0.313. REP_TK_BWDC_SPLITS overrides.
+  // One CTA per tail tile would be NBt/64 * H * B CTAs (64 at L=16k, H=16: under half of an H100's SMs),
+  // so each tile's query range (NB blocks) is split over CTAs. Measured at L=16k H=16 D=128 (64 tiles, 264
+  // slots): 1 split 0.792 ms, 4 (= one wave) 0.247 ms, 8 0.254, 9 (2.2 waves) 0.313. The split count is
+  // num_splits_heuristic over the resident CTA slots, SMs x CTAs/SM from the launch bounds (2 at D=128, 3
+  // at D=64), as FlashAttention passes 2 x SMs for its 2-CTA kernels; that gives 4 at the measured shape
+  // on 132 SMs. REP_TK_BWDC_SPLITS=<n> forces n; REP_TK_BWDC_SPLITS=wave is the previous policy (fill one
+  // wave, >= 16 query blocks per CTA).
   int splits;
-  if (const char* e = std::getenv("REP_TK_BWDC_SPLITS")) {
+  const long long ctas = (long long)(NBt / 64) * H * B;
+  const int slots = device_sms() * (D == 64 ? 3 : 2);
+  const char* e = std::getenv("REP_TK_BWDC_SPLITS");
+  if (e && std::strcmp(e, "wave") == 0)
+    splits = (int)std::max<long long>(1, std::min<long long>(slots / ctas, NB / 16));
+  else if (e)
     splits = std::max(1, std::atoi(e));
-  } else {
-    int dev = 0, sms = 0;
-    cudaGetDevice(&dev);
-    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
-    const long long ctas = (long long)(NBt / 64) * H * B, resident = (long long)sms * (D == 64 ? 3 : 2);
-    splits = (int)std::max<long long>(1, std::min<long long>(resident / ctas, NB / 16));
-  }
+  else
+    splits = num_splits_heuristic(ctas, slots, NB, 128);
   G g{a_q, a_og, a_kt, a_vt, a_qg, a_kg, a_vg, a_l, a_d, lc_tail.data_ptr<float>(),
       reinterpret_cast<const uint32_t*>(bits_ab.data_ptr<int>()), (int)H, NB, (int)NBt, words_of(NB), splits};
   constexpr int mem = (D == 64) ? 72000 : 113000;  // as VSA2's TK backward
