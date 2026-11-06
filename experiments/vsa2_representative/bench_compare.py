@@ -93,6 +93,9 @@ FWD_CFGS = {
     "46": ("operator", "alias of CFG1 since the fused kv->q column stage became the default; some of the router's mask/cut/emit or cols/colscan/cols kernels merged; bitmaps held "
                        "bit-identical"),
     "47": ("operator", "history arm: each chain builds its kv->q CSR with cols / colscan / cols"),
+    "48": ("operator", "CFG1 with the pool_kernel pass vectorised to two column pairs per thread; bit-identical, each "
+                       "column's summation order is unchanged"),
+    "49": ("operator", "CFG1 with the router's mask, cut and emit kernels merged into one; selection held bit-identical"),
     "2": ("tier_a_path", "tier-A-only specialisation at MINB 4; other phases run the default kernel"),
     "3": ("tier_a_path", "tier-A-only specialisation at MINB 3; other phases run the default kernel"),
     "4": ("timing_only", "copied native loop, native softmax"),
@@ -115,7 +118,8 @@ HISTORY_ARMS = {"20": "the pre-round-4 tier-B gather (32 x 512 B bulk copies)",
                 "47": "each chain builds its kv->q CSR with cols / colscan / cols"}
 # These reach only the routed operator: fwd_impl launches the default kernel, and their evidence is host code that
 # reads the config. Their full-op forward may move, so it is not a control. All but CFG43 keep every output byte.
-ROUTED_ARMS = {"38", "40", "41", "43", "45", "47"}
+ROUTED_ARMS = {"38", "40", "41", "43", "45", "47", "48", "49"}
+CFG1_ONLY = {"48", "49"}  # one change each to the router pass; comparable against CFG1 and nothing else
 TOLERANCE_EQUAL = {"43"}  # the group means are rounded to bf16 before the block mean is formed
 ROUTED_READ_ROWS = ("full_op.tk.routed.f", "full_op.tk.routed.f_plus_b")
 OWN_FORWARD = ("20", "24", "32", "33")  # meaningless if they launch the default kernel
@@ -235,6 +239,9 @@ def arms_error(configs):
     backward = arms & BACKWARD_ARMS.keys()
     if backward and not arms <= FORWARD_EQUAL:
         return f"CFG{min(backward)} changes only the backward; compare it with CFG1, not {sorted(arms)}"
+    for value in arms & CFG1_ONLY:
+        if not arms <= {value, "1"}:
+            return f"CFG{value} is comparable against CFG1 only, not {sorted(arms)}"
     if "47" in arms and not arms <= {"47", *ALIASES}:
         return f"CFG47 merges router kernels; compare it with CFG1 so that nothing else changes, not {sorted(arms)}"
     if "23" in arms and arms != {"23"} and arms != {"23", "37"}:
@@ -655,6 +662,10 @@ def child_main(spec):
         for name, ph in phases.items():
             o_p, lse_p = kernel_fwd(ph)()
             forward_output[name] = dict(o=digest(o_p), lse=digest(lse_p))
+        # Coarse means and pooled tables reach no row above: the selection alone would not show a pool change.
+        pooled = C.pool_fwd_vr(q, k, v, cnt, 16) if hasattr(C, "pool_fwd_vr") else C.pool_fwd(q, k, v, cnt, 16)
+        forward_output["pool"] = [digest(t) for t in pooled]
+        forward_output["full_op"] = dict(o=digest(rep_attention(q, k, v, gate, cnt, R=16, tiers=tiers, backend="tk")))
         o_g, lse_g = C.rep_attn_fwd(q, k, v, *gtab, qp, qi, sel.bits_a, sel.bits_ab, cnt, rm, PHASE_ALL, 0)
         output_check = [compare("o vs generic", o_t, o_g, TOL_O), compare("lse vs generic", lse_t, lse_g, TOL_LSE)]
         grads = {}

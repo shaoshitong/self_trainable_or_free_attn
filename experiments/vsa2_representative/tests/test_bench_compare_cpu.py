@@ -39,11 +39,11 @@ def test_configs_keep_their_semantics():
         {"REP_TK_FWD_CFG": "1", "REP_TK_BWDC_SPLITS": "8"}
     for cfg in "23457":
         assert rejected(f"REP_TK_FWD_CFG={cfg}", "representative"), "a diagnostic passed as production"
-    for cfg in ("0", "1", "2", "6", "8", "9", "10", "11", "13", "20", "21", "22", "23", "24", "32", "33", "34", "35", "36", "37", "38", "39", "40", "41", "42", "43", "44", "45", "46"):
+    for cfg in ("0", "1", "2", "6", "8", "9", "10", "11", "13", "20", "21", "22", "23", "24", "32", "33", "34", "35", "36", "37", "38", "39", "40", "41", "42", "43", "44", "45", "46", "47", "48", "49"):
         assert rejected(f"REP_TK_FWD_CFG={cfg}", "controlled-softmax"), "only CFG 4/5/7 are this diagnostic"
     for cfg in "457":
         assert parse_config(f"REP_TK_FWD_CFG={cfg}", "controlled-softmax")
-    for cfg in ("8", "9", "10", "11", "13", "20", "21", "22", "23", "24", "32", "33", "34", "35", "36", "37", "38", "39", "40", "41", "42", "43", "44", "45", "46"):
+    for cfg in ("8", "9", "10", "11", "13", "20", "21", "22", "23", "24", "32", "33", "34", "35", "36", "37", "38", "39", "40", "41", "42", "43", "44", "45", "46", "47", "48", "49"):
         assert parse_config(f"REP_TK_FWD_CFG={cfg}", "representative")
     assert rejected("REP_TK_FWD_CFG=25", "representative"), "the kernel would silently run its default path"
     assert parse_config("REP_TK_FWD_CFG=1,REP_TK_BWDC_SPLITS=wave", "representative"), "the kernel accepts wave"
@@ -175,7 +175,7 @@ def test_history_and_alias_arms_are_registered():
     pair = lambda x, y: {"baseline": {"REP_TK_FWD_CFG": x}, "candidate": {"REP_TK_FWD_CFG": y}}
     for value in ("20", "43"):
         assert not forward_must_match(pair("1", value)), "their outputs may differ"
-    for value in ("37", "40", "45", "47", "42", "44", "46"):
+    for value in ("37", "40", "45", "47", "48", "49", "42", "44", "46"):
         assert forward_must_match(pair("1", value)), f"CFG{value} is held to byte equality"
     assert not forward_must_match(pair("42", "43")), "a pair containing CFG43 is tolerance-equivalent"
 
@@ -212,6 +212,25 @@ def test_routed_arms_read_host_code_and_keep_full_op_timing_visible():
     assert "missing row full_op.tk.routed.f" in assemble({}, "representative", pair, [], short)["status"]
     for value in ("38", "40", "41", "42", "43", "44", "45"):  # the host code in this tree
         assert cfg_error(value, ROUND5) is None, value
+
+
+def test_router_pass_arms_are_byte_equal_against_cfg1_only():
+    pair = lambda x, y: {"baseline": {"REP_TK_FWD_CFG": x}, "candidate": {"REP_TK_FWD_CFG": y}}
+    for value in ("48", "49"):
+        assert value not in ALIASES and forward_must_match(pair("1", value))
+        assert arms_error(pair("1", value)) is None and arms_error(pair(value, value)) is None
+        for other in ("10", "46", "47", "45", "43", "11", "21"):
+            assert arms_error(pair(other, value)), f"CFG{other} vs CFG{value}"
+        assert cfg_error(value, ROUND5, "nothing here"), "must not pass before something reads it"
+        assert cfg_error(value, ROUND5, f'strcmp(cfg_env, "{value}")') is None
+        moved = kernel(BULK, f"(cfg == {value}) launch(rep_tk::fwd_ker<D, 4>);")
+        assert cfg_error(value, moved, f'strcmp(cfg_env, "{value}")'), "they must not change a forward kernel"
+        a, b = child("baseline", 1), child("candidate", 1)
+        a["forward_output"] = dict(pool=["x"], full_op=dict(o="x"))
+        b["forward_output"] = dict(pool=["y"], full_op=dict(o="x"))
+        for c in (a, b):
+            c["rows"] += [dict(id=r, ms=[1.0], meta=c["rows"][0]["meta"]) for r in ("full_op.tk.routed.f", "full_op.tk.routed.f_plus_b")]
+        assert assemble({}, "representative", pair("1", value), [], [a, b])["status"].startswith("invalid"), "a pool byte moved"
 
 
 def test_backward_arm_is_single_variable():
@@ -420,6 +439,7 @@ if __name__ == "__main__":
     test_softmax_reductions_stay_on_the_default_path()
     test_history_and_alias_arms_are_registered()
     test_routed_arms_read_host_code_and_keep_full_op_timing_visible()
+    test_router_pass_arms_are_byte_equal_against_cfg1_only()
     test_backward_arm_is_single_variable()
     test_backward_arm_reaches_only_its_tier()
     test_forward_change_under_backward_arm_is_invalid()
