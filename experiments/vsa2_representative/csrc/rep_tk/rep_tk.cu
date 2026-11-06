@@ -82,6 +82,12 @@ __device__ __forceinline__ void cp_async_16(uint32_t dst_smem, const void* src) 
 __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
 template <int N>
 __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory"); }
+// the same with a (block-uniform) run-time count 0..2; the instruction takes an immediate
+__device__ __forceinline__ void cp_async_wait_n(int n) {
+  if (n <= 0) cp_async_wait<0>();
+  else if (n == 1) cp_async_wait<1>();
+  else cp_async_wait<2>();
+}
 
 // Number of distinct swizzle phases a tier-B slot can start on: slot s begins at tile row RM*s, and the
 // 128-byte swizzle repeats every 8 rows.
@@ -684,6 +690,268 @@ epilogue:
   if (warp == 0) {  // TK's store/wait helpers are warp-collective (lane-0 guard + __syncwarp inside)
     coord<tile_t> c = {b, h, qb, 0};
     tma::store_async(g.o, q_smem, c);
+    tma::store_async_wait();
+  }
+#endif
+}
+
+// ---------------------------------------------------------------- forward, K double-buffered (cfg 11)
+// The default fwd_ker<D, 3, false, false, true> (vector softmax, tier-B cp.async gather) with K
+// double-buffered: one more st_bf<64, D> in shared memory, the same launch bounds, grid, single V buffer
+// and tier-B gather. Tile j's K lives in buffer j & 1, counting every tile; step j issues K(j + 2) into
+// its own buffer as soon as its QK has read it, so each K is issued a tile earlier than with one buffer.
+// A separate kernel with a plain template step, so fwd_ker and its instantiations are untouched.
+//
+// Barriers: one per K buffer; bit b of kph is the parity of buffer b's next TMA phase and flips only when
+// a TMA-delivered (A or C) tile is consumed from that buffer. Loads into a buffer and its consumptions
+// strictly alternate, so each barrier completes exactly one phase per TMA tile it receives, and a tier-B
+// tile, which goes through neither barrier, changes no parity whatever the A/B/C order. V's parity `it`
+// counts TMA tiles as in fwd_ker. cp.async groups are committed in the order K0, K1, V0, K2, V1, K3, V2,
+// ... (prologue, then K(j + 2) and V(j + 1) in step j), so for a tier-B tile j the groups younger than K(j)
+// are V(j - 1) (complete), K(j + 1) if tile j + 1 is tier B, and V(j): wait_group 1 + [j + 1 is B]; the
+// only group younger than V(j) is K(j + 2): wait_group [j + 2 is B]. Each thread then fences its
+// generic-proxy writes and a CTA barrier precedes the wgmma, as in fwd_ker.
+template <int D>
+struct kdb_ctx {
+  using tile_t = typename fwd_globals<D>::tile;
+  tile_t* q;
+  tile_t* k0;
+  tile_t* k1;
+  tile_t* v;
+  uint32_t k0_s, k1_s, v_s;
+  semaphore* kbar0;
+  semaphore* kbar1;
+  semaphore* vbar;
+  const bf16* ksw;
+  const bf16* vsw;
+  int b, h;
+  int it, kt, kph;  // TMA tiles consumed (V parity), tile ordinal (K buffer kt & 1), K parity per buffer
+};
+
+template <int D>
+struct kdb_regs {
+  rt_fl<16, 64> att;
+  rt_bf<16, 64> att_mma;
+  rt_fl<16, D> o;
+  col_vec<rt_fl<16, 64>> m, l;  // log2-domain running max (bias included) and row sum
+};
+
+// One pipeline step for `tile`: nxt's K is already in flight in the other buffer, nxt2's K is issued here,
+// nxt's V at the end. nsl / nsl2: slot blocks of nxt / nxt2 (slot_blocks_cta) when they are tier B. BC as
+// in fwd_ker: false = tier-A tile (count mask only), true = tier-B/C tile with biases cb.
+template <int D, bool BC>
+__device__ __forceinline__ void kdb_step(const fwd_globals<D>& g, kdb_ctx<D>& c, kdb_regs<D>& r, int2 tile,
+                                         int2 nxt, int2 nxt2, int kcA, const TileBias& cb, const int (&nsl)[4],
+                                         const int (&nsl2)[4]) {
+  constexpr float SL2 = kLog2e * (D == 64 ? 0.125f : 0.08838834764f);
+  const int kb = c.kt & 1, warp = warpid();
+  const bool cp_cur = tile.x == kTierB;
+  const int none[2] = {g.NB, g.NB};  // issue_tile's slot argument, unused for A/C tiles
+  typename fwd_globals<D>::tile& kbuf = kb ? *c.k1 : *c.k0;
+  semaphore& kbar = kb ? *c.kbar1 : *c.kbar0;
+  if (cp_cur) {
+    cp_async_wait_n(1 + (nxt.x == kTierB));
+    fence_async_smem();
+    __syncthreads();
+  } else {
+    wait(kbar, (c.kph >> kb) & 1);
+  }
+  warpgroup::mm_ABt(r.att, *c.q, kbuf);
+  warpgroup::mma_async_wait();
+  if (nxt2.x == kTierB) issue_tier_b_cta<D>(kb ? c.k1_s : c.k0_s, c.ksw, nsl2, g.NB, g.RM);
+  else if (nxt2.x != kTierNone && warp == 0)
+    issue_tile<D>(nxt2, kbuf, g.k, g.kt, c.ksw, none, c.b, c.h, g.NB, g.RM, kbar);
+
+  // log2 domain, then each column's + log2(c) bias (or -inf mask) before the row max
+  mul(r.att, r.att, SL2);
+  if constexpr (BC) {
+    if (cb.masked && !(tile.x == kTierB && (g.diag & 1))) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          float2& e = r.att.tiles[0][i].data[j];
+          e.x += cb.v[i][(j >> 1) * 2];
+          e.y += cb.v[i][(j >> 1) * 2 + 1];
+        }
+    }
+  } else if (kcA < kB) {  // partial tier-A block: VSA2's own column mask
+    right_fill(r.att, r.att, kcA, base_types::constants<float>::neg_infty());
+  }
+  online_softmax_tk<D>(r.att, r.m, r.l, r.o);
+  copy(r.att_mma, r.att);
+
+  if (cp_cur) {
+    cp_async_wait_n(nxt2.x == kTierB);
+    fence_async_smem();
+    __syncthreads();
+  } else {
+    wait(*c.vbar, c.it & 1);
+  }
+  warpgroup::mma_AB(r.o, r.att_mma, *c.v);
+  warpgroup::mma_async_wait();
+  if (nxt.x == kTierB) issue_tier_b_cta<D>(c.v_s, c.vsw, nsl, g.NB, g.RM);
+  else if (nxt.x != kTierNone && warp == 0)
+    issue_tile<D>(nxt, *c.v, g.v, g.vt, c.vsw, none, c.b, c.h, g.NB, g.RM, *c.vbar);
+  if (!cp_cur) {
+    ++c.it;
+    c.kph ^= 1 << kb;
+  }
+  ++c.kt;
+}
+
+template <int D>
+__global__ __launch_bounds__(128, 3) void fwd_kdb_ker(const __grid_constant__ fwd_globals<D> g) {
+#if REP_TK_HOPPER
+  constexpr int ND = D / 16;
+  using tile_t = typename fwd_globals<D>::tile;
+  const int qb = blockIdx.x, h = blockIdx.y, b = blockIdx.z;
+  const int bh = b * g.H + h;
+  const int warp = warpid(), lane = laneid(), gq = lane >> 2;
+
+  Stream s;
+  {
+    const size_t r = (size_t)bh * (g.NB + 1) + qb;
+    const int a0 = g.a_ptr[r], b0 = g.b_ptr[r];
+    s.a_idx = g.a_idx + a0;
+    s.na = g.a_ptr[r + 1] - a0;
+    s.b_idx = g.b_idx + b0;
+    s.nb_list = g.b_ptr[r + 1] - b0;
+    s.ab_row = g.bits_ab + ((size_t)bh * g.NB + qb) * g.W;
+    s.G = kB / g.RM;
+    s.nbt_tiles = (s.nb_list + s.G - 1) / s.G;
+    s.nc_tiles = g.NBt / kB;
+    s.NB = g.NB;
+    s.W = g.W;
+    s.phases = g.phases;
+    s.ia = s.ib = s.tc = 0;
+  }
+  const float* lc_tail = g.lc_tail + (size_t)bh * g.NBt;
+  const float* lcb = g.lcb + (size_t)(s.b_idx - g.b_idx) * g.RM;  // this row's entries
+  const bf16* ksw = g.k_sw + (size_t)bh * num_phases(g.RM) * (g.NB + 1) * (D / 64) * g.RM * 64;
+  const bf16* vsw = g.v_sw + (size_t)bh * num_phases(g.RM) * (g.NB + 1) * (D / 64) * g.RM * 64;
+  const int qcnt = g.blk_cnt[qb];
+
+  int2 cur = s.next();
+  if (cur.x == kTierNone) {
+    bf16* o = g.o.raw_ptr + ((size_t)bh * g.L + (size_t)qb * kB) * D;
+    for (int i = threadIdx.x; i < kB * D / 8; i += blockDim.x) reinterpret_cast<uint4*>(o)[i] = make_uint4(0, 0, 0, 0);
+    if (threadIdx.x < kB) g.lse[(size_t)bh * g.L + (size_t)qb * kB + threadIdx.x] = ninf();
+    return;
+  }
+
+  extern __shared__ int __shm[];
+  tma_swizzle_allocator al((int*)&__shm[0]);
+  tile_t(&q_smem) = al.allocate<tile_t>();
+  tile_t(&k0_smem) = al.allocate<tile_t>();
+  tile_t(&v_smem) = al.allocate<tile_t>();
+  tile_t(&k1_smem) = al.allocate<tile_t>();  // last, so q/k/v keep fwd_ker's offsets
+  __shared__ semaphore q_bar, k_bar0, v_bar, k_bar1;
+  if (threadIdx.x == 0) {
+    init_semaphore(q_bar, 0, 1);
+    init_semaphore(k_bar0, 0, 1);
+    init_semaphore(v_bar, 0, 1);
+    init_semaphore(k_bar1, 0, 1);
+    tma::expect_bytes(q_bar, sizeof(tile_t));
+    coord<tile_t> qc = {b, h, qb, 0};
+    tma::load_async(q_smem, g.q, qc, q_bar);
+  }
+  __syncthreads();  // barriers initialized before warp 0's other lanes use them
+  kdb_ctx<D> c;
+  c.q = &q_smem;
+  c.k0 = &k0_smem;
+  c.k1 = &k1_smem;
+  c.v = &v_smem;
+  c.k0_s = static_cast<uint32_t>(__cvta_generic_to_shared(&k0_smem.data[0]));
+  c.k1_s = static_cast<uint32_t>(__cvta_generic_to_shared(&k1_smem.data[0]));
+  c.v_s = static_cast<uint32_t>(__cvta_generic_to_shared(&v_smem.data[0]));
+  c.kbar0 = &k_bar0;
+  c.kbar1 = &k_bar1;
+  c.vbar = &v_bar;
+  c.ksw = ksw;
+  c.vsw = vsw;
+  c.b = b;
+  c.h = h;
+  c.it = c.kt = c.kph = 0;
+
+  // prologue: K(cur) -> buffer 0, K(nxt) -> buffer 1, V(cur), in the order kdb_step's group counts assume
+  int2 nxt = s.next(), nxt2 = make_int2(kTierNone, 0);
+  int sl_cur[4] = {g.NB, g.NB, g.NB, g.NB}, nsl[4] = {g.NB, g.NB, g.NB, g.NB}, nsl2[4] = {g.NB, g.NB, g.NB, g.NB};
+  const int none[2] = {g.NB, g.NB};
+  if (cur.x == kTierB) slot_blocks_cta(s.b_idx, s.nb_list, cur.y, g.NB, g.RM, sl_cur);
+  if (nxt.x == kTierB) slot_blocks_cta(s.b_idx, s.nb_list, nxt.y, g.NB, g.RM, nsl);
+  if (cur.x == kTierB) issue_tier_b_cta<D>(c.k0_s, ksw, sl_cur, g.NB, g.RM);
+  else if (warp == 0) issue_tile<D>(cur, k0_smem, g.k, g.kt, ksw, none, b, h, g.NB, g.RM, k_bar0);
+  if (nxt.x == kTierB) issue_tier_b_cta<D>(c.k1_s, ksw, nsl, g.NB, g.RM);
+  else if (nxt.x != kTierNone && warp == 0) issue_tile<D>(nxt, k1_smem, g.k, g.kt, ksw, none, b, h, g.NB, g.RM, k_bar1);
+  if (cur.x == kTierB) issue_tier_b_cta<D>(c.v_s, vsw, sl_cur, g.NB, g.RM);
+  else if (warp == 0) issue_tile<D>(cur, v_smem, g.v, g.vt, vsw, none, b, h, g.NB, g.RM, v_bar);
+
+  kdb_regs<D> r;
+  zero(r.o);
+  neg_infty(r.m);
+  zero(r.l);
+  TileBias cb;
+  cb.masked = false;
+  cb.kc = kB;
+  wait(q_bar, 0);
+
+  // The stream runs two tiles ahead: nxt2 and its slot blocks are read before each step, then rolled.
+  // Tier A: no bias state, as in fwd_ker.
+  while (cur.x == kTierA) {
+    nxt2 = s.next();
+    if (nxt2.x == kTierB) slot_blocks_cta(s.b_idx, s.nb_list, nxt2.y, g.NB, g.RM, nsl2);
+    kdb_step<D, false>(g, c, r, cur, nxt, nxt2, g.blk_cnt[cur.y], cb, nsl, nsl2);
+    cur = nxt;
+    nxt = nxt2;
+#pragma unroll
+    for (int u = 0; u < 4; ++u) nsl[u] = nsl2[u];
+  }
+  // Tiers B and C: biases one tile ahead, as in fwd_ker.
+  if (cur.x != kTierNone) cb = tile_bias(cur, s, g.blk_cnt, lcb, lc_tail, g.RM);
+  while (cur.x != kTierNone) {
+    nxt2 = s.next();
+    if (nxt2.x == kTierB) slot_blocks_cta(s.b_idx, s.nb_list, nxt2.y, g.NB, g.RM, nsl2);
+    const TileBias nb_ = tile_bias(nxt, s, g.blk_cnt, lcb, lc_tail, g.RM);
+    kdb_step<D, true>(g, c, r, cur, nxt, nxt2, kB, cb, nsl, nsl2);
+    cur = nxt;
+    nxt = nxt2;
+#pragma unroll
+    for (int u = 0; u < 4; ++u) nsl[u] = nsl2[u];
+    cb = nb_;
+  }
+
+  // epilogue, fwd_ker's vector-softmax one: o = o / l (padded query rows -> 0), natural lse (finite on
+  // padded rows); r.m / r.l: .x = row gq, .y = row gq + 8 of each warp
+  static_assert(decltype(r.m)::outer_dim == 1 && decltype(r.m)::inner_dim == 1, "col_vec layout");
+  const float m_row[2] = {r.m.data[0][0].x, r.m.data[0][0].y};
+  const float l_row[2] = {r.l.data[0][0].x, r.l.data[0][0].y};
+  float inv[2], lse[2];
+#pragma unroll
+  for (int i = 0; i < 2; ++i) {
+    const float l = l_row[i];
+    const int row = 16 * warp + gq + 8 * i;
+    inv[i] = (row < qcnt && l > 0.f) ? 1.f / l : 0.f;
+    lse[i] = l > 0.f ? (m_row[i] + __log2f(l)) * kLn2 : ninf();
+  }
+#pragma unroll
+  for (int n = 0; n < ND; ++n)
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      r.o.tiles[0][n].data[j].x *= inv[j & 1];
+      r.o.tiles[0][n].data[j].y *= inv[j & 1];
+    }
+  if ((lane & 3) == 0) {
+    float* gl_ = g.lse + (size_t)bh * g.L + (size_t)qb * kB + 16 * warp + gq;
+    gl_[0] = lse[0];
+    gl_[8] = lse[1];
+  }
+  __syncthreads();  // every warp is done with q_smem
+  warpgroup::store(q_smem, r.o);
+  __syncthreads();
+  if (warp == 0) {  // TK's store/wait helpers are warp-collective
+    coord<tile_t> oc = {b, h, qb, 0};
+    tma::store_async(g.o, q_smem, oc);
     tma::store_async_wait();
   }
 #endif
@@ -1365,6 +1633,12 @@ static void fwd_impl(torch::Tensor q, torch::Tensor k, torch::Tensor v, const st
   else if (cfg == 9) launch(rep_tk::fwd_ker<D, 2, false, true>);
   // cfg 20: the pre-cp.async default, per-slot cp.async.bulk tier-B gather (history arm)
   else if (cfg == 20) launch(rep_tk::fwd_ker<D, 3>);
+  // cfg 11: fwd_kdb_ker, the default with K double-buffered (one more K tile, same launch bounds and grid)
+  else if (cfg == 11) {
+    constexpr int mem_kdb = 4 * 64 * D * 2 + 1024;  // q, two K, v tiles + alignment slack
+    cudaFuncSetAttribute(rep_tk::fwd_kdb_ker<D>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_kdb);
+    rep_tk::fwd_kdb_ker<D><<<dim3(NB, H, B), 128, mem_kdb, stream()>>>(g);
+  }
   // cfg 1 / 10: tier-B tiles loaded by CTA-wide cp.async (issue_tier_b_cta) instead of bulk copies
   else launch(rep_tk::fwd_ker<D, 3, false, false, true>);
   check_launch("fwd");
