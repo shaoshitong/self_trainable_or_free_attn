@@ -24,7 +24,8 @@ need not sum to the complete call: stages overlap differently on the stream when
 
 Under every configuration each row keeps its meaning. reads_fwd_cfg says whether it can change with
 REP_TK_FWD_CFG. A row with false, such as pool or route, should match another configuration within the floor.
-CFG13 changes only the backward, so all its rows are labelled as a repeat of the CFG1 forward. Compare runs from
+CFG13 is an alias and CFG21/22/23 change only the backward, so all their rows are labelled as a repeat of the
+CFG1 forward. Compare runs from
 one build only, with --compare; numbers from another build, or from CFG1 before its gather changed, do not qualify.
 
   REP_TK_FWD_CFG=11 <gpu-runner> python bench_stages.py --out stages-cfg11.json
@@ -37,11 +38,11 @@ import statistics
 import sys
 from pathlib import Path
 
-from bench_compare import HERE, active_fwd_cfg, sha256_file
+from bench_compare import FORWARD_EQUAL, HERE, active_fwd_cfg, sha256_file
 
 NOTE = "measurement_only: not a performance claim; do not add to kernel rows"
 READS_FWD_CFG = {"total", "total.repeat", "fine", "fine.kernel"}
-BACKWARD_ONLY_NOTE = "CFG13 changes only the backward: this forward row repeats CFG1's"
+BACKWARD_ONLY_NOTE = "this configuration changes only the backward: this forward row repeats CFG1's"
 
 
 def compare_stages(a, b):
@@ -166,7 +167,7 @@ def main():
         ("total.repeat", False, "second measurement of total, for the floor", total),
     )
     rows = [dict(id=n, ms=loop(fn), in_sum=in_sum, label="measurement_only", measured=True, note=note or NOTE,
-                 reads_fwd_cfg=n in READS_FWD_CFG, **({"config_note": BACKWARD_ONLY_NOTE} if cfg == "13" else {}))
+                 reads_fwd_cfg=n in READS_FWD_CFG, **({"config_note": BACKWARD_ONLY_NOTE} if cfg in FORWARD_EQUAL - {"1", "10"} else {}))
             for n, in_sum, note, fn in stages]
     res = dict(schema="vsa2-rep-stages/1", measurement_only=True, note=NOTE, fwd_cfg=cfg, fwd_cfg_meaning=meaning,
                shape=dict(B=B, H=H, L=L, D=D, NB=nb, RM=rm, R=R, dtype="bf16", blk_cnt="full"),

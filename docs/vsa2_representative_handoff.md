@@ -352,41 +352,52 @@ CUDA_VISIBLE_DEVICES=0 /opt/venv/bin/python fwd_cfg.py
 CUDA_VISIBLE_DEVICES=0 /opt/venv/bin/python bwdc_split.py
 ```
 
-Forward configurations. The config table in `bench_compare.py` describes the kernel that has the CFG 20 history
-arm. Registers and stack bytes are D=128 `ptxas` figures: CFG 1 from CFG 10's round 4 build, the other measured
-rows from source `3c291f2`, before the gather changed, with CFG 20's taken from CFG 1 at that source. None has
-been read from a build containing CFG 20.
+Configurations. The config table in `bench_compare.py` describes the kernel that has the CFG 20 history arm.
+Registers and stack bytes are D=128 `ptxas` figures: CFG 1 from CFG 10's round 4 build, the other measured rows
+from source `3c291f2`, before the gather changed, with CFG 20's taken from CFG 1 at that source. None has been read
+from a build containing CFG 20.
 
-| CFG | Kernel | Softmax | MINB | Registers | Stack bytes |
-|---:|---|---|---:|---:|---:|
-| 1 (default) | `fwd_ker`, all tiers, tier-B gather by `cp.async` | TK vector | 3 | 166 | no spills |
-| 10 | alias of CFG 1, kept so old logs stay reproducible | TK vector | 3 | as CFG 1 | as CFG 1 |
-| 11 | CFG 1 plus a double-buffered K tile; V unchanged | TK vector | 3 | not built yet | not built yet |
-| 13 | CFG 1 forward; tier-C backward split by `num_splits_heuristic` | TK vector | 3 | as CFG 1 | as CFG 1 |
-| 20 | the pre-round-4 kernel: per-slot `cp.async.bulk` gather | TK vector | 3 | 168 | 24 |
-| 6 | `fwd_ker`, all tiers | hand-written | 3 | 168 | 16 |
-| 8 | `fwd_ker`, all tiers | TK vector | 2 | not recorded here | not recorded here |
-| 9 | `fwd_ker`, all tiers | hand-written | 2 | not recorded here | not recorded here |
-| 0 | `fwd_ker`, all tiers | TK vector | 4 | 128 | 184 |
-| 2 | `fwd_ker`, `A_ONLY` | TK vector | 4 | 128 | 8 |
-| 3 | `fwd_ker`, `A_ONLY` | TK vector | 3 | 160 | 0 |
-| 4 | `nat_copy_ker` | native | 4 | 128 | 0 |
-| 5 | `nat_copy_ker` | hand-written | 4 | 126 | 40 |
-| 7 | `nat_copy_ker` | TK vector | 4 | 128 | 0 |
+| CFG | Kernel | Softmax | MINB | Tier-B gather | Registers | Stack bytes |
+|---:|---|---|---:|---|---:|---:|
+| 1 (default) | `fwd_ker`, all tiers; heuristic tier-C backward split | TK vector | 3 | `cp.async` | 166 | no spills |
+| 10, 13 | aliases of CFG 1, kept so old logs stay reproducible | as CFG 1 | 3 | as CFG 1 | as CFG 1 | as CFG 1 |
+| 21 | CFG 1 forward; tier-C backward split by the old wave policy | as CFG 1 | 3 | as CFG 1 | as CFG 1 | as CFG 1 |
+| 22 | CFG 1 forward; tier-C backward split forced to 4 | as CFG 1 | 3 | as CFG 1 | as CFG 1 | as CFG 1 |
+| 23 | CFG 1 forward; tier-A backward `__launch_bounds__(128, 3)` probe | as CFG 1 | 3 | as CFG 1 | as CFG 1 | as CFG 1 |
+| 11 | negative arm: `fwd_kdb_ker`, CFG 1 plus a double-buffered K tile | TK vector | 3 | `cp.async` | not recorded here | not recorded here |
+| 20 | the pre-round-4 forward, with CFG 1's backward | TK vector | 3 | bulk | 168 | 24 |
+| 6 | `fwd_ker`, all tiers; a softmax pair with CFG 20 | hand-written | 3 | bulk | 168 | 16 |
+| 8 | `fwd_ker`, all tiers | TK vector | 2 | bulk | not recorded here | not recorded here |
+| 9 | `fwd_ker`, all tiers | hand-written | 2 | bulk | not recorded here | not recorded here |
+| 0 | `fwd_ker`, all tiers | TK vector | 4 | bulk | 128 | 184 |
+| 2 | `fwd_ker`, `A_ONLY` | TK vector | 4 | n/a | 128 | 8 |
+| 3 | `fwd_ker`, `A_ONLY` | TK vector | 3 | n/a | 160 | 0 |
+| 4 | `nat_copy_ker` | native | 4 | n/a | 128 | 0 |
+| 5 | `nat_copy_ker` | hand-written | 4 | n/a | 126 | 40 |
+| 7 | `nat_copy_ker` | TK vector | 4 | n/a | 128 | 0 |
 
-CFG 2/3 use their `A_ONLY` kernel only for `phases=A`; other phases run the default kernel. CFG 0/6/8/9 were
-defined against the old default, so a comparison with today's CFG 1 may also change the gather:
-`settings.fwd_kernels_in_source` in each result records the launched template. `REP_TK_BWDC_SPLITS=<positive>`
-forces the tier-C query split count. Without it, the split at D=128 is
-`min(2 * SMs / (tail_tiles * H * B), NB / 16)` with integer division. At 16K, H=16 and B=1 there are 4 tail
-tiles, so 132 SMs give a split of 4.
+CFG 2/3 use their `A_ONLY` kernel only for `phases=A`; other phases run the default kernel. CFG 0/6/8/9/20 keep the
+bulk gather, so CFG 6 is a softmax-only pair with CFG 20, not with CFG 1. `settings.fwd_kernels_in_source` records
+the launched template. CFG 21/22/23 are not in the newest kernel source read here, `f634020`, so they are refused
+until they land.
+
+`REP_TK_BWDC_SPLITS=<positive>` forces the tier-C split and `REP_TK_BWDC_SPLITS=wave` selects the old policy. At
+D=128, B=1, H=16 and 132 SMs, read from the kernel's formulas, many pairs of policies coincide, so a comparison
+at a shape where they do is an A/A run:
+
+| Length | Default (heuristic) | Wave (CFG 21) | Forced (CFG 22) |
+|---:|---:|---:|---:|
+| 16K | 4 | 4 | 4 |
+| 32K | 2 | 2 | 4 |
+| 48K | 4 | 1 | 4 |
+| 64K | 1 | 1 | 4 |
 
 `REP_TK_FWD_CFG` is cached on first use, so one process measures one value. A value the kernel does not
 dispatch on silently runs the default kernel, so `bench_compare.py`, `bench_tk.py`, `fwd_cfg.py`, `one_launch.py`
-and `bench_stages.py` check the kernel source on disk. They refuse a source without `cfg == 20`, a value not
-written as `cfg == <value>` (CFG 13 may use a name such as `bwd_cfg`; the alias CFG 10 may have no line), an alias
-or CFG 13 whose forward dispatch differs from the default, and a CFG 20 that launches the default. The check reads
-source, not the compiled extension.
+and `bench_stages.py` check `rep_tk.cu` on disk. They refuse a source without `cfg == 20`, a value not written as
+`cfg == <value>` (a backward arm may use a name such as `bwd_cfg`; the aliases may have no line), an alias or
+backward arm whose forward dispatch differs from the default, and a CFG 20 that launches the default. The check
+reads source, not the compiled extension, and does not look at the VSA2 sources compiled alongside it.
 
 CFG 4/5/7 are measurement code. They ignore `phases` and run tier A only, write no `lse` and do not mask
 padded output, so they are timing diagnostics and never a numerical reference. `fwd_cfg.py` prints only
@@ -436,11 +447,17 @@ ThunderKittens commit are recorded.
 | `forward_outputs_byte_identical` | whether the arms' `o` and `lse` have equal digests for every forward phase row; meaningful only if the A/A run is true |
 | `control=true` | does not read the compared setting; a ratio away from 1 is run drift |
 
-Backward kernels and table builds do not read `REP_TK_FWD_CFG`, except that CFG 13 reaches `kernel.tk.bwd.C`, so
-that row is not a control there. Between CFG 1, 10 and 13, one forward kernel by definition, the forward-only rows
-are controls and the result is invalid unless every forward output is byte-equal. CFG 13 can be compared only
-with CFG 1 or 10, and not with `REP_TK_BWDC_SPLITS`, which would override what it measures. Byte-equal output
-does not prove equal speed, so also read the forward control ratios.
+Backward kernels and table builds read no forward setting, so their kernel rows are controls, with two exceptions:
+CFG 21, CFG 22 and a forced split reach `kernel.tk.bwd.C`, and CFG 23 reaches `kernel.tk.bwd.A`. Between CFG 1, its
+aliases and the backward arms, one forward kernel by definition, the forward-only rows are controls.
+
+The forward-identical check for those arms has three parts. The forward dispatch in `fwd_impl` must launch the
+default. `o` and `lse` of all six forward phase rows must be byte-equal between arms, or the result is invalid. A
+backward arm can be compared only with CFG 1, its aliases, or an arm reaching the same tier, and not on top of
+`REP_TK_BWDC_SPLITS`. This does not prove the compiled forward is the same code, or equally fast: a change that
+keeps the bytes passes, so also read the forward control ratios. The byte check is meaningful only if the A/A run
+reports `forward_outputs_byte_identical` true. A backward-arm result is also invalid if `kernel.tk.bwd.A`,
+`kernel.tk.bwd.C`, or the `A|B|C` fine or routed `b_direct` or `f_plus_b` rows are missing.
 
 `b_direct` cannot reuse one graph: backward releases the representative tables, so `retain_graph=True`
 would not make a second backward valid. Its synchronizes add idle gaps the `f_plus_b` loop does not have,
@@ -471,7 +488,7 @@ prints the stage, shape, configuration, kernel name and per-name invocation numb
 |---|---|---|
 | `tk_fwd_abc` | `fwd_ker` | all tiers |
 | `tk_fwd_b`, `tk_fwd_c` | `fwd_ker` | partial: one tier |
-| `tk_bwd_b`, `tk_bwd_c` | `bwd_b_ker`, `bwd_c_ker` | partial: one tier |
+| `tk_bwd_a`, `tk_bwd_b`, `tk_bwd_c` | `bwd_attend_ker`, `bwd_b_ker`, `bwd_c_ker` | partial: one tier |
 
 ```bash
 REP_TK_FWD_CFG=1 <gpu-runner> python one_launch.py tk_fwd_abc
@@ -496,29 +513,39 @@ Round 4: CFG 10 won against the then-default. `kernel.tk.fwd.B` 0.2172 to 0.1668
 A/A displacement of 0.999-1.009. The TK suite passed under CFG 10, with 166 registers and no spills. Its gather
 is now the default. CFG 1 figures up to this round describe today's CFG 20.
 
-Next matrix, at the same shape and on one build containing CFG 11, 13 and 20, with the suites passing on it:
+Round 5, source `3da1d0c`: CPU 7, generic 287 and TK 349 checks passed, and the TK suite passed with CFG 10, 13 and
+20 selected. The promoted default reproduced round 4: CFG 20 was 30% slower on the B kernel, 12% on fine forward and
+2.3% on F+B, and at 32K full forward was 0.933. CFG 11, the K double buffer, gave no gain: full F+B 1.0003 and full
+forward 1.011, against an A/A floor of 1.004 and 1.000. It stays documented as a negative arm.
 
-| # | Purpose | Run |
-|---:|---|---|
-| 1 | noise floor | CFG 1 vs CFG 1 |
-| 2 | history, promotion reproduced | CFG 20 vs CFG 1 |
-| 3 | double-buffered K, one variable | CFG 1 vs CFG 11 |
-| 4 | tier-C backward split, one variable | CFG 1 vs CFG 13 |
-| 5 | stage split under the K change | `bench_stages.py` with CFG 1, then CFG 11, then `--compare` |
+In that run, A/A on forward rows was wider than on full-op rows: kernel `A|B|C` 1.0143 and fine `f` 1.0131, against
+1.004-1.007. In milliseconds that is about 0.011 on those forward rows and 0.016-0.029 on 4.08 ms full F+B, so the
+wider ratio reflects a shorter row, with no sign of larger absolute drift. These summary figures cannot separate
+ordering, thermal or allocator effects; the per-batch `ms` and `telemetry_*` fields in the result could.
+
+Backward stages: full-op `b_direct` is about 2.98 ms beside 4.08 ms F+B. They are separate measurements, and
+`b_direct` includes idle gaps from its synchronizes, so `b_estimate` is the one that subtracts from F+B.
+
+Next matrix, D=128/RM4/H16, on one build containing CFG 21, 22 and 23, with the suites passing on it. Each arm needs
+its own A/A floor at its shape:
+
+| # | Variable | Run | Shape |
+|---:|---|---|---|
+| 1 | none | CFG 1 vs CFG 1 | each length below |
+| 2 | tier-A backward occupancy | CFG 1 vs CFG 23 | 16K |
+| 3 | tier-C split forced to 4 | CFG 1 vs CFG 22 | 32K; 16K is an A/A run at 132 SMs |
+| 4 | tier-C wave policy | CFG 1 vs CFG 21 | 48K; 16K and 32K are A/A runs at 132 SMs |
 
 ```bash
-<gpu-runner> python bench_compare.py --candidate REP_TK_FWD_CFG=1 --out results/raw/aa.json
-<gpu-runner> python bench_compare.py --baseline REP_TK_FWD_CFG=20 --candidate REP_TK_FWD_CFG=1 --out results/raw/cfg20-cfg1.json
-<gpu-runner> python bench_compare.py --candidate REP_TK_FWD_CFG=11 --out results/raw/cfg1-cfg11.json
-<gpu-runner> python bench_compare.py --candidate REP_TK_FWD_CFG=13 --out results/raw/cfg1-cfg13.json
-REP_TK_FWD_CFG=1 <gpu-runner> python bench_stages.py --out results/raw/stages-cfg1.json
-REP_TK_FWD_CFG=11 <gpu-runner> python bench_stages.py --out results/raw/stages-cfg11.json
-python bench_stages.py --compare results/raw/stages-cfg1.json results/raw/stages-cfg11.json
+<gpu-runner> python bench_compare.py --candidate REP_TK_FWD_CFG=1 --out results/raw/aa-16k.json
+<gpu-runner> python bench_compare.py --candidate REP_TK_FWD_CFG=23 --out results/raw/cfg1-cfg23-16k.json
+<gpu-runner> python bench_compare.py --len 32768 --candidate REP_TK_FWD_CFG=22 --out results/raw/cfg1-cfg22-32k.json
+<gpu-runner> python bench_compare.py --len 49152 --candidate REP_TK_FWD_CFG=21 --out results/raw/cfg1-cfg21-48k.json
 ```
 
-In row 3, `kernel.tk.fwd.B` and `A|B|C` show the K change alone and inside the full stream. In row 4, read
-`kernel.tk.bwd.C` and F+B. The result that matters is measured `A|B|C` kernel, fine-op and full-op F+B against the
-A/A displacement. Partial rows and profiler output locate cost, and adding them does not produce a measured total.
+Read `kernel.tk.bwd.C` for CFG 21/22, `kernel.tk.bwd.A` for CFG 23, and `fine_op` and `full_op` `b_direct` and F+B for
+all three. Check `multi_processor_count`: the split table assumes 132 SMs. The result that matters is measured
+fine-op and full-op F+B against the A/A displacement. Adding isolated stage times does not produce a measured total.
 
 ### Full-operator forward stages
 
@@ -543,7 +570,7 @@ the operator's own autograd wrapper cannot be timed on its own.
 
 Every row keeps its meaning under every all-tier configuration. `reads_fwd_cfg` marks the rows that can change with
 `REP_TK_FWD_CFG` (`total`, `fine`, `fine.kernel`); the others should match another configuration within the floor.
-Under CFG 13 each row carries a `config_note`, because the forward repeats CFG 1's. `--compare` prints per-row
+Under CFG 13, 21, 22 and 23 each row carries a `config_note`, because the forward repeats CFG 1's. `--compare` prints per-row
 ratios and refuses runs that differ in build, inputs, shape, timing or hardware. The round 4 stage figures came from
 an earlier build with the old default, so they cannot serve as the CFG 1 side.
 

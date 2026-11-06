@@ -8,8 +8,8 @@ whose extension, sources, inputs, selection, shape or timing settings differ.
 Profiles (see docs/vsa2_representative_handoff.md, section 7):
 
   representative      all-tier fwd_ker, diag=0, warmup 10, iters 30. Baseline CFG1, candidate required; FWD_CFGS
-                      says what each value runs. CFG13 changes only the backward: compared with CFG1 or its
-                      alias CFG10, differing forward outputs make the result invalid. Kernel,
+                      says what each value runs. CFG21/22/23 change only the backward: compared with CFG1 or
+                      its aliases CFG10/13, differing forward outputs make the result invalid. Kernel,
                       fine-op and full-operator scope. Output cross-checked against the generic backend.
   controlled-softmax  CFG 4/5/7, warmup 10, iters 50, kernel forward only. TIMING ONLY: these kernels run
                       tier A whatever `phases` says, write no lse and do not mask padded output.
@@ -56,15 +56,19 @@ HERE = Path(__file__).resolve().parent
 TUNABLES = ("REP_TK_FWD_CFG", "REP_TK_BWDC_SPLITS")
 # What each REP_TK_FWD_CFG value runs. Only "operator" values compute the 64/4/1 operator.
 FWD_CFGS = {
-    "0": ("operator", "fwd_ker: TK-vector softmax, MINB 4"),
-    "1": ("operator", "fwd_ker: TK-vector softmax, MINB 3, tier-B gather by cp.async (the kernel's default)"),
-    "6": ("operator", "fwd_ker: hand-written softmax, MINB 3"),
-    "8": ("operator", "fwd_ker: TK-vector softmax, MINB 2"),
-    "9": ("operator", "fwd_ker: hand-written softmax, MINB 2"),
+    "0": ("operator", "fwd_ker: TK-vector softmax, MINB 4, bulk tier-B gather"),
+    "1": ("operator", "fwd_ker: TK-vector softmax, MINB 3, cp.async tier-B gather; tier-C backward split by "
+                      "num_splits_heuristic (the kernel's default)"),
+    "6": ("operator", "fwd_ker: hand-written softmax, MINB 3, bulk tier-B gather; a softmax pair with CFG20"),
+    "8": ("operator", "fwd_ker: TK-vector softmax, MINB 2, bulk tier-B gather"),
+    "9": ("operator", "fwd_ker: hand-written softmax, MINB 2, bulk tier-B gather"),
     "10": ("operator", "alias of CFG1, kept so old logs stay reproducible"),
-    "11": ("operator", "CFG1 plus a double-buffered K tile; V unchanged"),
-    "13": ("operator", "CFG1 forward; tier-C backward split by num_splits_heuristic"),
-    "20": ("operator", "the pre-round-4 kernel: per-slot cp.async.bulk tier-B gather"),
+    "11": ("operator", "negative arm, not a candidate: fwd_kdb_ker, CFG1 plus a double-buffered K tile; V unchanged"),
+    "13": ("operator", "alias of CFG1 since the num_splits_heuristic split became the default"),
+    "20": ("operator", "the pre-round-4 forward: per-slot cp.async.bulk tier-B gather; CFG1's backward"),
+    "21": ("operator", "CFG1 forward; tier-C backward split by the old wave policy"),
+    "22": ("operator", "CFG1 forward; tier-C backward split forced to 4"),
+    "23": ("operator", "CFG1 forward; tier-A backward __launch_bounds__(128, 3) occupancy probe"),
     "2": ("tier_a_path", "tier-A-only specialisation at MINB 4; other phases run the default kernel"),
     "3": ("tier_a_path", "tier-A-only specialisation at MINB 3; other phases run the default kernel"),
     "4": ("timing_only", "copied native loop, native softmax"),
@@ -76,7 +80,11 @@ PROFILES = {
     "controlled-softmax": dict(warmup=10, iters=50, kind="timing_only", baseline="REP_TK_FWD_CFG=4",
                                candidate="REP_TK_FWD_CFG=5"),
 }
-FORWARD_EQUAL = {"1", "10", "13"}  # one forward kernel by definition; see forward_must_match
+BACKWARD_ARMS = {"21": "C", "22": "C", "23": "A"}  # the only backward tier each one's setting reaches
+ALIASES = ("1", "10", "13")  # no dispatch line of their own needed
+FORWARD_EQUAL = {*ALIASES, *BACKWARD_ARMS}  # one forward kernel by definition; see forward_must_match
+BACKWARD_READ_ROWS = ("kernel.tk.bwd.A", "kernel.tk.bwd.C", "fine_op.tk.A|B|C.b_direct", "full_op.tk.routed.b_direct",
+                      "fine_op.tk.A|B|C.f_plus_b", "full_op.tk.routed.f_plus_b")
 HISTORICAL_LIMIT = "historical H200 measurements are from other hardware and must not be compared with this run"
 CONTROLLED_LIMITS = [
     "timing only: CFG4/5/7 are not a numerical reference and the output check is not run",
@@ -100,6 +108,7 @@ def fwd_dispatch(source):
         return {}
     kernel = r"launch\((rep_tk::\w+<[^;]*?>)\)"
     table = dict(re.findall(rf"cfg == (\d+)[^\n]*?\)\s*{kernel}", body.group(0)))
+    table.update(re.findall(r"cfg == (\d+)\)\s*\{[^}]*?(rep_tk::\w+<[^;,]*?>)", body.group(0)))  # a braced branch
     default = re.search(rf"else {kernel};", body.group(0))
     return dict(table, default=default.group(1)) if default else {}
 
@@ -114,9 +123,9 @@ def cfg_error(value, source):
         return f"REP_TK_FWD_CFG={value} is not in the config table"
     if not re.search(r"\bcfg == 20\b", source):
         return "this kernel source has no CFG20 history arm; the config table does not describe it"
-    if value not in ("1", "10") and not re.search(rf"\w*cfg\w* == {value}\b", source):
+    if value not in ALIASES and not re.search(rf"\w*cfg\w* == {value}\b", source):
         return f"REP_TK_FWD_CFG={value} is not implemented by this kernel source"
-    if value in ("10", "13", "20"):
+    if value in ("10", "13", "20", *BACKWARD_ARMS):
         table = fwd_dispatch(source)
         if not table:
             return f"cannot read the forward dispatch to check REP_TK_FWD_CFG={value}"
@@ -133,13 +142,22 @@ def forward_must_match(configs):
 
 
 def arms_error(configs):
-    """One variable per comparison, for the arm whose meaning depends on its partner."""
+    """One variable per comparison, for the arms whose meaning depends on their partner."""
     arms = {c.get("REP_TK_FWD_CFG") for c in configs.values()}
-    if "13" in arms and not arms <= FORWARD_EQUAL:
-        return f"CFG13 changes only the backward; compare it with CFG1 or CFG10, not {sorted(arms)}"
-    if any(c.get("REP_TK_FWD_CFG") == "13" and "REP_TK_BWDC_SPLITS" in c for c in configs.values()):
-        return "CFG13 chooses the tier-C split; REP_TK_BWDC_SPLITS would override what it measures"
+    backward = arms & BACKWARD_ARMS.keys()
+    if backward and not arms <= FORWARD_EQUAL:
+        return f"CFG{min(backward)} changes only the backward; compare it with CFG1, not {sorted(arms)}"
+    if len({BACKWARD_ARMS[a] for a in backward}) > 1:
+        return f"{sorted(backward)} change different backward tiers; compare each with CFG1"
+    if any(c.get("REP_TK_FWD_CFG") in FORWARD_EQUAL - {"1", "10"} and "REP_TK_BWDC_SPLITS" in c for c in configs.values()):
+        return "REP_TK_BWDC_SPLITS would override or add to what a backward arm measures"
     return None
+
+
+def backward_row_is_control(tier, env):
+    """Backward kernels read neither forward setting; a backward arm or a forced split reaches only its tier."""
+    reached = BACKWARD_ARMS.get(env.get("REP_TK_FWD_CFG"))
+    return tier != reached and not (tier == "C" and "REP_TK_BWDC_SPLITS" in env)
 
 
 def active_fwd_cfg(env=os.environ, source=None):
@@ -164,8 +182,8 @@ def parse_config(text, profile):
     if cfg.get("REP_TK_FWD_CFG") not in allowed:
         raise ValueError(f"profile {profile} needs REP_TK_FWD_CFG in {allowed}, got {cfg.get('REP_TK_FWD_CFG')!r}")
     splits = cfg.get("REP_TK_BWDC_SPLITS")
-    if splits is not None and not (splits.isdigit() and int(splits) > 0):
-        raise ValueError(f"REP_TK_BWDC_SPLITS must be positive, got {splits!r}")
+    if splits is not None and splits != "wave" and not (splits.isdigit() and int(splits) > 0):
+        raise ValueError(f"REP_TK_BWDC_SPLITS must be positive or wave, got {splits!r}")
     return cfg
 
 
@@ -243,6 +261,9 @@ def assemble(args_dict, profile, configs, order, children):
     identical = None if None in digests else len({json.dumps(d, sort_keys=True) for d in digests}) == 1
     if forward_must_match(configs) and identical is not True:
         bad = bad + ["forward outputs of arms defined to share one forward kernel"]
+    if {c.get("REP_TK_FWD_CFG") for c in configs.values()} & BACKWARD_ARMS.keys():
+        ids = {row["id"] for c in children for row in c["rows"]}
+        bad = bad + [f"missing row {r}" for r in BACKWARD_READ_ROWS if r not in ids]
     if bad:
         claim["may_claim_op_level_change"] = False
     return dict(schema=SCHEMA, profile=profile, created_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -472,8 +493,7 @@ def child_main(spec):
             ("C", "tier_subset", lambda: C.rep_tk_bwd_c(q, tab[3], tab[4], tab[5], dout, lse_t, d_t, sel.bits_ab, qg, kgt,
                                                         vgt)),
         ):
-            # Of the forward settings, only CFG13 reaches a backward kernel: tier C, as REP_TK_BWDC_SPLITS does.
-            control = name != "C" or not ("REP_TK_BWDC_SPLITS" in os.environ or os.environ.get("REP_TK_FWD_CFG") == "13")
+            control = backward_row_is_control(name, os.environ)
             add(f"kernel.tk.bwd.{name}", "kernel", "bwd_stage", "tk", work, control, loop(fn, W, I, N),
                 note="one stage; do not add stages and call the sum a complete call")
         del o_t, lse_t, d_t, o_n, lse_n, d_n, qg, kg, vg, dkm, dvm, kgt, vgt
