@@ -1,0 +1,198 @@
+--- a/csrc/rep_tk/rep_tk.cu
++++ b/csrc/rep_tk/rep_tk.cu
+@@ -279,13 +279,15 @@
+ struct fwd_globals {
+   using tile = st_bf<kB, D>;
+   using tgl = gl<bf16, -1, -1, -1, -1, tile>;
++  using l_col_vec = col_vec<st_fl<kB, D>>;
++  using l_gl = gl<float, -1, -1, -1, -1, l_col_vec>;
+   tgl q, k, v, o, kt, vt;
+   const bf16* k_sw;
+   const bf16* v_sw;
+   const float* lc_mid;
+   const float* lc_tail;
+   const float* lcb;  // [n_B * RM] flattened tier-B log2 counts per absolute entry (lcb_kernel)
+-  float* lse;
++  l_gl lse;
+   const int* a_ptr;
+   const int* a_idx;
+   const int* b_ptr;
+@@ -363,7 +365,7 @@
+   if (cur.x == kTierNone) {
+     bf16* o = g.o.raw_ptr + ((size_t)bh * g.L + (size_t)qb * kB) * D;
+     for (int i = threadIdx.x; i < kB * D / 8; i += blockDim.x) reinterpret_cast<uint4*>(o)[i] = make_uint4(0, 0, 0, 0);
+-    if (threadIdx.x < kB) g.lse[(size_t)bh * g.L + (size_t)qb * kB + threadIdx.x] = ninf();
++    if (threadIdx.x < kB) g.lse.raw_ptr[(size_t)bh * g.L + (size_t)qb * kB + threadIdx.x] = ninf();
+     return;
+   }
+ 
+@@ -372,6 +374,7 @@
+   tile_t(&q_smem) = al.allocate<tile_t>();
+   tile_t(&k_smem) = al.allocate<tile_t>();
+   tile_t(&v_smem) = al.allocate<tile_t>();
++  typename fwd_globals<D>::l_col_vec(&l_smem) = al.allocate<typename fwd_globals<D>::l_col_vec>();
+   __shared__ semaphore q_bar, k_bar, v_bar;
+   if (threadIdx.x == 0) {
+     init_semaphore(q_bar, 0, 1);
+@@ -395,8 +398,15 @@
+   rt_fl<16, 64> att;
+   rt_bf<16, 64> att_mma;
+   rt_fl<16, D> o_reg;
++  // Running statistics in TK col_vecs, so the reductions and rescalings are its row_max / row_sum /
++  // sub_row / mul_row rather than hand-rolled shuffles. Unlike VSA2's kernel, max_vec is kept already
++  // in log2 units: a representative's + log2(c) bias is per column and cannot be factored out of the
++  // max, so the bias has to be added before the row max is taken.
++  col_vec<rt_fl<16, 64>> max_vec, norm_vec, max_last, alpha;
+   zero(o_reg);
+-  float m_r[2] = {ninf(), ninf()}, l_r[2] = {0.f, 0.f};
++  neg_infty(max_vec);
++  neg_infty(max_last);
++  zero(norm_vec);
+   wait(q_bar, 0);
+ 
+   // One pipeline step: S = Q K^T for `cur`, online softmax, O += P V, with the loads of `nxt` issued as
+@@ -412,56 +422,31 @@
+     if (nxt.x != kTierNone && warp == 0)
+       issue_tile<D>(nxt, k_smem, g.k, g.kt, ksw, nsl, b, h, g.NB, g.RM, k_bar, g.diag & 2, g.diag & 4);
+ 
+-    // online softmax in the log2 domain; rows gq (data 0, 2) and gq + 8 (data 1, 3)
+-    float mx[2] = {ninf(), ninf()};
++    mul(att, att, SL2);  // raw q.k -> log2 units
++    if constexpr (BC) {
++      if (masked) {  // + log2(c) per column, -inf where the column is absent
+ #pragma unroll
+-    for (int i = 0; i < 4; ++i)
++        for (int i = 0; i < 4; ++i)
+ #pragma unroll
+-      for (int j = 0; j < 4; ++j) {
+-        float2& e = att.tiles[0][i].data[j];
+-        float b0 = 0.f, b1 = 0.f;
+-        if constexpr (BC) {
+-          if (masked) {
+-            b0 = cb.v[i][(j >> 1) * 2];
+-            b1 = cb.v[i][(j >> 1) * 2 + 1];
++          for (int j = 0; j < 4; ++j) {
++            float2& e = att.tiles[0][i].data[j];
++            e.x += cb.v[i][(j >> 1) * 2];
++            e.y += cb.v[i][(j >> 1) * 2 + 1];
+           }
+-        } else if (kcA < kB) {  // partial tier-A block
+-          const int c = 16 * i + 2 * (lane & 3) + 8 * (j >> 1);
+-          b0 = c < kcA ? 0.f : ninf();
+-          b1 = c + 1 < kcA ? 0.f : ninf();
+-        }
+-        e.x = e.x * SL2 + b0;
+-        e.y = e.y * SL2 + b1;
+-        mx[j & 1] = fmaxf(mx[j & 1], fmaxf(e.x, e.y));
+-      }
+-    float mu[2], alpha[2];
+-#pragma unroll
+-    for (int r = 0; r < 2; ++r) {
+-      float v2 = fmaxf(mx[r], __shfl_xor_sync(0xffffffffu, mx[r], 1));
+-      v2 = fmaxf(v2, __shfl_xor_sync(0xffffffffu, v2, 2));
+-      const float mn = fmaxf(m_r[r], v2);
+-      mu[r] = mn == ninf() ? 0.f : mn;
+-      alpha[r] = exp2f(m_r[r] - mu[r]);
+-      m_r[r] = mn;
+-      l_r[r] *= alpha[r];
+-    }
+-#pragma unroll
+-    for (int i = 0; i < 4; ++i)
+-#pragma unroll
+-      for (int j = 0; j < 4; ++j) {
+-        float2& e = att.tiles[0][i].data[j];
+-        e.x = exp2f(e.x - mu[j & 1]);
+-        e.y = exp2f(e.y - mu[j & 1]);
+-        l_r[j & 1] += e.x + e.y;
+-      }
+-#pragma unroll
+-    for (int n = 0; n < ND; ++n)
+-#pragma unroll
+-      for (int j = 0; j < 4; ++j) {
+-        o_reg.tiles[0][n].data[j].x *= alpha[j & 1];
+-        o_reg.tiles[0][n].data[j].y *= alpha[j & 1];
+       }
++    } else if (kcA < kB) {  // partial tier-A block: VSA2's own column mask
++      right_fill(att, att, kcA, base_types::constants<float>::neg_infty());
++    }
++    row_max(max_vec, att, max_vec);
++    sub_row(att, att, max_vec);
++    exp2(att, att);
++    sub(alpha, max_last, max_vec);
++    exp2(alpha, alpha);
++    mul(norm_vec, norm_vec, alpha);
++    row_sum(norm_vec, att, norm_vec);
+     copy(att_mma, att);
++    mul_row(o_reg, o_reg, alpha);
++    copy(max_last, max_vec);
+ 
+     wait(v_bar, it & 1);
+     warpgroup::mma_AB(o_reg, att_mma, v_smem);
+@@ -494,35 +479,34 @@
+   }
+ 
+ epilogue:
+-  // epilogue: o = o / l (padded query rows -> 0), natural lse = (m + log2 l) * ln 2 (finite on padded
+-  // rows, which the TK backward relies on, like the native kernel)
+-  float inv[2], lse[2];
++  // o = o / l, natural lse = max * ln2 + ln(l). Padded query rows get o = 0 (as the generic backend
++  // does) but a finite lse, which the TK backward relies on, like VSA2's own kernel.
++  div_row(o_reg, o_reg, norm_vec);
++  {
++    const int r0 = 16 * warp + gq;
+ #pragma unroll
+-  for (int r = 0; r < 2; ++r) {
+-    float l = l_r[r] + __shfl_xor_sync(0xffffffffu, l_r[r], 1);
+-    l += __shfl_xor_sync(0xffffffffu, l, 2);
+-    const int row = 16 * warp + gq + 8 * r;
+-    inv[r] = (row < qcnt && l > 0.f) ? 1.f / l : 0.f;
+-    lse[r] = l > 0.f ? (m_r[r] + __log2f(l)) * kLn2 : ninf();
+-  }
++    for (int n = 0; n < ND; ++n)
+ #pragma unroll
+-  for (int n = 0; n < ND; ++n)
+-#pragma unroll
+-    for (int j = 0; j < 4; ++j) {
+-      o_reg.tiles[0][n].data[j].x *= inv[j & 1];
+-      o_reg.tiles[0][n].data[j].y *= inv[j & 1];
+-    }
+-  if ((lane & 3) == 0) {
+-    float* gl_ = g.lse + (size_t)bh * g.L + (size_t)qb * kB + 16 * warp + gq;
+-    gl_[0] = lse[0];
+-    gl_[8] = lse[1];
++      for (int j = 0; j < 4; ++j) {
++        if (r0 + 8 * (j & 1) >= qcnt) {
++          o_reg.tiles[0][n].data[j].x = 0.f;
++          o_reg.tiles[0][n].data[j].y = 0.f;
++        }
++      }
+   }
++  mul(max_vec, max_vec, kLn2);
++  log(norm_vec, norm_vec);
++  add(norm_vec, norm_vec, max_vec);
++
+   __syncthreads();  // every warp is done with q_smem
+   warpgroup::store(q_smem, o_reg);
++  warpgroup::store(l_smem, norm_vec);
+   __syncthreads();
+   if (warp == 0) {  // TK's store/wait helpers are warp-collective (lane-0 guard + __syncwarp inside)
+     coord<tile_t> c = {b, h, qb, 0};
+     tma::store_async(g.o, q_smem, c);
++    coord<typename fwd_globals<D>::l_col_vec> lc = {b, h, 0, qb};
++    tma::store_async(g.lse, l_smem, lc);
+     tma::store_async_wait();
+   }
+ #endif
+@@ -1147,10 +1131,10 @@
+   typename G::tgl gkt{bfp(tab[3]), B, H, (unsigned)NBt, (unsigned)D};
+   typename G::tgl gvt{bfp(tab[4]), B, H, (unsigned)NBt, (unsigned)D};
+   G g{gq, gk, gv, go, gkt, gvt, bfp(tab[0]), bfp(tab[1]), tab[2].data_ptr<float>(), tab[5].data_ptr<float>(),
+-      tab[6].data_ptr<float>(), lse.data_ptr<float>(), a_ptr.data_ptr<int>(), a_idx.data_ptr<int>(), b_ptr.data_ptr<int>(),
++      tab[6].data_ptr<float>(), typename G::l_gl{lse.data_ptr<float>(), B, H, 1U, L}, a_ptr.data_ptr<int>(), a_idx.data_ptr<int>(), b_ptr.data_ptr<int>(),
+       b_idx.data_ptr<int>(), reinterpret_cast<const uint32_t*>(bits_ab.data_ptr<int>()), blk_cnt.data_ptr<int>(),
+       (int)H, (int)L, NB, NBt, RM, words_of(NB), phases, diag};
+-  constexpr int mem = 3 * 64 * D * 2 + 1024;  // q, k, v tiles + alignment slack
++  constexpr int mem = 3 * 64 * D * 2 + 2048;  // q, k, v tiles, the lse vector + alignment slack
+   static int cfg = -1;  // 0: MINB 4, else MINB 3 (default, measured best); 2-5 diagnostics
+   if (cfg < 0) {
+     const char* e = std::getenv("REP_TK_FWD_CFG");

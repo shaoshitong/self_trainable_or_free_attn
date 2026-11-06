@@ -1,0 +1,34 @@
+Source: tclaude_continue.jsonl and tclaude_tk_tma.jsonl command results; remote read-only
+environment checks made during release packaging.
+
+Validated host:
+- SSH alias: aster-debug-1105-worker-0
+- GPU allocation: use GPU 0 only; this host is reserved for this work
+- Other known host: aster-sparse-attn-fwd-1105-06713-worker-0; owned by another chat, never use it
+- Device: NVIDIA H200, compute capability 9.0
+- Python: /opt/venv/bin/python (Python 3.12 in compiler paths)
+- PyTorch: 2.13.0+cu130
+- CUDA runtime: 13.0
+- nvcc: release 13.0, V13.0.48
+- CUDA home: /usr/local/cuda
+- Remote package root: /efs/astershao/vsa2_rep_work/pkg
+- Remote VSA2 source tree: /efs/astershao/vsa2_rep_work/vsa2_src (source copied from commit 25e2b37)
+- Remote ThunderKittens tree: /efs/astershao/vsa2_rep_work/ThunderKittens
+
+Versions:
+- VSA2 / self_trainable_or_free_attn reference commit: 25e2b37e4b9a415c6135011b67ba01d336c82f92
+- ThunderKittens actual local HEAD: 6c27e28c8115d1839d9eeeb530913c184a75fc87
+- Experiment setup pins the same TK SHA in its ThunderKittens documentation.
+
+Recorded successful checks:
+- all CPU reference tests passed
+- all GPU tests passed (generic backend)
+- all TK GPU tests passed
+- covered D=64 and D=128, mid_reps 2/4/8, partial blocks, forward/LSE, backward dQ/dK/dV,
+  routed autograd, and TK-vs-generic comparison
+
+Important final-round boundary:
+- The last local rep_tk.cu softmax edit occurred after an automatic model downgrade.
+- That edit had no rsync, build, or test command after it.
+- The active release source is the separate remote snapshot with SHA-256
+  6224637ff9a96404e170aa7de568a070c449ae83707564c37cbfae3cffdc784e.

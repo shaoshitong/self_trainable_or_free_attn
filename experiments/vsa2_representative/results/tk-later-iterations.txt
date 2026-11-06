@@ -1,0 +1,50 @@
+Source: local work/vsa2_representative/tclaude_tk_tma.jsonl
+Scope: 16K/H16/D128/B1 bf16 tuning helpers; warmup and iteration counts differ by helper
+
+These snippets come from different builds and must not be added together or presented as one
+same-version op-scope measurement.
+
+1) Forward configuration sweep:
+
+cfg=4  native 0.486  A-only 0.471 (0.967x)  A|B|C 0.533 (1.095x)
+cfg=5  native 0.491  A-only 0.579 (1.179x)  A|B|C 0.612 (1.247x)
+cfg=3  native 0.488  A-only 0.592 (1.213x)  A|B|C 0.906 (1.857x)
+cfg=1  native 0.488  A-only 0.554 (1.137x)  A|B|C 0.879 (1.803x)
+
+cfg=4 is a diagnostic verbatim copy of the native TK loop. cfg=5 substitutes this experiment's
+hand-written softmax and changes nothing else. cfg=1 is the tuned experiment path. This isolates
+the softmax cause; the A|B|C numbers on diagnostic cfg=4/5 are not valid workload results.
+
+2) Tier-B bias/load attribution before flattened log-counts:
+
+cfg=0  native 0.486  A-only 0.518 (1.066x)  A|B|C 0.877 (1.804x)
+  B only 0.286 ms
+  diag=1 B: no bias loads                   B only 0.208 ms  (+0.078 ms for bias)
+  diag=2 B: one tensor-TMA tile, no bulk    B only 0.182 ms  (+0.104 ms for bulk path)
+  diag=3 B: neither                         B only 0.098 ms  (+0.188 ms combined)
+
+3) Tier-C backward query split:
+
+splits=   1  bwd_c 0.792 ms
+splits=   2  bwd_c 0.396 ms
+splits=   4  bwd_c 0.247 ms
+splits=   8  bwd_c 0.254 ms
+splits=  16  bwd_c 0.267 ms
+splits=auto  bwd_c 0.313 ms
+
+4) After flattened per-entry tier-B log-counts:
+
+B only 0.216 ms
+diag=1 B: no bias loads                   B only 0.211 ms  (+0.005 ms for bias)
+diag=2 B: one tensor-TMA tile, no bulk    B only 0.117 ms  (+0.099 ms for bulk path)
+diag=3 B: neither                         B only 0.117 ms  (+0.100 ms combined)
+splits=auto  bwd_c 0.247 ms
+
+5) Later forward ranges, still different runs:
+
+- tuned A-only kernel: approximately 0.509-0.521 ms in the spill-reduction iterations;
+- tuned A|B|C kernel: approximately 0.879-0.892 ms in several later iterations;
+- native TK A-only reference in those runs: approximately 0.485-0.489 ms.
+
+There is no final post-C-split/post-B-flatten same-build complete op-scope table. Do not sum
+fractional kernel improvements to claim an op-level result.

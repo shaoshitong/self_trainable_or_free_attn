@@ -1,0 +1,46 @@
+Source: local work/vsa2_representative/tclaude_tk_tma.jsonl (first fair TK/TMA round)
+Device/input: NVIDIA H200, B=1 H=16 L=16384 D=128 NB=256 RM=4, bf16,
+              tiers full=10%, mid=20%, tail=70%
+Timing: CUDA events around a loop, warmup=10, iters=30, one final synchronize
+
+Extracted output:
+
+--- forward, kernel scope (tables prebuilt)                 ms     vs native TK
+  native TK attn_fwd (tier A only)                        0.487    1.000x
+  native generic attn_fwd (tier A only)                   0.996    2.044x
+  generic rep_attn_fwd A                                  0.940    1.929x
+  TK      rep_tk_fwd   A                                  0.718    1.474x
+  generic rep_attn_fwd A|B                                1.132    2.322x
+  TK      rep_tk_fwd   A|B                                0.957    1.964x
+  generic rep_attn_fwd A|B|C                              1.292    2.651x
+  TK      rep_tk_fwd   A|B|C                              1.074    2.204x
+  generic rep_attn_fwd B|C                                0.397    0.814x
+  TK      rep_tk_fwd   B|C                                0.394    0.809x
+  generic rep_build                                       0.048    0.099x
+  TK      rep_tk_build                                    0.051    0.105x
+
+--- backward, kernel scope                                    ms
+  native TK bwd (tier A only; = TK tier A)                1.552
+  TK tier B  (query-owner, bulk reduce)                   0.591
+  TK tier C  (KV-owner over block means)                  0.782
+  generic tier A KV-owner + atomic dQ                     3.526
+  generic B|C query-owner                                 1.746
+  => TK three tiers (A native + B + C)                    2.925   1.885x native TK
+  => generic three tiers (variant 1)                      5.272   3.398x native TK
+     TK / generic                                         0.555x
+
+--- op scope (rep_fine_attention autograd op, frozen selection)   fwd ms    bwd ms
+  generic  A only                                              0.988     4.335
+  generic  A|B|C                                               1.341     5.505
+  tk       A only                                              0.768     2.040
+  tk       A|B|C                                               1.124     3.392
+  native TK fine (tier A only, VSA2 kernels + zero-init/delta/finalize)    0.487     1.971
+
+  three tiers, TK vs generic:   forward 0.838x   backward 0.616x   fwd+bwd 0.660x
+  three tiers TK vs native TK (tier A only): forward 2.309x   backward 1.721x   fwd+bwd 1.838x
+
+Interpretation boundary:
+- Native TK rows compute only tier A's 10% of pairs.
+- New TK A|B|C rows cover the whole sequence through 64/4/1 representatives.
+- The 10% native baseline and the all-tier kernel are not equal work; ratios are labels,
+  not an efficiency claim about identical computation.

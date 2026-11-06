@@ -1,0 +1,9 @@
+Source: local work/vsa2_representative/tclaude_continue.jsonl
+
+==ERROR== ERR_NVGPUCTRPERM - The user does not have permission to access NVIDIA GPU
+Performance Counters on the target device 0. For instructions on enabling permissions and to get
+more information see https://developer.nvidia.com/ERR_NVGPUCTRPERM
+
+No driver/module/security change was made. Do not claim measured MFU, occupancy, stall reasons, or
+DRAM throughput from this work. The available evidence is CUDA-event timing plus controlled
+ablations, not hardware performance counters.

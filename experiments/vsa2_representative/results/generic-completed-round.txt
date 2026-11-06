@@ -1,0 +1,30 @@
+Source: local work/vsa2_representative/tclaude_continue.jsonl (generic completed round)
+Scope: rep_fine_attention autograd op, frozen selection
+Device/input: NVIDIA H200, B=1 H=16 L=16384 D=128, bf16
+Timing: CUDA events around a loop; warmup=5, iters=20 in bench.py
+
+Extracted output:
+
+build ok
+ok  phase mask selects tiers (A alone == attention over the tier-A columns)
+
+all CPU reference tests passed
+===== GPU tests
+60
+all GPU tests passed
+===== bench 16k/16
+columns per (b,h):  A 419,456 (81.0%)  B 52,428 (10.1%)  C 45,875 (8.9%)   total 1.234x tier A
+KV blocks reachable per query block: tier A 25.6, all tiers 256 (the whole sequence)
+
+                                           forward     bwd v1     bwd v2   fwd x   bwd x
+this impl, A only (VSA2's KV budget)      0.995 ms   4.332 ms   4.330 ms   1.00x   1.00x
+A + B                                     1.185 ms   4.832 ms   5.140 ms   1.19x   1.12x
+A + B + C (full sequence)                 1.343 ms   5.508 ms   5.815 ms   1.35x   1.27x
+
+NATIVE VSA2 reference, same tier-A lists (kernel only, no autograd wrapper):
+  attn_fwd (forward)                      0.994 ms   -> three-tier forward (incl. rep_build) is 1.35x this
+  of which rep_build                      0.048 ms
+
+Note: bench.py's helper default is warmup=5. The directly quoted known fair run in the
+handoff uses the same 16K/H16/D128/B1 bf16 scope and reports generic ABC fwd 1.341 ms,
+bwd 5.505 ms. These are generic-backend results only.

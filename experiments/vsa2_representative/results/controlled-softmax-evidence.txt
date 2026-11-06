@@ -1,0 +1,26 @@
+Source: local work/vsa2_representative/tclaude_tk_tma.jsonl
+Scope: one-build controlled diagnostic at 16K/H16/D128/B1 bf16, tier-A kernel path
+
+Diagnostic design: copy VSA2's native TK forward loop verbatim, then switch only the softmax
+implementation. The timing helper uses warmup=10 and iters=50 for this diagnostic.
+
+cfg=4  native 0.486  A-only 0.471 (0.967x)
+cfg=5  native 0.491  A-only 0.579 (1.179x)
+
+Mapping:
+- cfg=4: copied native loop + native TK softmax: 0.471 ms.
+- cfg=5: same copied loop + this experiment's hand-written softmax: 0.579 ms.
+- Independent native TK kernel in the same run: approximately 0.486 ms.
+
+Conclusion supported by this controlled pair: the hand-written softmax adds about 0.108 ms.
+It does not support a claim that TMA setup or the benchmark harness caused the gap.
+
+Follow-up not completed:
+- Replace the hand-written max/sum/rescale path with ThunderKittens row/column vector ops.
+- Rebuild and run the complete CPU/generic/TK suites.
+- Re-run a same-build A-only controlled pair and the complete op-scope benchmark.
+
+The local follow-up edit exists only as
+patches/softmax-vector-ops-UNVERIFIED.patch and
+unverified/rep_tk.softmax-vector-ops-UNVERIFIED.cu. It was not synchronized, compiled, or tested.
+It is not applied to the active source and must not be treated as a result.
