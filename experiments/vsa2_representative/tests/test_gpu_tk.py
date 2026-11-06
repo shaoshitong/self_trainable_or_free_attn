@@ -177,9 +177,6 @@ def test_zero_count_blocks():
             print(f"{'ok ' if ok else 'FAIL'} tk zero-count D={D} RM={rm} {name}: no NaN, padded rows 0")
             if not ok:
                 FAILED.append(f"tk zero-count NaN/padding D={D} RM={rm} {name}")
-            # a row whose visible columns all carry a -inf bias (q3 under B: only the empty block 2) is
-            # NaN in the reference's softmax; the kernels define it as o = 0, lse = -inf
-            ro = torch.where(torch.isfinite(rlse)[..., None], ro, torch.zeros_like(ro))
             m = valid[None, None, :, None].expand_as(o)
             check(f"tk zero-count o   D={D} RM={rm} {name}", o.float()[m],
                   ro.float().to(torch.bfloat16).float()[m], 3e-2)

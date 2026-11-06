@@ -49,6 +49,11 @@ constexpr float kLog2e = 1.44269504089f;
 constexpr float kLn2 = 0.69314718056f;
 
 __device__ __forceinline__ float ninf() { return __uint_as_float(0xff800000u); }
+__device__ __forceinline__ float pinf() { return __uint_as_float(0x7f800000u); }
+// Backward lse of an empty row (no valid column: lse = -inf, and every bias it meets is -inf as well) as
+// +inf, so that P = exp2(x + bias - lse) = 0 and dS = 0, as the generic backend's lse != -inf guard gives,
+// instead of -inf - -inf = NaN. Finite lse is unchanged.
+__device__ __forceinline__ float bwd_lse(float lse) { return lse == ninf() ? pinf() : lse; }
 
 // ---------------------------------------------------------------- raw TMA-engine helpers
 __device__ __forceinline__ void bulk_load(uint32_t dst_smem, const void* src, uint32_t bytes, semaphore& bar) {
@@ -611,14 +616,19 @@ struct bwdc_globals {
   int splits;  // query range of a tail tile split over this many CTAs (gridDim.z = B * splits)
 };
 
-__device__ static inline void stream_tile(auto& reg_tile, auto& smem_vec) {
+// VSA2's stream_tile for the lse vector, with bwd_lse applied: an empty query column's -lse/scale becomes
+// -inf, so S^T - lse/scale + bias stays -inf rather than +inf + -inf.
+__device__ static inline void stream_lse_tile(auto& reg_tile, auto& smem_vec) {
 #pragma unroll
   for (int i = 0; i < 4; i++) {
     const int base_col = 16 * i + 2 * (laneid() % 4);
-    reg_tile.tiles[0][i].data[0] = *(float2*)&smem_vec[base_col + 0];
-    reg_tile.tiles[0][i].data[1] = *(float2*)&smem_vec[base_col + 0];
-    reg_tile.tiles[0][i].data[2] = *(float2*)&smem_vec[base_col + 8];
-    reg_tile.tiles[0][i].data[3] = *(float2*)&smem_vec[base_col + 8];
+    float2 a = *(float2*)&smem_vec[base_col + 0], c = *(float2*)&smem_vec[base_col + 8];
+    a = make_float2(bwd_lse(a.x), bwd_lse(a.y));
+    c = make_float2(bwd_lse(c.x), bwd_lse(c.y));
+    reg_tile.tiles[0][i].data[0] = a;
+    reg_tile.tiles[0][i].data[1] = a;
+    reg_tile.tiles[0][i].data[2] = c;
+    reg_tile.tiles[0][i].data[3] = c;
   }
 }
 __device__ static inline void stream_sub_tile(auto& reg_tile, auto& smem_vec) {
@@ -729,7 +739,7 @@ __global__ __launch_bounds__(128, (D == 64) ? 3 : 2) void bwd_c_ker(const __grid
     warpgroup::mm_ABt(dp_t, v_smem, og_smem);  // dP^T = V dO^T
     warpgroup::mma_commit_group();
     wait(vec_b, it & 1);
-    stream_tile(s_t, l_smem);
+    stream_lse_tile(s_t, l_smem);
     mul(s_t, s_t, NEG_INV_SCALE);
     wait(q_b, it & 1);
     warpgroup::mma_ABt(s_t, k_smem, q_smem);  // S^T - lse/scale
@@ -890,9 +900,9 @@ __global__ __launch_bounds__(128, (D == 64) ? 3 : 2) void bwd_b_ker(const __grid
     issue_kv(sl0);
   }
 
-  // this thread's query rows (gq, gq + 8 of its warp): lse in log2 units, delta
+  // this thread's query rows (gq, gq + 8 of its warp): lse in log2 units (+inf for an empty row), delta
   const size_t row0 = (size_t)bh * g.L + (size_t)qb * kB + 16 * warp + gq;
-  const float lse2[2] = {g.lse[row0] * kLog2e, g.lse[row0 + 8] * kLog2e};
+  const float lse2[2] = {bwd_lse(g.lse[row0]) * kLog2e, bwd_lse(g.lse[row0 + 8]) * kLog2e};
   const float dl[2] = {g.delta[row0], g.delta[row0 + 8]};
 
   rt_fl<16, D> dq_reg;
