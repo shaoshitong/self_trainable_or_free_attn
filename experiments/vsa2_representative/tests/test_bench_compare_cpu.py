@@ -8,8 +8,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bench_stages import attribute
-from bench_compare import FWD_CFGS, PROFILES, abba, active_fwd_cfg, assemble, claims, implemented, parse_config, summarize
+from bench_stages import attribute, compare_stages
+from bench_compare import (FWD_CFGS, PROFILES, abba, active_fwd_cfg, arms_error, assemble, cfg_error, claims,
+                           fwd_dispatch, parse_config, summarize)
 
 
 def child(arm, scale, check=True):
@@ -35,35 +36,85 @@ def test_configs_keep_their_semantics():
         {"REP_TK_FWD_CFG": "1", "REP_TK_BWDC_SPLITS": "8"}
     for cfg in "23457":
         assert rejected(f"REP_TK_FWD_CFG={cfg}", "representative"), "a diagnostic passed as production"
-    for cfg in ("0", "1", "2", "6", "8", "9", "10"):
+    for cfg in ("0", "1", "2", "6", "8", "9", "10", "11", "13", "20"):
         assert rejected(f"REP_TK_FWD_CFG={cfg}", "controlled-softmax"), "only CFG 4/5/7 are this diagnostic"
     for cfg in "457":
         assert parse_config(f"REP_TK_FWD_CFG={cfg}", "controlled-softmax")
-    for cfg in ("8", "9", "10"):
+    for cfg in ("8", "9", "10", "11", "13", "20"):
         assert parse_config(f"REP_TK_FWD_CFG={cfg}", "representative")
-    assert rejected("REP_TK_FWD_CFG=11", "representative"), "the kernel would silently run its default path"
-    assert PROFILES["representative"]["baseline"].endswith("=6") and PROFILES["representative"]["candidate"].endswith("=1")
+    assert rejected("REP_TK_FWD_CFG=21", "representative"), "the kernel would silently run its default path"
+    assert PROFILES["representative"]["baseline"].endswith("=1") and PROFILES["representative"]["candidate"] is None
     assert rejected("", "representative") and rejected("OTHER=1,REP_TK_FWD_CFG=1", "representative")
     assert rejected("REP_TK_FWD_CFG=1,REP_TK_BWDC_SPLITS=0", "representative")
 
 
+def kernel(*lines):
+    return "static void fwd_impl(int x) {\n  if (cfg == 4) launch(rep_tk::nat_copy_ker<D, 0>);\n" + \
+        "".join(f"  else if {line}\n" for line in lines) + "  else launch(rep_tk::fwd_ker<D, 3, false, false, true>);\n}\n"
+
+
+BULK = "(cfg == 20) launch(rep_tk::fwd_ker<D, 3>);"
+DOUBLE = "(cfg == 11) launch(rep_tk::fwd_ker<D, 3, false, false, true, true>);"
+ROUND5 = kernel(BULK, DOUBLE) + "int bwd(int fwd_cfg) { return fwd_cfg == 13 ? 2 : 1; }\n"
+
+
 def test_standalone_scripts_see_what_runs():
-    new = "if (cfg == 4) a; else if (cfg == 5) b; else if (cfg == 7) c; else if (cfg == 0) d; " \
-          "else if (cfg == 2 && phases == 1) e; else if (cfg == 3 && phases == 1) f; else if (cfg == 6) g; " \
-          "else if (cfg == 8) h; else if (cfg == 9) i; else if (cfg == 10) j;"
-    assert all(implemented(v, new) for v in FWD_CFGS)
-    old = "if (cfg == 4) a; else if (cfg == 5) b; else if (cfg == 0) d;"
-    assert active_fwd_cfg({}, old)[:2] == ("1", "operator")
-    assert active_fwd_cfg({"REP_TK_FWD_CFG": "6"}, new)[1] == "operator"
-    assert active_fwd_cfg({"REP_TK_FWD_CFG": "7"}, new)[1] == "timing_only", "CFG7 must never print operator rows"
-    # would run the default kernel, and CFG10 must not pass on a source that only has `cfg == 1`
-    for value, source in (("6", old), ("7", old), ("8", old), ("9", old), ("10", old + " cfg == 1;"), ("11", new)):
-        assert not (value in FWD_CFGS and implemented(value, source))
+    assert active_fwd_cfg({}, ROUND5)[:2] == ("1", "operator")
+    assert active_fwd_cfg({"REP_TK_FWD_CFG": "7"}, ROUND5 + "cfg == 7")[1] == "timing_only"
+    assert fwd_dispatch(ROUND5)["20"] == "rep_tk::fwd_ker<D, 3>"
+    for value, source in (("1", kernel()), ("11", kernel(BULK)), ("6", ROUND5), ("21", ROUND5)):
         try:
             active_fwd_cfg({"REP_TK_FWD_CFG": value}, source)
         except SystemExit:
             continue
         raise AssertionError(f"CFG{value} accepted")
+
+
+def test_arm_meanings_hold_in_the_source():
+    assert cfg_error("10", ROUND5) is None, "an alias needs no dispatch line of its own"
+    assert cfg_error("10", kernel(BULK, "(cfg == 10) launch(rep_tk::fwd_ker<D, 3, false, false, true>);")) is None
+    assert cfg_error("10", kernel(BULK, "(cfg == 10) launch(rep_tk::fwd_ker<D, 3>);")), "an alias that differs"
+    assert cfg_error("13", ROUND5) is None
+    assert cfg_error("13", kernel(BULK, "(cfg == 13) launch(rep_tk::fwd_ker<D, 4>);")), "forward change under CFG13"
+    assert cfg_error("20", ROUND5) is None
+    same = "(cfg == 20) launch(rep_tk::fwd_ker<D, 3, false, false, true>);"
+    assert cfg_error("20", kernel(same)), "a history arm that is the default"
+    assert cfg_error("13", ROUND5.replace("static void fwd_impl", "void renamed")), "must fail closed"
+
+
+def test_backward_arm_is_single_variable():
+    one, thirteen = {"REP_TK_FWD_CFG": "1"}, {"REP_TK_FWD_CFG": "13"}
+    assert arms_error({"baseline": one, "candidate": thirteen}) is None
+    assert arms_error({"baseline": {"REP_TK_FWD_CFG": "11"}, "candidate": thirteen})
+    assert arms_error({"baseline": one, "candidate": dict(thirteen, REP_TK_BWDC_SPLITS="4")})
+
+
+def test_forward_change_under_backward_arm_is_invalid():
+    configs = {"baseline": {"REP_TK_FWD_CFG": "1"}, "candidate": {"REP_TK_FWD_CFG": "13"}}
+    a, b = child("baseline", 1), child("candidate", 1)
+    res = assemble({}, "representative", configs, [], [a, b])
+    assert res["status"].startswith("invalid"), "unrecorded forward output must not pass"
+    a["forward_output"], b["forward_output"] = {"B": dict(o="x")}, {"B": dict(o="x")}
+    res = assemble({}, "representative", configs, [], [a, b])
+    assert res["status"] == "ok" and res["forward_outputs_byte_identical"] is True
+    assert {s["id"]: s["control"] for s in res["summary"]}["op.f"] is True
+    assert {s["id"]: s["control"] for s in res["summary"]}["op.f_plus_b"] is False
+    b["forward_output"] = {"B": dict(o="y")}
+    res = assemble({}, "representative", configs, [], [a, b])
+    assert res["status"].startswith("invalid") and res["claims"]["may_claim_op_level_change"] is False
+    other = {"baseline": {"REP_TK_FWD_CFG": "1"}, "candidate": {"REP_TK_FWD_CFG": "11"}}
+    assert assemble({}, "representative", other, [], [a, b])["status"] == "ok", "CFG11 may change bytes; only reported"
+
+
+def test_stage_runs_compare_only_within_one_build():
+    run = lambda cfg, ext, ms: dict(fwd_cfg=cfg, build=dict(extension_sha256=ext), inputs={}, shape={}, timing={}, hardware={},
+                                    rows=[dict(id="fine", ms=[ms], reads_fwd_cfg=True)])
+    assert compare_stages(run("1", "x", 1.0), run("11", "x", 0.5))["rows"][0]["b_over_a"] == 0.5
+    try:
+        compare_stages(run("1", "x", 1.0), run("11", "y", 0.5))
+    except ValueError:
+        return
+    raise AssertionError("runs from two builds compared")
 
 
 def test_abba_is_balanced():
@@ -141,6 +192,10 @@ def test_claims():
 if __name__ == "__main__":
     test_configs_keep_their_semantics()
     test_standalone_scripts_see_what_runs()
+    test_arm_meanings_hold_in_the_source()
+    test_backward_arm_is_single_variable()
+    test_forward_change_under_backward_arm_is_invalid()
+    test_stage_runs_compare_only_within_one_build()
     test_abba_is_balanced()
     test_estimate_is_labelled_and_stages_are_not_summed()
     test_row_is_a_control_only_if_it_is_in_every_arm()

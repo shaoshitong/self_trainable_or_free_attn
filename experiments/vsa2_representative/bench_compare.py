@@ -7,9 +7,9 @@ whose extension, sources, inputs, selection, shape or timing settings differ.
 
 Profiles (see docs/vsa2_representative_handoff.md, section 7):
 
-  representative      all-tier fwd_ker, diag=0, warmup 10, iters 30. Default arms: CFG6 (hand-written softmax)
-                      vs CFG1 (TK-vector softmax), both MINB 3. CFG8/9 are the same pair at MINB 2. CFG10 is
-                      CFG1 with the tier-B gather by warpgroup-wide cp.async. Kernel,
+  representative      all-tier fwd_ker, diag=0, warmup 10, iters 30. Baseline CFG1, candidate required; FWD_CFGS
+                      says what each value runs. CFG13 changes only the backward: compared with CFG1 or its
+                      alias CFG10, differing forward outputs make the result invalid. Kernel,
                       fine-op and full-operator scope. Output cross-checked against the generic backend.
   controlled-softmax  CFG 4/5/7, warmup 10, iters 50, kernel forward only. TIMING ONLY: these kernels run
                       tier A whatever `phases` says, write no lse and do not mask padded output.
@@ -33,7 +33,7 @@ Control rows do not depend on the configuration; a control ratio away from 1 is 
 No hardware counters are collected: this file reports no MFU or stall figures. Results record no node
 name, address or raw device id; arms are matched on a hash of the GPU id.
 
-  <gpu-runner> python bench_compare.py --out main.json                    # CFG6 vs CFG1
+  <gpu-runner> python bench_compare.py --candidate REP_TK_FWD_CFG=11 --out k-buffer.json
   <gpu-runner> python bench_compare.py --baseline REP_TK_FWD_CFG=1 --candidate REP_TK_FWD_CFG=1 --out aa.json
   <gpu-runner> python bench_compare.py --profile controlled-softmax --out cfg45.json \
       --baseline REP_TK_FWD_CFG=4 --candidate REP_TK_FWD_CFG=5
@@ -57,11 +57,14 @@ TUNABLES = ("REP_TK_FWD_CFG", "REP_TK_BWDC_SPLITS")
 # What each REP_TK_FWD_CFG value runs. Only "operator" values compute the 64/4/1 operator.
 FWD_CFGS = {
     "0": ("operator", "fwd_ker: TK-vector softmax, MINB 4"),
-    "1": ("operator", "fwd_ker: TK-vector softmax, MINB 3 (the kernel's default)"),
+    "1": ("operator", "fwd_ker: TK-vector softmax, MINB 3, tier-B gather by cp.async (the kernel's default)"),
     "6": ("operator", "fwd_ker: hand-written softmax, MINB 3"),
     "8": ("operator", "fwd_ker: TK-vector softmax, MINB 2"),
     "9": ("operator", "fwd_ker: hand-written softmax, MINB 2"),
-    "10": ("operator", "fwd_ker: TK-vector softmax, MINB 3, tier-B gather by warpgroup-wide cp.async"),
+    "10": ("operator", "alias of CFG1, kept so old logs stay reproducible"),
+    "11": ("operator", "CFG1 plus a double-buffered K tile; V unchanged"),
+    "13": ("operator", "CFG1 forward; tier-C backward split by num_splits_heuristic"),
+    "20": ("operator", "the pre-round-4 kernel: per-slot cp.async.bulk tier-B gather"),
     "2": ("tier_a_path", "tier-A-only specialisation at MINB 4; other phases run the default kernel"),
     "3": ("tier_a_path", "tier-A-only specialisation at MINB 3; other phases run the default kernel"),
     "4": ("timing_only", "copied native loop, native softmax"),
@@ -69,11 +72,11 @@ FWD_CFGS = {
     "7": ("timing_only", "copied native loop, TK-vector softmax"),
 }
 PROFILES = {
-    "representative": dict(warmup=10, iters=30, kind="operator", baseline="REP_TK_FWD_CFG=6",
-                           candidate="REP_TK_FWD_CFG=1"),
+    "representative": dict(warmup=10, iters=30, kind="operator", baseline="REP_TK_FWD_CFG=1", candidate=None),
     "controlled-softmax": dict(warmup=10, iters=50, kind="timing_only", baseline="REP_TK_FWD_CFG=4",
                                candidate="REP_TK_FWD_CFG=5"),
 }
+FORWARD_EQUAL = {"1", "10", "13"}  # one forward kernel by definition; see forward_must_match
 HISTORICAL_LIMIT = "historical H200 measurements are from other hardware and must not be compared with this run"
 CONTROLLED_LIMITS = [
     "timing only: CFG4/5/7 are not a numerical reference and the output check is not run",
@@ -90,18 +93,62 @@ TOL_O, TOL_LSE, TOL_GRAD = 1e-2, 1e-4, 2e-2
 
 
 # ------------------------------------------------------------ driver: no torch, never touches the GPU
-def implemented(value, source):
-    """Does this rep_tk.cu dispatch on `value`? It silently runs its default kernel (CFG1) otherwise, so
-    a build without CFG 6 or 7 would report the default kernel under that label."""
-    return value == "1" or re.search(rf"\bcfg == {value}\b", source) is not None
+def fwd_dispatch(source):
+    """{cfg value: launched kernel, "default": the fallback} as read from fwd_impl; {} if unreadable."""
+    body = re.search(r"static void fwd_impl\(.*?^}", source, re.S | re.M)
+    if not body:
+        return {}
+    kernel = r"launch\((rep_tk::\w+<[^;]*?>)\)"
+    table = dict(re.findall(rf"cfg == (\d+)[^\n]*?\)\s*{kernel}", body.group(0)))
+    default = re.search(rf"else {kernel};", body.group(0))
+    return dict(table, default=default.group(1)) if default else {}
+
+
+def cfg_error(value, source):
+    """Why this rep_tk.cu cannot run `value` as FWD_CFGS describes it, or None.
+
+    An undispatched value silently runs the default kernel, and FWD_CFGS describes the kernel that has the
+    CFG20 history arm: on an older source, CFG1 would be labelled with a gather it does not have.
+    """
+    if value not in FWD_CFGS:
+        return f"REP_TK_FWD_CFG={value} is not in the config table"
+    if not re.search(r"\bcfg == 20\b", source):
+        return "this kernel source has no CFG20 history arm; the config table does not describe it"
+    if value not in ("1", "10") and not re.search(rf"\w*cfg\w* == {value}\b", source):
+        return f"REP_TK_FWD_CFG={value} is not implemented by this kernel source"
+    if value in ("10", "13", "20"):
+        table = fwd_dispatch(source)
+        if not table:
+            return f"cannot read the forward dispatch to check REP_TK_FWD_CFG={value}"
+        same = table.get(value, table["default"]) == table["default"]
+        if same != (value != "20"):
+            return f"REP_TK_FWD_CFG={value} launches {table.get(value, table['default'])}, default {table['default']}"
+    return None
+
+
+def forward_must_match(configs):
+    """Two different arms that are one forward kernel by definition, so their outputs must be byte-equal."""
+    arms = {c.get("REP_TK_FWD_CFG") for c in configs.values()}
+    return len(arms) == 2 and arms <= FORWARD_EQUAL
+
+
+def arms_error(configs):
+    """One variable per comparison, for the arm whose meaning depends on its partner."""
+    arms = {c.get("REP_TK_FWD_CFG") for c in configs.values()}
+    if "13" in arms and not arms <= FORWARD_EQUAL:
+        return f"CFG13 changes only the backward; compare it with CFG1 or CFG10, not {sorted(arms)}"
+    if any(c.get("REP_TK_FWD_CFG") == "13" and "REP_TK_BWDC_SPLITS" in c for c in configs.values()):
+        return "CFG13 chooses the tier-C split; REP_TK_BWDC_SPLITS would override what it measures"
+    return None
 
 
 def active_fwd_cfg(env=os.environ, source=None):
     """(value, kind, meaning) of this process's REP_TK_FWD_CFG, for the standalone scripts."""
     value = env.get("REP_TK_FWD_CFG", "1")
     source = (HERE / "csrc/rep_tk/rep_tk.cu").read_text() if source is None else source
-    if value not in FWD_CFGS or not implemented(value, source):
-        raise SystemExit(f"REP_TK_FWD_CFG={value} is not implemented by this kernel source")
+    error = cfg_error(value, source)
+    if error:
+        raise SystemExit(error)
     return (value,) + FWD_CFGS[value]
 
 
@@ -169,6 +216,15 @@ def summarize(children):
     return out
 
 
+def mark_shared_forward(summary, configs):
+    """Between arms sharing a forward kernel, forward-only rows are controls; byte-equal output is checked apart."""
+    if forward_must_match(configs):
+        for s in summary:
+            if s["stage"] in ("fwd", "f"):
+                s["control"] = True
+    return summary
+
+
 def claims(profile, children):
     """What this result may support; printed and stored so that a reader of the JSON cannot miss it."""
     if profile == "controlled-softmax":
@@ -185,6 +241,8 @@ def assemble(args_dict, profile, configs, order, children):
     claim = claims(profile, children)
     digests = [c.get("forward_output") for c in children]
     identical = None if None in digests else len({json.dumps(d, sort_keys=True) for d in digests}) == 1
+    if forward_must_match(configs) and identical is not True:
+        bad = bad + ["forward outputs of arms defined to share one forward kernel"]
     if bad:
         claim["may_claim_op_level_change"] = False
     return dict(schema=SCHEMA, profile=profile, created_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -192,7 +250,7 @@ def assemble(args_dict, profile, configs, order, children):
                 status="invalid: arms differ in " + ", ".join(bad) if bad else "ok",
                 identity_differences=bad, claims=claim, forward_outputs_byte_identical=identical,
                 counters=dict(collected=False, reason="not collected by this harness; no counter workaround is authorized"),
-                summary=summarize(children) if not bad else [], children=children)
+                summary=[] if bad else mark_shared_forward(summarize(children), configs), children=children)
 
 
 def run_child(a, arm, config, round_idx):
@@ -261,12 +319,19 @@ def main():
         ap.error(str(e))
     source = (HERE / "csrc/rep_tk/rep_tk.cu").read_text()
     for arm, config in configs.items():
-        if not implemented(config["REP_TK_FWD_CFG"], source):
-            ap.error(f"{arm}: REP_TK_FWD_CFG={config['REP_TK_FWD_CFG']} is not implemented by this kernel source")
+        error = cfg_error(config["REP_TK_FWD_CFG"], source)
+        if error:
+            ap.error(f"{arm}: {error}")
+    error = arms_error(configs)
+    if error:
+        ap.error(error)
     order = abba(a.rounds)
     children = [run_child(a, arm, configs[arm], i) for i, arm in enumerate(order)]
     settings = {k: getattr(a, k) for k in ("len", "heads", "dim", "mid_reps", "seed", "warmup", "iters", "batches", "rounds")}
     settings["fwd_cfg_meanings"] = {arm: FWD_CFGS[c["REP_TK_FWD_CFG"]][1] for arm, c in configs.items()}
+    dispatch = fwd_dispatch(source)
+    settings["fwd_kernels_in_source"] = {arm: dispatch.get(c["REP_TK_FWD_CFG"], dispatch.get("default"))
+                                         for arm, c in configs.items()}
     res = assemble(settings, a.profile, configs, order, children)
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(out.suffix + ".tmp")
@@ -379,9 +444,11 @@ def child_main(spec):
     add("kernel.tk.fwd.A", "kernel", "fwd", "tk", "tier_a_only", False, loop(kernel_fwd(PHASE_A), W, I, N))
     output_check = forward_output = None
     if spec["profile"] == "representative":
+        phases = {"A": PHASE_A}
         for name, ph, work in (("A|B", PHASE_A | PHASE_B, "tier_subset"), ("A|B|C", PHASE_ALL, "64/4/1"),
                                ("B|C", PHASE_B | PHASE_C, "tier_subset"), ("B", PHASE_B, "tier_b_only"),
                                ("C", PHASE_C, "tier_c_only")):
+            phases[name] = ph
             add(f"kernel.tk.fwd.{name}", "kernel", "fwd", "tk", work, False, loop(kernel_fwd(ph), W, I, N))
         gtab = C.rep_build(k, v, cnt, rm)
         add("kernel.generic.fwd.A|B|C", "kernel", "fwd", "generic", "64/4/1", True,
@@ -405,8 +472,8 @@ def child_main(spec):
             ("C", "tier_subset", lambda: C.rep_tk_bwd_c(q, tab[3], tab[4], tab[5], dout, lse_t, d_t, sel.bits_ab, qg, kgt,
                                                         vgt)),
         ):
-            # Backward kernels do not read REP_TK_FWD_CFG; only tier C reads REP_TK_BWDC_SPLITS.
-            control = name != "C" or "REP_TK_BWDC_SPLITS" not in os.environ
+            # Of the forward settings, only CFG13 reaches a backward kernel: tier C, as REP_TK_BWDC_SPLITS does.
+            control = name != "C" or not ("REP_TK_BWDC_SPLITS" in os.environ or os.environ.get("REP_TK_FWD_CFG") == "13")
             add(f"kernel.tk.bwd.{name}", "kernel", "bwd_stage", "tk", work, control, loop(fn, W, I, N),
                 note="one stage; do not add stages and call the sum a complete call")
         del o_t, lse_t, d_t, o_n, lse_n, d_n, qg, kg, vg, dkm, dvm, kgt, vgt
@@ -461,7 +528,10 @@ def child_main(spec):
             return dict(name=name, max_err=err, scale=scale, tol_rel=tol, ok=err <= tol * max(scale, 1.0))
 
         o_t, lse_t = kernel_fwd(PHASE_ALL)()
-        forward_output = dict(o=digest(o_t), lse=digest(lse_t))
+        forward_output = {}
+        for name, ph in phases.items():
+            o_p, lse_p = kernel_fwd(ph)()
+            forward_output[name] = dict(o=digest(o_p), lse=digest(lse_p))
         o_g, lse_g = C.rep_attn_fwd(q, k, v, *gtab, qp, qi, sel.bits_a, sel.bits_ab, cnt, rm, PHASE_ALL, 0)
         output_check = [compare("o vs generic", o_t, o_g, TOL_O), compare("lse vs generic", lse_t, lse_g, TOL_LSE)]
         grads = {}

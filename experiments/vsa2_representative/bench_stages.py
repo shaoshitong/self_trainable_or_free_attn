@@ -22,7 +22,13 @@ isolated, so it lands in the residual, and `fine` carries a wrapper the operator
 Stage times are not a performance claim and must not be added to bench_compare's kernel rows. Isolated loops
 need not sum to the complete call: stages overlap differently on the stream when they run back to back.
 
-  <gpu-runner> python bench_stages.py --out stages.json
+Under every configuration each row keeps its meaning. reads_fwd_cfg says whether it can change with
+REP_TK_FWD_CFG. A row with false, such as pool or route, should match another configuration within the floor.
+CFG13 changes only the backward, so all its rows are labelled as a repeat of the CFG1 forward. Compare runs from
+one build only, with --compare; numbers from another build, or from CFG1 before its gather changed, do not qualify.
+
+  REP_TK_FWD_CFG=11 <gpu-runner> python bench_stages.py --out stages-cfg11.json
+  python bench_stages.py --compare stages-cfg1.json stages-cfg11.json
 """
 import argparse
 import hashlib
@@ -34,6 +40,19 @@ from pathlib import Path
 from bench_compare import HERE, active_fwd_cfg, sha256_file
 
 NOTE = "measurement_only: not a performance claim; do not add to kernel rows"
+READS_FWD_CFG = {"total", "total.repeat", "fine", "fine.kernel"}
+BACKWARD_ONLY_NOTE = "CFG13 changes only the backward: this forward row repeats CFG1's"
+
+
+def compare_stages(a, b):
+    """Per-row ratios of two runs, or an error if they are not one build, input, shape and timing setup."""
+    for key in ("build", "inputs", "shape", "timing", "hardware"):
+        if a[key] != b[key]:
+            raise ValueError(f"runs differ in {key}; stage times are only comparable within one build")
+    med = lambda r: statistics.median(r["ms"])
+    return dict(measured_rows=True, note=NOTE, fwd_cfgs=[a["fwd_cfg"], b["fwd_cfg"]],
+                rows=[dict(id=x["id"], reads_fwd_cfg=x.get("reads_fwd_cfg"), a_ms=med(x), b_ms=med(y), b_over_a=med(y) / med(x))
+                      for x, y in zip(a["rows"], b["rows"], strict=True)])
 
 
 def attribute(rows):
@@ -53,8 +72,22 @@ def main():
     ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument("--iters", type=int, default=30)
     ap.add_argument("--batches", type=int, default=3)
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--out")
+    ap.add_argument("--compare", nargs=2, metavar=("A.json", "B.json"))
     a = ap.parse_args()
+    if a.compare:
+        x, y = (json.loads(Path(p).read_text()) for p in a.compare)
+        try:
+            res = compare_stages(x, y)
+        except ValueError as e:
+            sys.exit(str(e))
+        print(f"{NOTE}\nCFG{res['fwd_cfgs'][0]} vs CFG{res['fwd_cfgs'][1]}, same build")
+        for r in res["rows"]:
+            tag = "" if r["reads_fwd_cfg"] else "  does not read the config"
+            print(f"{r['id']:20s} {r['a_ms']:9.3f} {r['b_ms']:9.3f} {r['b_over_a']:7.3f}{tag}")
+        return
+    if not a.out:
+        ap.error("--out is required")
     out = Path(a.out)
     if out.exists():
         ap.error(f"{out} exists; results are not overwritten")
@@ -132,7 +165,8 @@ def main():
         ("fuse", True, None, lambda: C.fuse_fwd(of, oc, gate, cnt, gate_act)),
         ("total.repeat", False, "second measurement of total, for the floor", total),
     )
-    rows = [dict(id=n, ms=loop(fn), in_sum=in_sum, label="measurement_only", measured=True, note=note or NOTE)
+    rows = [dict(id=n, ms=loop(fn), in_sum=in_sum, label="measurement_only", measured=True, note=note or NOTE,
+                 reads_fwd_cfg=n in READS_FWD_CFG, **({"config_note": BACKWARD_ONLY_NOTE} if cfg == "13" else {}))
             for n, in_sum, note, fn in stages]
     res = dict(schema="vsa2-rep-stages/1", measurement_only=True, note=NOTE, fwd_cfg=cfg, fwd_cfg_meaning=meaning,
                shape=dict(B=B, H=H, L=L, D=D, NB=nb, RM=rm, R=R, dtype="bf16", blk_cnt="full"),
