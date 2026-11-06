@@ -19,6 +19,8 @@ using namespace vsa2rep;
 
 #ifdef VSA2_REP_TK  // csrc/rep_tk/rep_tk.cu (ThunderKittens + TMA, sm_90a)
 std::vector<torch::Tensor> rep_tk_build(torch::Tensor k, torch::Tensor v, torch::Tensor blk_cnt, int64_t RM);
+std::vector<torch::Tensor> rep_tk_build_pooled(torch::Tensor kr, torch::Tensor vr, torch::Tensor kc,
+                                               torch::Tensor vc, torch::Tensor blk_cnt, int64_t RM);
 torch::Tensor rep_tk_lcb(torch::Tensor lc_mid, torch::Tensor b_ptr, torch::Tensor b_idx, int64_t NB, int64_t RM);
 std::vector<torch::Tensor> rep_tk_fwd(torch::Tensor q, torch::Tensor k, torch::Tensor v, std::vector<torch::Tensor> tab,
                                       torch::Tensor a_ptr, torch::Tensor a_idx, torch::Tensor b_ptr,
@@ -692,6 +694,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("tier_a_bwd_kv", &tier_a_bwd_kv);
 #ifdef VSA2_REP_TK
   m.def("rep_tk_build", &rep_tk_build);
+  m.def("rep_tk_build_pooled", &rep_tk_build_pooled);
   m.def("rep_tk_lcb", &rep_tk_lcb);
   m.def("rep_tk_fwd", &rep_tk_fwd);
   m.def("rep_tk_bwd_c", &rep_tk_bwd_c);
