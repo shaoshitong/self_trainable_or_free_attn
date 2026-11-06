@@ -989,9 +989,11 @@ __global__ __launch_bounds__(128, (D == 64) ? 3 : 2) void bwd_b_ker(const __grid
 
 // ---------------------------------------------------------------- diagnostic: native forward, copied
 // VSA2's TK forward loop body (csrc/vsa/sm90_tk/fine_tk_h100.cu, unsplit path) copied verbatim, so its
-// time can be compared with this file's tier-A path inside one build. MY_SOFTMAX = true swaps in this
-// file's softmax (log2-domain, deferred row sums) and nothing else. Measurement only; o/lse as native.
-template <int D, bool MY_SOFTMAX>
+// time can be compared with this file's tier-A path inside one build. SM selects the softmax and nothing
+// else: 0 VSA2's own, 1 the previous hand-written one (log2 domain, deferred row sums), 2 fwd_ker's
+// online_softmax_tk. Measurement only: o is normalized (padded rows are not zeroed) and no lse is written,
+// so it is not a numerical reference.
+template <int D, int SM>
 __global__ __launch_bounds__(128, 4) void nat_copy_ker(const __grid_constant__ fwd_globals<D> g) {
 #if REP_TK_HOPPER
   constexpr float SCALE_LOG2 = (D == 64) ? 1.44269504089f * 0.125f : 1.44269504089f * 0.08838834764f;
@@ -1036,7 +1038,7 @@ __global__ __launch_bounds__(128, 4) void nat_copy_ker(const __grid_constant__ f
     const int nkv = has_next ? idx[kv_idx + 1] : 0;
     wait(k_smem_arrived, kv_idx % 2);
     warpgroup::mm_ABt(att_block, q_smem, k_smem);
-    if constexpr (!MY_SOFTMAX) {
+    if constexpr (SM == 0) {
       copy(max_vec_last_scaled, max_vec);
       mul(max_vec_last_scaled, max_vec_last_scaled, SCALE_LOG2);
     }
@@ -1046,7 +1048,13 @@ __global__ __launch_bounds__(128, 4) void nat_copy_ker(const __grid_constant__ f
       coord<tile_t> kc = {b, h, nkv, 0};
       tma::load_async(k_smem, g.k, kc, k_smem_arrived);
     }
-    if constexpr (!MY_SOFTMAX) {
+    if constexpr (SM == 2) {
+      const int kcA = g.blk_cnt[idx[kv_idx]];
+      mul(att_block, att_block, SCALE_LOG2);
+      if (kcA < kB) right_fill(att_block, att_block, kcA, base_types::constants<float>::neg_infty());
+      online_softmax_tk<D>(att_block, max_vec, norm_vec, o_reg);
+      copy(att_block_mma, att_block);
+    } else if constexpr (SM == 0) {
       right_fill(att_block, att_block, g.blk_cnt[idx[kv_idx]], base_types::constants<float>::neg_infty());
       row_max(max_vec, att_block, max_vec);
       mul(att_block, att_block, SCALE_LOG2);
@@ -1116,10 +1124,21 @@ __global__ __launch_bounds__(128, 4) void nat_copy_ker(const __grid_constant__ f
       tma::load_async(v_smem, g.v, vc, v_smem_arrived);
     }
   }
-  if constexpr (MY_SOFTMAX) {
-    float l = l_r[0] + __shfl_xor_sync(0xffffffffu, l_r[0], 1);
-    l += __shfl_xor_sync(0xffffffffu, l, 2);
-    for (int n = 0; n < D / 16; ++n) for (int j = 0; j < 4; ++j) { o_reg.tiles[0][n].data[j].x /= l; }
+  if constexpr (SM == 1) {  // both rows of the thread, every element (was: row gq's l on .x only)
+    float inv[2];
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+      float l = l_r[r] + __shfl_xor_sync(0xffffffffu, l_r[r], 1);
+      l += __shfl_xor_sync(0xffffffffu, l, 2);
+      inv[r] = l > 0.f ? 1.f / l : 0.f;
+    }
+#pragma unroll
+    for (int n = 0; n < D / 16; ++n)
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        o_reg.tiles[0][n].data[j].x *= inv[j & 1];
+        o_reg.tiles[0][n].data[j].y *= inv[j & 1];
+      }
   } else {
     div_row(o_reg, o_reg, norm_vec);
   }
@@ -1214,7 +1233,7 @@ static void fwd_impl(torch::Tensor q, torch::Tensor k, torch::Tensor v, const st
       b_idx.data_ptr<int>(), reinterpret_cast<const uint32_t*>(bits_ab.data_ptr<int>()), blk_cnt.data_ptr<int>(),
       (int)H, (int)L, NB, NBt, RM, words_of(NB), phases, diag};
   constexpr int mem = 3 * 64 * D * 2 + 1024;  // q, k, v tiles + alignment slack
-  static int cfg = -1;  // 0: MINB 4, else MINB 3 (default, measured best); 2-6 diagnostics
+  static int cfg = -1;  // 0: MINB 4, else MINB 3 (default, measured best); 2-7 diagnostics
   if (cfg < 0) {
     const char* e = std::getenv("REP_TK_FWD_CFG");
     cfg = e ? std::atoi(e) : 1;
@@ -1224,9 +1243,11 @@ static void fwd_impl(torch::Tensor q, torch::Tensor k, torch::Tensor v, const st
     kern<<<dim3(NB, H, B), 128, mem, stream()>>>(g);
   };
   // cfg 2 / 3: tier-A-only specialisation at MINB 4 / 3 (diagnostic; valid only for phases == A)
-  // cfg 4 / 5: verbatim copy of VSA2's TK forward with its own / this file's softmax (diagnostic, tier A)
-  if (cfg == 4) launch(rep_tk::nat_copy_ker<D, false>);
-  else if (cfg == 5) launch(rep_tk::nat_copy_ker<D, true>);
+  // cfg 4 / 5 / 7: verbatim copy of VSA2's TK forward with its own / the previous hand-written /
+  // online_softmax_tk softmax (diagnostic, tier A)
+  if (cfg == 4) launch(rep_tk::nat_copy_ker<D, 0>);
+  else if (cfg == 5) launch(rep_tk::nat_copy_ker<D, 1>);
+  else if (cfg == 7) launch(rep_tk::nat_copy_ker<D, 2>);
   else if (cfg == 0) launch(rep_tk::fwd_ker<D, 4>);
   else if (cfg == 2 && phases == 1) launch(rep_tk::fwd_ker<D, 4, true>);
   else if (cfg == 3 && phases == 1) launch(rep_tk::fwd_ker<D, 3, true>);
