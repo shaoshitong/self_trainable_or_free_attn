@@ -178,6 +178,53 @@ def _coarse_meta(B: int, H: int, nb: int, nbc_pad: int, device):
     return cnt.contiguous(), ptr, idx
 
 
+_ROUTE_GRAPH_CACHE = {}
+
+
+def _route_graph_enabled() -> bool:
+    """REP_TK_FWD_CFG=41: replay a captured route_tiers instead of launching its eighteen kernels.
+
+    Routing's inputs are the pooled q/k (8 MiB), so copying fresh pools into the captured buffers is cheap
+    enough that the launch saving survives — unlike capturing the whole operator, whose 192 MiB of inputs
+    cost more to copy than the graph saves.
+    """
+    import os
+    return os.environ.get("REP_TK_FWD_CFG") == "41"
+
+
+def _route_tiers_graphed(C, qr, kr, blk_cnt, R, ba, bab, norm, max_bytes):
+    """None when capture is unavailable for this shape, so the caller falls back to the eager call."""
+    key = (tuple(qr.shape), tuple(kr.shape), tuple(blk_cnt.shape), int(R), int(ba), int(bab), int(norm),
+           qr.device.index)
+    hit = _ROUTE_GRAPH_CACHE.get(key)
+    if hit is False:
+        return None
+    if hit is None:
+        try:
+            qr_s, kr_s, cnt_s = qr.clone(), kr.clone(), blk_cnt.clone()
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                for _ in range(3):
+                    C.route_tiers(qr_s, kr_s, cnt_s, R, ba, bab, norm, max_bytes)
+            torch.cuda.current_stream().wait_stream(side)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                outs = C.route_tiers(qr_s, kr_s, cnt_s, R, ba, bab, norm, max_bytes)
+            hit = (qr_s, kr_s, cnt_s, graph, [t.detach() for t in outs])
+        except Exception:  # a shape that cannot be captured simply keeps the eager path
+            _ROUTE_GRAPH_CACHE[key] = False
+            return None
+        _ROUTE_GRAPH_CACHE[key] = hit
+    qr_s, kr_s, cnt_s, graph, outs = hit
+    qr_s.copy_(qr)
+    kr_s.copy_(kr)
+    cnt_s.copy_(blk_cnt)
+    graph.replay()
+    return tuple(t.clone() for t in outs)  # a caller may keep the selection past the next call
+
+
 _COARSE_META_CACHE = {}
 
 
@@ -423,7 +470,11 @@ class _RepAttentionFunction(torch.autograd.Function):
                 tab0 = C.rep_tk_build(k, v, blk_cnt, tiers.mid_reps)
         if sel_in is None:
             ba, bab = tiers.budgets(nb)
-            sel = TierSelection(*C.route_tiers(qr, kr, blk_cnt, R, ba, bab, row_norm, max_score_bytes))
+            outs = (_route_tiers_graphed(C, qr, kr, blk_cnt, R, ba, bab, ROW_NORMS[row_norm], max_score_bytes)
+                    if _route_graph_enabled() else None)
+            if outs is None:
+                outs = C.route_tiers(qr, kr, blk_cnt, R, ba, bab, ROW_NORMS[row_norm], max_score_bytes)
+            sel = TierSelection(*outs)
         else:
             sel = sel_in
         if use_tk:
