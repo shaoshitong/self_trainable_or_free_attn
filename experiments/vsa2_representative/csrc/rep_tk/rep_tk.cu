@@ -2165,8 +2165,8 @@ inline bf16* bfp(const torch::Tensor& t) { return reinterpret_cast<bf16*>(t.data
 inline int words_of(int nb) { return (nb + 31) >> 5; }
 inline cudaStream_t stream() { return at::cuda::getCurrentCUDAStream().stream(); }
 // REP_TK_FWD_CFG, read once. Forward-only values are dispatched in fwd_impl; 21 / 22 select the tier-C
-// backward split (previous "wave" policy / 4), 23 the tier-A backward launch-bound probe and 36 its
-// single-writer dK/dV store (tk_bwd_store_kv), each with
+// backward split (previous "wave" policy / 4), 23 the tier-A backward launch-bound probe and 37 its
+// previous zero-fill + reduce-add dK/dV path (see tk_bwd_store_kv), each with
 // the default forward, so every one of them differs from cfg 1 (13) in one backward choice only.
 inline int rep_cfg() {
   static const int cfg = [] {
@@ -2499,18 +2499,24 @@ std::vector<torch::Tensor> tk_native_fwd(torch::Tensor q, torch::Tensor k, torch
   return {o, lse};
 }
 
+// Whether tk_native_bwd stores rather than reduce-adds dK/dV, so its kg/vg may be allocated uninitialized:
+// on the row_ptr launch each (b, h, kv block) has one owner CTA (VSA2's TK backward is MHA, grid NB x H x
+// B), which stores its dK/dV tiles or, with an empty k2q list, zeros, so every row is written exactly once;
+// on the TK path nothing else writes kg/vg (the coarse branch's add_dk/add_dv go to the tier-C tables).
+// The default since round 11 (REP_TK_FWD_CFG=36 is its alias); 37 and 23 keep the zero-fill + reduce-add.
+bool tk_bwd_store_kv() { return rep_cfg() != 37 && rep_cfg() != 23; }
+
 void tk_native_bwd(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor dout_f, torch::Tensor lse,
                    torch::Tensor delta, torch::Tensor row_ptr, torch::Tensor col_idx, torch::Tensor blk_cnt,
                    torch::Tensor qg, torch::Tensor kg, torch::Tensor vg) {
   check_bf16(q, "q");
-  // REP_TK_FWD_CFG=23: VSA2's kMinb3 (8), its tier-A backward at __launch_bounds__(128, 3). 36: kStoreKV
-  // (16), dK/dV stored by each kv block's single owner CTA into kg/vg that the caller did not zero-fill
-  // (tk_bwd_store_kv). Otherwise unchanged.
-  const int opts = rep_cfg() == 23 ? 8 : rep_cfg() == 36 ? 16 : 0;
+  // Default (and 36, its alias): VSA2's kStoreKV (16), dK/dV stored by each kv block's single owner CTA
+  // into kg/vg the caller did not zero-fill (tk_bwd_store_kv). 37: the previous reduce-add into zeroed
+  // kg/vg (history arm). 23: kMinb3 (8), the launch-bound probe, kept on the reduce-add path it was
+  // measured with.
+  const int opts = rep_cfg() == 23 ? 8 : tk_bwd_store_kv() ? 16 : 0;
   vsa2_tk_fine_bwd(q, k, v, dout_f, lse, delta, row_ptr, col_idx, blk_cnt, qg, kg, vg, opts);
   check_launch("native bwd");
 }
 
-// Whether tk_native_bwd stores rather than reduce-adds dK/dV (REP_TK_FWD_CFG=36): its kg/vg may then be
-// allocated uninitialized, as every row is written once.
-bool tk_bwd_store_kv() { return rep_cfg() == 36; }
+

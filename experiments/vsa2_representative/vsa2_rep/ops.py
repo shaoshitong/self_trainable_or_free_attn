@@ -263,8 +263,8 @@ def _rep_bwd_tk(C, q, k, v, tab, dout_m, lse, delta, blk_cnt, sel: TierSelection
     qg = torch.zeros(q.shape, **f32)
     kg = vg = None
     if phases & PHASE_A:
-        # REP_TK_FWD_CFG=36: the tier-A kernel stores every kg/vg row exactly once (its single-owner path),
-        # so they need no zero fill; otherwise it reduce-adds into zeroed accumulators.
+        # By default the tier-A kernel stores every kg/vg row exactly once (its single-owner path), so they
+        # need no zero fill; REP_TK_FWD_CFG=37 (history) reduce-adds into zeroed accumulators.
         alloc = torch.empty if C.tk_bwd_store_kv() else torch.zeros
         kg, vg = alloc(q.shape, **f32), alloc(q.shape, **f32)
         C.tk_native_bwd(q, k, v, dout_m, lse, delta, sel.k2q_ptr, sel.k2q_idx, blk_cnt, qg, kg, vg)
