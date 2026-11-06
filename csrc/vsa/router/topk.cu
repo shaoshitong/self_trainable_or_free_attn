@@ -296,6 +296,110 @@ __global__ void __launch_bounds__(256) topk_emit_rows_kernel(int NB, int bh0, co
   }
 }
 
+// topk_cut and topk_emit_rows as one kernel, one CTA per (b, h) (launch_global_topk's fused_cut_emit): the
+// cut stage verbatim, a CTA barrier so its q->kv row_ptr and cut position are visible, then the emit stage's
+// per-row body with the CTA's 32 warps striding over the rows. topk_mask stays separate: it is the one
+// stage that is parallel over rows across CTAs. Same selection words and ascending lists as the two kernels.
+__global__ void __launch_bounds__(kScanThreads) topk_cut_emit_kernel(int NB, int bh0, int* state,
+                                                                     const uint32_t* gtbits, const uint32_t* eqbits,
+                                                                     const int* gtcnt, const int* eqcnt,
+                                                                     uint32_t* selbits, int* q2k_ptr, int* q2k_idx) {
+  __shared__ int sscan[kScanThreads / 32];
+  __shared__ int s_cut[3];
+  const int bh = blockIdx.x;
+  int* st = state + bh * ST_STRIDE;
+  const int keff = st[ST_KEFF];
+  const int krem = st[ST_KREM];
+  const int W = words_of(NB);
+  // ---- topk_cut_kernel
+  const int per = (NB + kScanThreads - 1) / kScanThreads;
+  const int r0 = min(NB, (int)threadIdx.x * per), r1 = min(NB, r0 + per);
+  const int* ec = eqcnt + (size_t)bh * NB;
+  const int* gc = gtcnt + (size_t)bh * NB;
+  if (threadIdx.x == 0) {
+    s_cut[0] = -1;
+    s_cut[1] = -1;
+    s_cut[2] = 0;
+  }
+  int esum = 0;
+  for (int i = r0; i < r1; ++i) esum += ec[i];
+  int etot;
+  int eex = block_excl_scan(esum, sscan, &etot);
+  if (keff > 0 && krem > 0 && eex < krem && krem <= eex + esum) {
+    int cum = eex;
+    for (int i = r0; i < r1; ++i) {
+      if (cum + ec[i] >= krem) {
+        int need = krem - cum;  // 1-based rank of the cutoff tie within row i
+        const uint32_t* ew = eqbits + ((size_t)bh * NB + i) * W;
+        for (int w = 0; w < W; ++w) {
+          uint32_t word = ew[w];
+          int c = __popc(word);
+          if (need <= c) {
+            for (int j = 1; j < need; ++j) word &= word - 1;
+            s_cut[0] = i;
+            s_cut[1] = w * 32 + (__ffs(word) - 1);
+            s_cut[2] = krem - cum;
+            break;
+          }
+          need -= c;
+        }
+        break;
+      }
+      cum += ec[i];
+    }
+  }
+  __syncthreads();
+  const int cut_row = s_cut[0];
+  const int cut_need = s_cut[2];
+  int rsum = 0;
+  for (int i = r0; i < r1; ++i) rsum += gc[i] + (i < cut_row ? ec[i] : (i == cut_row ? cut_need : 0));
+  int rtot;
+  int rex = block_excl_scan(rsum, sscan, &rtot);
+  const long long base = (long long)(bh0 + bh) * keff;
+  int* ptr = q2k_ptr + (size_t)(bh0 + bh) * (NB + 1);
+  int run_r = rex;
+  for (int i = r0; i < r1; ++i) {
+    ptr[i] = (int)(base + run_r);
+    run_r += gc[i] + (i < cut_row ? ec[i] : (i == cut_row ? cut_need : 0));
+  }
+  if (threadIdx.x == 0) {
+    ptr[NB] = (int)(base + rtot);
+    st[ST_CUTROW] = cut_row;
+    st[ST_CUTCOL] = s_cut[1];
+  }
+  __syncthreads();  // row_ptr and the cut position visible to every warp
+  // ---- topk_emit_rows_kernel, warp per row
+  const int cut_col = s_cut[1];
+  const int lane = threadIdx.x & 31;
+  for (int row = threadIdx.x >> 5; row < NB; row += kScanThreads / 32) {
+    const size_t roff = ((size_t)bh * NB + row) * W;
+    int* out = q2k_idx + ptr[row];
+    int run = 0;
+    for (int wb = 0; wb < W; wb += 32) {
+      int w = wb + lane;
+      uint32_t word = 0;
+      if (w < W) {
+        word = gtbits[roff + w] | (eqbits[roff + w] & cut_mask(row, w, cut_row, cut_col));
+        selbits[roff + w] = word;
+      }
+      int c = __popc(word);
+      int x = c;
+#pragma unroll
+      for (int off = 1; off < 32; off <<= 1) {
+        int y = __shfl_up_sync(0xffffffff, x, off);
+        if (lane >= off) x += y;
+      }
+      int pos = run + x - c;
+      while (word) {
+        int b = __ffs(word) - 1;
+        out[pos++] = w * 32 + b;
+        word &= word - 1;
+      }
+      run += __shfl_sync(0xffffffff, x, 31);
+    }
+  }
+}
+
 // one warp per selection-bitmask word column; lane = bit (column j = 32*wc + lane)
 template <bool EMIT>
 __global__ void __launch_bounds__(256) topk_cols_kernel(int NB, int bh0, const uint32_t* selbits, int* colcnt,
@@ -435,7 +539,8 @@ void topk_carve_workspace(void* base, int bh_count, int NB, TopkWorkspace* ws) {
   ws->colcnt = reinterpret_cast<int*>(p);
 }
 
-void launch_global_topk(const TopkParams& p, const TopkWorkspace& ws, cudaStream_t s, bool fused_cols) {
+void launch_global_topk(const TopkParams& p, const TopkWorkspace& ws, cudaStream_t s, bool fused_cols,
+                        bool fused_cut_emit) {
   const int NB = p.NB, bhc = p.bh_count;
   const long long nn = (long long)NB * NB;
   const int W = (NB + 31) / 32;
@@ -454,9 +559,14 @@ void launch_global_topk(const TopkParams& p, const TopkWorkspace& ws, cudaStream
 
   dim3 rgrid((NB + 7) / 8, bhc);
   topk_mask_kernel<<<rgrid, 256, 0, s>>>(p.scores, NB, ws.state, ws.gtbits, ws.eqbits, ws.gtcnt, ws.eqcnt);
-  topk_cut_kernel<<<bhc, kScanThreads, 0, s>>>(NB, p.bh0, ws.state, ws.eqbits, ws.gtcnt, ws.eqcnt, p.q2k_ptr);
-  topk_emit_rows_kernel<<<rgrid, 256, 0, s>>>(NB, p.bh0, ws.state, ws.gtbits, ws.eqbits, ws.selbits, p.q2k_ptr,
-                                              p.q2k_idx);
+  if (fused_cut_emit) {
+    topk_cut_emit_kernel<<<bhc, kScanThreads, 0, s>>>(NB, p.bh0, ws.state, ws.gtbits, ws.eqbits, ws.gtcnt, ws.eqcnt,
+                                                      ws.selbits, p.q2k_ptr, p.q2k_idx);
+  } else {
+    topk_cut_kernel<<<bhc, kScanThreads, 0, s>>>(NB, p.bh0, ws.state, ws.eqbits, ws.gtcnt, ws.eqcnt, p.q2k_ptr);
+    topk_emit_rows_kernel<<<rgrid, 256, 0, s>>>(NB, p.bh0, ws.state, ws.gtbits, ws.eqbits, ws.selbits, p.q2k_ptr,
+                                                p.q2k_idx);
+  }
   if (fused_cols) {
     topk_cols_fused_kernel<<<bhc, kScanThreads, 0, s>>>(NB, p.bh0, ws.state, ws.selbits, ws.colcnt, p.k2q_ptr,
                                                         p.k2q_idx);

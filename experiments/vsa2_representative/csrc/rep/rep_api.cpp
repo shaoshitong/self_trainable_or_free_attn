@@ -245,6 +245,8 @@ std::vector<torch::Tensor> route_tiers(torch::Tensor qr, torch::Tensor kr, torch
   // launches fewer per chain); the bitmaps come from earlier kernels and are untouched. Default since it
   // measured -1.3% on the full forward; CFG46 is the accepted alias and CFG47 restores the three-kernel form.
   const bool fused_cols = !(cfg_env != nullptr && std::strcmp(cfg_env, "47") == 0);
+  // REP_TK_FWD_CFG=49: each chain runs topk_cut and topk_emit_rows as one kernel (same bitmaps and lists).
+  const bool fused_cut_emit = cfg_env != nullptr && std::strcmp(cfg_env, "49") == 0;
   torch::Tensor ws2, ab_k2q_buf2;
   vsa2::TopkWorkspace w2{};
   // Created once per process: creating and destroying a stream plus two events on every routing call cost more
@@ -285,10 +287,10 @@ std::vector<torch::Tensor> route_tiers(torch::Tensor qr, torch::Tensor kr, torch
       if (parallel) {  // the A|B chain waits for the scores it reads, then runs beside the tier-A chain
         cudaEventRecord(ev_scores, cur_stream());
         cudaStreamWaitEvent(s2, ev_scores, 0);
-        vsa2::launch_global_topk(ab, w2, s2, fused_cols);
+        vsa2::launch_global_topk(ab, w2, s2, fused_cols, fused_cut_emit);
         cudaMemcpyAsync(bits_ab_p + (size_t)bh0 * NB * W, w2.selbits, bits_bytes, cudaMemcpyDeviceToDevice, s2);
       } else {
-        vsa2::launch_global_topk(ab, w, cur_stream(), fused_cols);
+        vsa2::launch_global_topk(ab, w, cur_stream(), fused_cols, fused_cut_emit);
         cudaMemcpyAsync(bits_ab_p + (size_t)bh0 * NB * W, w.selbits, bits_bytes, cudaMemcpyDeviceToDevice,
                         cur_stream());
       }
@@ -297,7 +299,7 @@ std::vector<torch::Tensor> route_tiers(torch::Tensor qr, torch::Tensor kr, torch
     vsa2::TopkParams a{scores.data_ptr<float>(), NB,  bh0,                      cnt,
                        keff_a,                   q2k_ptr.data_ptr<int>(), q2k_buf.data_ptr<int>(),
                        k2q_ptr.data_ptr<int>(),  k2q_buf.data_ptr<int>()};
-    vsa2::launch_global_topk(a, w, cur_stream(), fused_cols);
+    vsa2::launch_global_topk(a, w, cur_stream(), fused_cols, fused_cut_emit);
     cudaMemcpyAsync(bits_a_p + (size_t)bh0 * NB * W, w.selbits, bits_bytes, cudaMemcpyDeviceToDevice, cur_stream());
     if (keff_ab == keff_a)
       cudaMemcpyAsync(bits_ab_p + (size_t)bh0 * NB * W, w.selbits, bits_bytes, cudaMemcpyDeviceToDevice,
