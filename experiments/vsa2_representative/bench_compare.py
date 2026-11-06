@@ -132,6 +132,10 @@ FORWARD_EQUAL = {*ALIASES, *BACKWARD_ARMS}  # one forward path by definition, so
 BYTE_EQUAL = FORWARD_EQUAL | (ROUTED_ARMS - TOLERANCE_EQUAL)  # see forward_must_match
 BACKWARD_READ_ROWS = ("kernel.tk.bwd.A", "kernel.tk.bwd.C", "fine_op.tk.A|B|C.b_direct", "full_op.tk.routed.b_direct",
                       "fine_op.tk.A|B|C.f_plus_b", "full_op.tk.routed.f_plus_b")
+# Forward outputs and selections are deterministic. Gradients are not: dQ, dK and dV are fp32 reduce-adds whose order
+# across CTAs varies, so two identical eager runs differ in about 300-1200 of 33.5M elements. Gradients are only ever
+# compared within a tolerance; a digest of one would make any arm, or an A/A run, look broken at random.
+NOT_BYTE_COMPARABLE = {"dq", "dk", "dv", "dgate"}
 HISTORICAL_LIMIT = "historical H200 measurements are from other hardware and must not be compared with this run"
 CONTROLLED_LIMITS = [
     "timing only: CFG4/5/7 are not a numerical reference and the output check is not run",
@@ -339,6 +343,14 @@ def summarize(children):
     return out
 
 
+def byte_compared_gradients(digests):
+    """Names in a forward_output digest that hold gradients; see NOT_BYTE_COMPARABLE."""
+    if not isinstance(digests, dict):
+        return set()
+    found = {k for k in digests if k.lower() in NOT_BYTE_COMPARABLE}
+    return found.union(*(byte_compared_gradients(v) for v in digests.values()))
+
+
 def control_drift(summary):
     """How far the rows that cannot move did move. Reported, because no threshold here could be justified."""
     ratios = {s["id"]: s["candidate_over_baseline"] for s in summary if s.get("control") and "candidate_over_baseline" in s}
@@ -372,6 +384,9 @@ def assemble(args_dict, profile, configs, order, children):
     claim = claims(profile, children)
     digests = [c.get("forward_output") for c in children]
     identical = None if None in digests else len({json.dumps(d, sort_keys=True) for d in digests}) == 1
+    gradients = sorted(set().union(*(byte_compared_gradients(d) for d in digests)))
+    if gradients:
+        bad = bad + [f"gradients held to byte equality ({', '.join(gradients)}); they need a tolerance"]
     if forward_must_match(configs) and identical is not True:
         bad = bad + ["forward outputs of arms defined to share one forward kernel"]
     if {c.get("REP_TK_FWD_CFG") for c in configs.values()} & BACKWARD_ARMS.keys():
@@ -683,7 +698,7 @@ def child_main(spec):
             return dict(name=name, max_err=err, scale=scale, tol_rel=tol, ok=err <= tol * max(scale, 1.0))
 
         o_t, lse_t = kernel_fwd(PHASE_ALL)()
-        forward_output = {}
+        forward_output = {}  # deterministic outputs only; see NOT_BYTE_COMPARABLE
         for name, ph in phases.items():
             o_p, lse_p = kernel_fwd(ph)()
             forward_output[name] = dict(o=digest(o_p), lse=digest(lse_p))

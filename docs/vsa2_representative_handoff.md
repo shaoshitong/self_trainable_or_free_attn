@@ -77,6 +77,44 @@ pooled branch comes first and never uses that result, so the arm adds a discarde
 written for. Its overlap path runs only where the pooled guard fails. `bench_stages.py`'s `fine.tables` row calls `tk_tables` directly
 on the main stream, so it is not expected to go to zero under CFG 38 and says nothing about an overlap.
 
+### Determinism
+
+Two eager runs on identical inputs give bit-identical forward outputs and selections, and gradients that differ in about 300-1200 of
+33.5M elements, as measured with `bench_determinism.py`. dQ, dK and dV are fp32 reduce-adds whose order across CTAs varies.
+
+The rule is that outputs and selections may be held to byte equality, and gradients only to a tolerance. Any arm whose evidence is a gradient
+comparison reads it against the eager-vs-eager difference. `forward_output` holds no gradients, and `assemble` marks a result invalid if one
+appears there, under a name in `NOT_BYTE_COMPARABLE`. "Byte-equal" in the arm model therefore never covers the backward: for a backward arm it
+means its forward. `bench_graph.py` and the output check use tolerances for gradients for this reason.
+
+### What the routed cross-check covers
+
+The check compares routed `o`, dQ, dK, dV and dgate from the TK backend against the generic backend, inside each `bench_compare.py` arm of the
+`representative` profile, at that run's shape. It exists from `b18ae56` on, so no earlier result had it. It does not run in the
+`controlled-softmax` profile (CFG 4, 5, 7), or for CFG 2 and 3, which `bench_compare.py` refuses, or in any other script.
+
+Running is not the same as verifying. Both backends share the pool pass, the router, the coarse metadata and attention, and the fusion, and
+each config applies to both, so the generic side moves with the TK side there. The check can only see what is TK-only.
+
+| Config | Change it reaches | Does the routed cross-check verify it? | What does |
+|---:|---|---|---|
+| 1, 10, 13 | the default TK fine path and backward | yes, for the TK-only parts | also the suites |
+| 36, 37 | tier-A backward store or reduce-add | yes, TK only | also the suites |
+| 42, 43 | pooled or K/V tables, TK only | yes, the only independent check at run shape | also the suites |
+| 20, 34, 35, 11, 24, 32, 33, 0, 6, 8, 9 | TK forward kernel | yes, TK only | also the suites |
+| 21, 22, 23 | TK backward | yes, TK only | also the suites |
+| 39, 40 | coarse metadata, shared | **no** | byte equality of CFG 1 vs CFG 40 |
+| 44, 45 | top-k chain order, shared | **no** | selection and byte equality of CFG 1 vs CFG 45 |
+| 46, 47 | fused column stage, shared | **no** | selection and byte equality of CFG 1 vs CFG 47 |
+| 48 | pool pass, shared | **no** | pool digests and byte equality of CFG 1 vs CFG 48 |
+| 49 | mask, cut and emit, shared | **no** | selection and byte equality of CFG 1 vs CFG 49 |
+| 41 | route replay, shared | **no** | the frozen-selection output check, and `replay_vs_eager_changed_input` |
+| 38 | superseded | not meaningful | do not re-measure |
+
+For the **no** rows, the history arm or CFG 1 is the reference, so the evidence exists only from a same-run byte comparison with the digests of
+`d5aeffa` or later, including the pool and routed `o` digests. `output_validated: true` on those arms says nothing about the shared change.
+Its tolerance is also what the check can resolve: see the first item below.
+
 ### Measurement rules
 
 Each of these cost real time.
@@ -95,6 +133,12 @@ Each of these cost real time.
 
 ### What the harness does not prove
 
+- **That a gradient is right within its stated tolerance in relative terms.** `compare` passes when `err <= tol * max(scale, 1.0)`, against the largest
+  element. When the largest element is below 1 the tolerance is an absolute 0.02 for gradients, and a wrong small element is measured against the
+  largest one. The tolerances were kept as the suites set them. Read `max_err` and `scale` in `output_check`: if `scale` is near or below 0.02, the
+  check is vacuous for that gradient.
+- **The routed operator on zero-count blocks.** `test_masked_and_empty` uses `rep_fine_attention`. The routed tests use full blocks and one partial
+  last block, so the pooled tables have not met a zero-count block in any test.
 - **That an arm took effect.** A byte-equal arm that silently does nothing looks like a neutral result. The guards read source, not the
   compiled extension. A result cannot claim a change if a source is newer than the extension, but that compares file times only.
 - **That outputs match below their resolution.** Digests resolve bf16 `o` and fp32 `lse`, and cross-checks are tolerances.

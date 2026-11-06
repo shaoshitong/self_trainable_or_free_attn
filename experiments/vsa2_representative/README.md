@@ -65,6 +65,7 @@ bench_stages.py             measurement-only stages of the full operator's forwa
 bench_bwd_stages.py         measurement-only stages of one backward() call
 bench_graph.py              measurement-only eager F+B vs a CUDA graph replay of it
 bench_route_graph.py        measurement-only route-only CUDA graph probe
+bench_determinism.py        measurement-only eager-vs-eager determinism probe
 bench_tables.py             measurement-only table-build vs log-count timing split
 one_launch.py               one generic or TK kernel after warmup, for a profiler to select by name
 ```

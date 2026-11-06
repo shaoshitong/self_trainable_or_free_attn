@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from bench_bwd_stages import ZEROS, attribute as attribute_backward, batches, fill_absent, intervals
 from bench_graph import GRAPH_ROWS, attribute as attribute_graph, compare_outputs, row as graph_row
 from bench_stages import attribute, compare_stages
-from bench_compare import (ALIASES, HISTORY_ARMS, control_drift, BACKWARD_READ_ROWS, launch_bound, FWD_CFGS, PROFILES, abba, active_fwd_cfg, arms_error, assemble,
+from bench_compare import (ALIASES, HISTORY_ARMS, byte_compared_gradients, control_drift, BACKWARD_READ_ROWS, launch_bound, FWD_CFGS, PROFILES, abba, active_fwd_cfg, arms_error, assemble,
                            backward_row_is_control, cfg_error, claims, forward_must_match, fwd_dispatch, fwd_kernel_name,
                            parse_config, summarize)
 
@@ -231,6 +231,15 @@ def test_router_pass_arms_are_byte_equal_against_cfg1_only():
         for c in (a, b):
             c["rows"] += [dict(id=r, ms=[1.0], meta=c["rows"][0]["meta"]) for r in ("full_op.tk.routed.f", "full_op.tk.routed.f_plus_b")]
         assert assemble({}, "representative", pair("1", value), [], [a, b])["status"].startswith("invalid"), "a pool byte moved"
+
+
+def test_gradients_are_never_held_to_byte_equality():
+    assert byte_compared_gradients({"A": dict(o="x", lse="y"), "pool": ["z"], "full_op": dict(o="x")}) == set()
+    assert byte_compared_gradients({"full_op": dict(o="x", dQ="y"), "dgate": "z"}) == {"dQ", "dgate"}
+    a, b = child("baseline", 1), child("candidate", 1)
+    a["forward_output"] = b["forward_output"] = {"full_op": dict(dk="same")}
+    res = assemble({}, "representative", {}, [], [a, b])
+    assert res["status"].startswith("invalid") and "need a tolerance" in res["status"], "even when the digests happen to match"
 
 
 def test_comparisons_that_change_two_things_are_refused():
@@ -484,6 +493,7 @@ if __name__ == "__main__":
     test_history_and_alias_arms_are_registered()
     test_routed_arms_read_host_code_and_keep_full_op_timing_visible()
     test_router_pass_arms_are_byte_equal_against_cfg1_only()
+    test_gradients_are_never_held_to_byte_equality()
     test_comparisons_that_change_two_things_are_refused()
     test_evidence_must_be_code_that_reads_the_config()
     test_passing_outputs_are_not_reported_as_a_passing_comparison()
