@@ -234,15 +234,19 @@ std::vector<torch::Tensor> route_tiers(torch::Tensor qr, torch::Tensor kr, torch
                         std::strcmp(std::getenv("REP_TK_FWD_CFG"), "44") == 0 && (keff_ab != keff_a);
   torch::Tensor ws2, ab_k2q_buf2;
   vsa2::TopkWorkspace w2{};
-  cudaStream_t s2 = nullptr;
-  cudaEvent_t ev_scores = nullptr, ev_ab = nullptr;
+  // Created once per process: creating and destroying a stream plus two events on every routing call cost more
+  // than the launch gaps this arm is trying to fill (that is what made the first attempt look unstable).
+  static cudaStream_t s2 = nullptr;
+  static cudaEvent_t ev_scores = nullptr, ev_ab = nullptr;
   if (parallel) {
     ws2 = torch::empty({(long long)vsa2::topk_workspace_bytes(chunk, NB)}, qr.options().dtype(torch::kUInt8));
     vsa2::topk_carve_workspace(ws2.data_ptr(), chunk, NB, &w2);
     ab_k2q_buf2 = torch::empty_like(k2q_buf);
-    cudaStreamCreateWithFlags(&s2, cudaStreamNonBlocking);
-    cudaEventCreateWithFlags(&ev_scores, cudaEventDisableTiming);
-    cudaEventCreateWithFlags(&ev_ab, cudaEventDisableTiming);
+    if (s2 == nullptr) {
+      cudaStreamCreateWithFlags(&s2, cudaStreamNonBlocking);
+      cudaEventCreateWithFlags(&ev_scores, cudaEventDisableTiming);
+      cudaEventCreateWithFlags(&ev_ab, cudaEventDisableTiming);
+    }
     check_launch();
   }
 
@@ -287,11 +291,8 @@ std::vector<torch::Tensor> route_tiers(torch::Tensor qr, torch::Tensor kr, torch
     }
     check_launch();
   }
-  if (parallel) {
-    cudaEventDestroy(ev_scores);
-    cudaEventDestroy(ev_ab);
-    cudaStreamDestroy(s2);  // the join above already ordered the main stream behind every A|B kernel
-  }
+  // The per-iteration join above already ordered the main stream behind every A|B kernel; the stream and the
+  // events outlive the call on purpose.
   const long long used = std::max<long long>(1, (long long)BH * keff_a);
   auto b_ptr = torch::empty({B, H, NB + 1}, i32);
   auto b_idx = torch::empty({std::max<long long>(1, (long long)BH * (keff_ab - keff_a))}, i32);
