@@ -352,22 +352,30 @@ CUDA_VISIBLE_DEVICES=0 /opt/venv/bin/python fwd_cfg.py
 CUDA_VISIBLE_DEVICES=0 /opt/venv/bin/python bwdc_split.py
 ```
 
-Forward configurations:
+Forward configurations, with D=128 `ptxas` resources from a fresh build of source `3c291f2`:
 
-```text
-REP_TK_FWD_CFG=1                 production kernel, TK-vector softmax (candidate; the kernel's default)
-REP_TK_FWD_CFG=6                 same template, grid, SMEM and tier stream, previous hand-written softmax (control)
-REP_TK_FWD_CFG=0                 production kernel at MINB 4
-REP_TK_FWD_CFG=2, 3              tier-A-only specialisation at MINB 4, 3; other phases run the default kernel
-REP_TK_FWD_CFG=4                 diagnostic copied native loop, native softmax
-REP_TK_FWD_CFG=5                 diagnostic copied native loop, previous hand-written softmax
-REP_TK_FWD_CFG=7                 diagnostic copied native loop, TK-vector softmax
-REP_TK_BWDC_SPLITS=<positive>    force tier-C query split count
-```
+| CFG | Kernel | Softmax | MINB | Registers | Stack bytes |
+|---:|---|---|---:|---:|---:|
+| 1 (default) | `fwd_ker`, all tiers | TK vector | 3 | 168 | 24 |
+| 6 | `fwd_ker`, all tiers | hand-written | 3 | 168 | 16 |
+| 8 | `fwd_ker`, all tiers | TK vector | 2 | not built yet | not built yet |
+| 9 | `fwd_ker`, all tiers | hand-written | 2 | not built yet | not built yet |
+| 0 | `fwd_ker`, all tiers | TK vector | 4 | 128 | 184 |
+| 2 | `fwd_ker`, `A_ONLY` | TK vector | 4 | 128 | 8 |
+| 3 | `fwd_ker`, `A_ONLY` | TK vector | 3 | 160 | 0 |
+| 4 | `nat_copy_ker` | native | 4 | 128 | 0 |
+| 5 | `nat_copy_ker` | hand-written | 4 | 126 | 40 |
+| 7 | `nat_copy_ker` | TK vector | 4 | 128 | 0 |
+
+CFG 2/3 use their `A_ONLY` kernel only for `phases=A`; other phases run the default kernel. CFG 8/9 change
+only MINB relative to CFG 1/6. `REP_TK_BWDC_SPLITS=<positive>` forces the tier-C query split count. Without
+it, the split at D=128 is `min(2 * SMs / (tail_tiles * H * B), NB / 16)` with integer division. At 16K, H=16
+and B=1 there are 4 tail tiles, so 132 SMs give a split of 4.
 
 `REP_TK_FWD_CFG` is cached on first use, so one process measures one value. A value the kernel does not
 dispatch on silently runs the default kernel, so `bench_compare.py`, `bench_tk.py` and `fwd_cfg.py` refuse a
-value missing from the kernel source on disk, for example CFG 6 or 7 on a build from before they existed.
+value missing from the kernel source on disk, for example CFG 8 or 9 on a build from before they existed. The check looks for `cfg == <value>` in
+`rep_tk.cu`.
 
 CFG 4/5/7 are measurement code. They ignore `phases` and run tier A only, write no `lse` and do not mask
 padded output, so they are timing diagnostics and never a numerical reference. `fwd_cfg.py` prints only
@@ -413,6 +421,7 @@ ThunderKittens commit are recorded.
 | `stage=b_direct` | measured backward: fresh graph per sample, forward finished before the interval, grads reset after it |
 | `stage=b_estimate` | `median(f_plus_b) - median(f)`, `measured=false`, an estimate |
 | `work=tier_a_only` | 10% of the pairs; not equivalent to the 64/4/1 operator |
+| `work=tier_b_only`, `tier_c_only`, `tier_subset` | part of the tile stream, tables prebuilt; locates cost, and these rows do not add up to `A\|B\|C` |
 | `control=true` | does not read the compared setting; a ratio away from 1 is run drift |
 
 Backward kernels and table builds do not read `REP_TK_FWD_CFG`, so their kernel rows are controls in a
@@ -437,18 +446,50 @@ Helper checks, no GPU, build or `torch`:
 python3 tests/test_bench_compare_cpu.py
 ```
 
-Minimal H100 (sm_90) matrix, in order, at 16K/H16/D128/RM4 unless stated. No H100 results exist yet.
+### Profiling one kernel
 
-| # | Purpose | Build | Run | Gate before the next step |
-|---:|---|---|---|---|
-| 1 | baseline correctness | exact baseline kernel | CPU, generic and TK suites | all pass, or each failure is explained |
-| 2 | candidate correctness | candidate kernel | same suites | all pass, or each failure is explained |
-| 3 | noise floor | candidate | CFG 1 vs CFG 1 | controls and A/A ratios near 1; sets the smallest resolvable difference |
-| 4 | complete operator | candidate | CFG 6 vs CFG 1 | `output_validated` true; difference above the A/A floor |
-| 5 | locate the softmax cost | candidate | CFG 4 vs 5, CFG 4 vs 7 | timing only |
-| 6 | one longer length, only if step 4 is above the floor | candidate | 64K: CFG 1 vs CFG 1, then CFG 6 vs CFG 1 | same gates |
+`one_launch.py <stage> [reps]` runs one kernel after 10 warmup launches, on deterministic 16K/H16/D128/RM4
+inputs, with tables and intermediates built first. The profiler selects the kernel by name, and the script
+prints the stage, shape, configuration, kernel name and per-name invocation numbers.
 
-The comparisons need the candidate build: the exact baseline kernel has no CFG 6 or 7.
+| Stage | Kernel | Work |
+|---|---|---|
+| `tk_fwd_abc` | `fwd_ker` | all tiers |
+| `tk_fwd_b`, `tk_fwd_c` | `fwd_ker` | partial: one tier |
+| `tk_bwd_b`, `tk_bwd_c` | `bwd_b_ker`, `bwd_c_ker` | partial: one tier |
+
+```bash
+REP_TK_FWD_CFG=1 <gpu-runner> python one_launch.py tk_fwd_abc
+```
+
+It is for kernel-scope diagnosis. It does no timing, is not a correctness check and is not a full-operator
+benchmark. It refuses CFG values that do not run all tiers. The generic stages remain available.
+
+### H100 status
+
+Round 2, source `3c291f2`, 16K/H16/D128/RM4: the fresh build and the CPU, generic and TK suites passed, the
+TK suite also with CFG 6. CFG 6 vs CFG 1 gave no measured operator improvement above A/A displacement: routed
+full-operator F+B ratio 1.002 against an A/A ratio of 0.997. No second length was run.
+
+Next matrix, one variable per row, at the same shape and on one build containing CFG 8/9:
+
+| # | Variable | Run | When |
+|---:|---|---|---|
+| 1 | none (noise floor) | CFG 1 vs CFG 1 | always; a new build needs its own floor |
+| 2 | MINB 3 to 2, vector softmax | CFG 1 vs CFG 8 | always |
+| 3 | MINB 3 to 2, hand-written softmax | CFG 6 vs CFG 9 | if row 2 clears the floor, or to see whether the softmax changes the MINB effect |
+| 4 | tier-C split | CFG 1 vs `REP_TK_FWD_CFG=1,REP_TK_BWDC_SPLITS=4` | only if `multi_processor_count` in the result is not 132; with 132 SMs the default is already 4 and this repeats row 1 |
+
+```bash
+<gpu-runner> python bench_compare.py --baseline REP_TK_FWD_CFG=1 --candidate REP_TK_FWD_CFG=1 --out results/raw/aa.json
+<gpu-runner> python bench_compare.py --baseline REP_TK_FWD_CFG=1 --candidate REP_TK_FWD_CFG=8 --out results/raw/cfg1-cfg8.json
+<gpu-runner> python bench_compare.py --baseline REP_TK_FWD_CFG=6 --candidate REP_TK_FWD_CFG=9 --out results/raw/cfg6-cfg9.json
+<gpu-runner> python bench_compare.py --baseline REP_TK_FWD_CFG=1 --candidate REP_TK_FWD_CFG=1,REP_TK_BWDC_SPLITS=4 --out results/raw/split4.json
+```
+
+The result that matters is measured `A|B|C` kernel, fine-op and full-op F+B against the A/A displacement.
+Partial rows and profiler output locate cost, and adding them does not produce a measured total. CFG 8/9 also
+need the suites to pass on their build before any claim.
 
 ## 8. Measured evidence
 
@@ -554,9 +595,10 @@ Successful `--check` would prove textual applicability only, not correctness.
   terminated by exact PID/argv/cwd validation rather than by touching unrelated processes.
 - **Mid-table swizzle phase.** Tier-B records are pre-swizzled for each start phase a slot can take.
   Tests un-swizzle the stored table and compare it bit-exactly with plain bf16 group means.
-- **Register spill/pressure.** Forward launch bounds and path specialization were tuned. The target
-  forward specialization reports 128 registers with no stack spill; the diagnostic generic
-  min-blocks choice spilled. Recheck resource output after every future kernel edit.
+- **Register spill/pressure, not resolved for the all-tier path.** An earlier note here reported 128
+  registers and no spill for the target forward. That does not describe the all-tier kernel: at D=128, CFG 1
+  and CFG 6 use 168 registers and spill (see the table in section 7). Recheck resource output after every
+  kernel edit.
 - **Tier-C backward under-occupancy.** One CTA per tail tile gave only 64 CTAs at 16K/H16. Splitting
   each tile's query range across CTAs reduced measured tier-C backward from 0.792 to 0.247 ms.
 - **Tier-B dependency/load ordering.** Table indices are read into registers before issuing volatile

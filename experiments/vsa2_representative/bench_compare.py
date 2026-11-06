@@ -7,15 +7,17 @@ whose extension, sources, inputs, selection, shape or timing settings differ.
 
 Profiles (see docs/vsa2_representative_handoff.md, section 7):
 
-  representative      production semantics, diag=0, warmup 10, iters 30. Default arms: CFG6 (the production
-                      kernel with the previous hand-written softmax) vs CFG1 (TK-vector softmax). Kernel,
+  representative      all-tier fwd_ker, diag=0, warmup 10, iters 30. Default arms: CFG6 (hand-written softmax)
+                      vs CFG1 (TK-vector softmax), both MINB 3. CFG8/9 are the same pair at MINB 2. Kernel,
                       fine-op and full-operator scope. Output cross-checked against the generic backend.
   controlled-softmax  CFG 4/5/7, warmup 10, iters 50, kernel forward only. TIMING ONLY: these kernels run
                       tier A whatever `phases` says, write no lse and do not mask padded output.
 
 What each number is:
 
-  kernel            one kernel with its tables prebuilt; never a complete call, and stages are never summed
+  kernel            one kernel with its tables prebuilt; never a complete call, and stages are never summed.
+                    Forward rows with work="tier_b_only", "tier_c_only" or "tier_subset" run part of the
+                    tile stream: they locate cost, and their times do not add up to the A|B|C row.
   fine_op, full_op  a complete autograd call. full_op adds router, coarse branch and gate.
   f                 forward; the graph is built on the same leaves as f_plus_b and dropped
   f_plus_b          MEASURED forward + backward + grad reset, no synchronize inside the loop
@@ -53,9 +55,11 @@ HERE = Path(__file__).resolve().parent
 TUNABLES = ("REP_TK_FWD_CFG", "REP_TK_BWDC_SPLITS")
 # What each REP_TK_FWD_CFG value runs. Only "operator" values compute the 64/4/1 operator.
 FWD_CFGS = {
-    "0": ("operator", "production kernel at MINB 4, TK-vector softmax"),
-    "1": ("operator", "production kernel, TK-vector softmax (candidate; the kernel's default)"),
-    "6": ("operator", "production template, grid, SMEM and tier stream, previous hand-written softmax (control)"),
+    "0": ("operator", "fwd_ker: TK-vector softmax, MINB 4"),
+    "1": ("operator", "fwd_ker: TK-vector softmax, MINB 3 (the kernel's default)"),
+    "6": ("operator", "fwd_ker: hand-written softmax, MINB 3"),
+    "8": ("operator", "fwd_ker: TK-vector softmax, MINB 2"),
+    "9": ("operator", "fwd_ker: hand-written softmax, MINB 2"),
     "2": ("tier_a_path", "tier-A-only specialisation at MINB 4; other phases run the default kernel"),
     "3": ("tier_a_path", "tier-A-only specialisation at MINB 3; other phases run the default kernel"),
     "4": ("timing_only", "copied native loop, native softmax"),
@@ -137,7 +141,8 @@ def summarize(children):
     rows = {}
     for child in children:
         for row in child["rows"]:
-            arms = rows.setdefault(row["id"], {"meta": row["meta"], "baseline": [], "candidate": []})
+            arms = rows.setdefault(row["id"], {"meta": dict(row["meta"]), "baseline": [], "candidate": []})
+            arms["meta"]["control"] = arms["meta"]["control"] and row["meta"]["control"]  # in every arm
             arms[child["arm"]].extend(row["ms"])
     out = []
     median = {}
@@ -370,9 +375,10 @@ def child_main(spec):
     add("kernel.tk.fwd.A", "kernel", "fwd", "tk", "tier_a_only", False, loop(kernel_fwd(PHASE_A), W, I, N))
     output_check = None
     if spec["profile"] == "representative":
-        for name, ph in (("A|B", PHASE_A | PHASE_B), ("A|B|C", PHASE_ALL), ("B|C", PHASE_B | PHASE_C)):
-            add(f"kernel.tk.fwd.{name}", "kernel", "fwd", "tk", "64/4/1" if ph == PHASE_ALL else "tier_subset", False,
-                loop(kernel_fwd(ph), W, I, N))
+        for name, ph, work in (("A|B", PHASE_A | PHASE_B, "tier_subset"), ("A|B|C", PHASE_ALL, "64/4/1"),
+                               ("B|C", PHASE_B | PHASE_C, "tier_subset"), ("B", PHASE_B, "tier_b_only"),
+                               ("C", PHASE_C, "tier_c_only")):
+            add(f"kernel.tk.fwd.{name}", "kernel", "fwd", "tk", work, False, loop(kernel_fwd(ph), W, I, N))
         gtab = C.rep_build(k, v, cnt, rm)
         add("kernel.generic.fwd.A|B|C", "kernel", "fwd", "generic", "64/4/1", True,
             loop(lambda: C.rep_attn_fwd(q, k, v, *gtab, qp, qi, sel.bits_a, sel.bits_ab, cnt, rm, PHASE_ALL, 0), W, I, N))
@@ -468,6 +474,7 @@ def child_main(spec):
     identity = dict(
         hardware=dict(name=torch.cuda.get_device_name(0), capability=list(torch.cuda.get_device_capability(0)),
                       uuid_sha256=hashlib.sha256(str(getattr(props, "uuid", "")).encode()).hexdigest(), total_memory=props.total_memory,
+                      multi_processor_count=getattr(props, "multi_processor_count", None),
                       driver=capture("nvidia-smi", *smi_target(), "--query-gpu=driver_version", "--format=csv,noheader")),
         software=dict(python=platform.python_version(), torch=torch.__version__, cuda=torch.version.cuda,
                       nvcc=(capture("nvcc", "--version") or "").splitlines()[1:2]),

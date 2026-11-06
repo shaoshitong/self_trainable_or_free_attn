@@ -10,9 +10,9 @@ that no row silently includes work another one omits:
            This script has no directly timed backward; bench_compare.py's b_direct rows do.
 
 The "=>" backward lines add separately timed kernels. They are sums, not measured complete calls.
-One run measures one REP_TK_FWD_CFG: 1 (TK-vector softmax, the default), 6 (the production kernel with the
-previous hand-written softmax) or 0 (MINB 4). bench_compare.py compares two of them in one build and writes
-a machine-readable result; do not compare separate runs of this script as a same-build result.
+One run measures one all-tier REP_TK_FWD_CFG, printed in the header (see the table in bench_compare.py).
+bench_compare.py compares two of them in one build and writes a machine-readable result; do not compare
+separate runs of this script as a same-build result.
 
 The native TK rows are VSA2's own fine kernels on the tier-A lists -- the 10% budget VSA2 keeps, with
 the other 90% of the pairs dropped. They are the baseline every three-tier row is compared against.

@@ -61,7 +61,7 @@ vsa2_rep/reference.py       pure-PyTorch reference (fp64) + bitmap pack/unpack
 tests/test_reference_cpu.py representative softmax semantics, no GPU and no build needed
 tests/test_gpu.py           kernels vs the reference: routing, tables, forward, backward, unpool
 bench.py / prof.py          end-to-end comparison / per-kernel breakdown with measured scopes
-one_launch.py               single launch of one kernel, for a profiler
+one_launch.py               one generic or TK kernel after warmup, for a profiler to select by name
 ```
 
 The three-tier kernels are this package's own; the pooling, router, global top-k, generic fine
