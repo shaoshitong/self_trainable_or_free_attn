@@ -50,6 +50,13 @@ until the checks in section 9 pass.
 No algorithm implementation or GPU test was added during release packaging. This branch is an
 organized snapshot plus handoff.
 
+The first packaged snapshot on this branch was already published before the handoff was resumed.
+Because publishing this release was explicitly authorized and the snapshot is public, the resumed
+session preserves that commit rather than rewriting it or force-pushing the branch. Any follow-up
+release commit is authored with the verified GitHub account identity; no upstream commit metadata or
+placeholder WIP identity is reused. The top-level README now scopes its older Triton "ordinary pointer
+loads" statement separately from this package's implemented ThunderKittens/TMA data path.
+
 ## 2. Operator and softmax semantics
 
 The fine branch is a three-tier approximation of VSA2's block-sparse attention:

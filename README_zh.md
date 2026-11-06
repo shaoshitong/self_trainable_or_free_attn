@@ -2,6 +2,10 @@
 
 [调度用法与实测结果](docs/vsa2_splitkv.md) · [交互动画](docs/animations/vsa2-load-balance-standalone.html) · [Canvas](docs/animations/vsa2-load-balance.canvas.tsx)
 
+本分支同时发布实验性的 VSA2 **64/4/1 代表块**包。其 H100 ThunderKittens 后端对 tier A 和连续的 tier C 表使用
+tensor TMA，对预 swizzle 的 tier B 表使用一维 `cp.async.bulk`。实现边界、复现命令、实测和未验证项见
+[实现与交接文档](docs/vsa2_representative_handoff.md)；这条路径与下文 EchoSparse 的 Triton 实现相互独立。
+
 <div align="center">
 
 <h1>EchoSparse</h1>
@@ -57,7 +61,8 @@ CFG 分支保存上一步的 LSE，在同一个注意力 kernel 里用到三处�
 Triton kernel 从每个 query tile 的两个短列表读取补偿列：用平均值代表的块和细化的块，在展开选块时写出。与逐块掩码相比，
 列和权重都相同，只是省去了被掩掉的计算，求和顺序不同。RTX 5090 kernel 把每个 64-token 块分成两个 32-key 的半块计算，
 每次 32 个补偿列；H100 kernel 用 8 个 warp 整块计算 64-token 块，每次 128 个补偿列，并在稀疏步把精确块循环做三级软件流水，
-让 K / V 的读取与点积重叠；它使用普通的指针访存，不使用 TMA。
+让 K / V 的读取与点积重叠；这个 Triton 实现使用普通的指针访存。上面链接的独立 VSA2 代表块 kernel 在 H100 上使用
+tensor TMA 和异步 bulk copy。
 
 ## 结果
 
@@ -111,6 +116,7 @@ Sol-Engine 的对角阈值估计会计算 21–25% 的 KV 块。按上图的模�
 - [x] 将 EchoSparse 适配到 NVIDIA H100（SM90）。
 - [x] 给出 Wan2.1-1.3B 在 H100 上的首轮端到端结果。
 - [x] 原生 CUDA VSA 与 VSA2：在 H100（SM90）和 RTX 5090（SM120）上支持前向与反向。
+- [x] 增加实验性的 H100 VSA2 64/4/1 代表块 ThunderKittens/TMA 前后向路径。
 - [ ] 将 EchoSparse 适配到 NVIDIA RTX 4090（SM89）。
 - [ ] 用 TMA 实现生产者-消费者结构，进一步减少访存停顿。
 

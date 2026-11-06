@@ -18,6 +18,12 @@
 This repository contains the EchoSparse implementation and experimental **H100 VSA2 split-KV scheduling**.
 The default schedule remains unsplit; automatic scheduling is opt-in. See the [usage and measured results](docs/vsa2_splitkv.md).
 
+This branch also publishes the experimental VSA2 **64/4/1 representative-block** package. Its H100
+ThunderKittens backend uses tensor TMA for tier A and the contiguous tier C table, plus 1-D
+`cp.async.bulk` for the pre-swizzled tier B table. See the
+[implementation and handoff](docs/vsa2_representative_handoff.md). This is distinct from the
+EchoSparse Triton path described below.
+
 - [Interactive animation — standalone HTML](docs/animations/vsa2-load-balance-standalone.html)
 - [Canvas component](docs/animations/vsa2-load-balance.canvas.tsx) · [animation source and checks](docs/animations/README.md)
 
@@ -75,7 +81,8 @@ same weights as a masked pass over every block, without the masked-out work; onl
 The RTX 5090 kernel computes each 64-token block as two 32-key halves and 32 compensation columns at a time. The H100
 kernel computes whole 64-token blocks with 8 warps, 128 compensation columns at a time, and in sparse steps
 software-pipelines the exact-block loop over three stages so that the K / V gathers overlap the dots; it uses
-ordinary pointer loads, not TMA.
+ordinary pointer loads in that Triton implementation. The separate VSA2 representative-block kernel linked above
+does use tensor TMA and asynchronous bulk copies on H100.
 
 ## Results
 
@@ -133,6 +140,7 @@ while running 1.12–1.54× faster.
 - [x] Adapt EchoSparse to NVIDIA H100 (SM90).
 - [x] Report initial end-to-end H100 results for Wan2.1-1.3B.
 - [x] Native CUDA VSA and VSA2, forward and backward, on H100 (SM90) and RTX 5090 (SM120).
+- [x] Add the experimental H100 VSA2 64/4/1 representative-block ThunderKittens/TMA forward and backward path.
 - [ ] Adapt EchoSparse to NVIDIA RTX 4090 (SM89).
 - [ ] Develop a producer-consumer architecture using TMA to reduce memory stalls further.
 
