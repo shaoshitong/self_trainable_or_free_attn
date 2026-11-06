@@ -470,10 +470,11 @@ class _RepAttentionFunction(torch.autograd.Function):
                 tab0 = C.rep_tk_build(k, v, blk_cnt, tiers.mid_reps)
         if sel_in is None:
             ba, bab = tiers.budgets(nb)
-            outs = (_route_tiers_graphed(C, qr, kr, blk_cnt, R, ba, bab, ROW_NORMS[row_norm], max_score_bytes)
+            # row_norm arrives already resolved to its integer code (see rep_attention); do not remap it.
+            outs = (_route_tiers_graphed(C, qr, kr, blk_cnt, R, ba, bab, row_norm, max_score_bytes)
                     if _route_graph_enabled() else None)
             if outs is None:
-                outs = C.route_tiers(qr, kr, blk_cnt, R, ba, bab, ROW_NORMS[row_norm], max_score_bytes)
+                outs = C.route_tiers(qr, kr, blk_cnt, R, ba, bab, row_norm, max_score_bytes)
             sel = TierSelection(*outs)
         else:
             sel = sel_in
