@@ -60,7 +60,7 @@ def main():
     nb = L // 64
     torch.manual_seed(0)
     q, k, v = (torch.randn(B, H, L, D, device=dev, dtype=dt).contiguous().requires_grad_(True) for _ in range(3))
-    gate = torch.randn(B, H, nb, device=dev, dtype=torch.float32).requires_grad_(True)
+    gate = (0.1 * torch.randn(B, H, L, device=dev)).to(dt).requires_grad_(True)  # per token, as bench_compare builds it
     cnt = torch.full((nb,), 64, dtype=torch.int32, device=dev)
     tiers = RepTiers(0.10, 0.20, rm)
 
