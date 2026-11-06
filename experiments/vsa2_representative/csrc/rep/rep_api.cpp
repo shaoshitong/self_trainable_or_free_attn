@@ -239,14 +239,18 @@ std::vector<torch::Tensor> route_tiers(torch::Tensor qr, torch::Tensor kr, torch
   // than the launch gaps this arm is trying to fill (that is what made the first attempt look unstable).
   static cudaStream_t s2 = nullptr;
   static cudaEvent_t ev_scores = nullptr, ev_ab = nullptr;
+  static int s2_device = -1;
   if (parallel) {
     ws2 = torch::empty({(long long)vsa2::topk_workspace_bytes(chunk, NB)}, qr.options().dtype(torch::kUInt8));
     vsa2::topk_carve_workspace(ws2.data_ptr(), chunk, NB, &w2);
     ab_k2q_buf2 = torch::empty_like(k2q_buf);
-    if (s2 == nullptr) {
-      cudaStreamCreateWithFlags(&s2, cudaStreamNonBlocking);
+    int device = -1;
+    cudaGetDevice(&device);
+    if (s2 == nullptr || s2_device != device) {  // a stream belongs to the device that created it
+      cudaStreamCreateWithFlags(&s2, cudaStreamNonBlocking);  // the previous one is left alone: it may be in use
       cudaEventCreateWithFlags(&ev_scores, cudaEventDisableTiming);
       cudaEventCreateWithFlags(&ev_ab, cudaEventDisableTiming);
+      s2_device = device;
     }
     check_launch();
   }
