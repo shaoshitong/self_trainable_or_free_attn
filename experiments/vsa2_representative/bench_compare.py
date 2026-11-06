@@ -123,8 +123,12 @@ def cfg_error(value, source):
         return f"REP_TK_FWD_CFG={value} is not in the config table"
     if not re.search(r"\bcfg == 20\b", source):
         return "this kernel source has no CFG20 history arm; the config table does not describe it"
-    if value not in ALIASES and not re.search(rf"\w*cfg\w* == {value}\b", source):
+    if value not in ALIASES and value not in BACKWARD_ARMS and not re.search(rf"\w*cfg\w* == {value}\b", source):
         return f"REP_TK_FWD_CFG={value} is not implemented by this kernel source"
+    # A backward-only arm has no forward dispatch line: its evidence is the backward code that reads the
+    # config. Checking that token keeps the guard honest instead of exempting the arm outright.
+    if value in BACKWARD_ARMS and not re.search(rf"rep_cfg\(\) == {value}\b", source):
+        return f"REP_TK_FWD_CFG={value} is not implemented by the backward path"
     if value in ("10", "13", "20", *BACKWARD_ARMS):
         table = fwd_dispatch(source)
         if not table:
