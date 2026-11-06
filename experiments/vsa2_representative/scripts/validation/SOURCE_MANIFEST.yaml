@@ -1,0 +1,249 @@
+{
+  "schema": "vsa2-representative-source-v1",
+  "source_commit": "efe5503bfa74dd23dcb96cd9173e72f963be76c2",
+  "kind": "exact baseline",
+  "files": [
+    {
+      "path": "LICENSE",
+      "flat": "LICENSE",
+      "bytes": 11358,
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "origin": "git:efe5503bfa74dd23dcb96cd9173e72f963be76c2"
+    },
+    {
+      "path": "csrc/vsa/common.cuh",
+      "flat": "repbase_001_common.cuh",
+      "bytes": 6521,
+      "sha256": "20ee2d58292c2a7064ce3a00f610ccd8a399f74aa7223730ad9dac2e16a39570",
+      "origin": "git:efe5503bfa74dd23dcb96cd9173e72f963be76c2"
+    },
+    {
+      "path": "csrc/vsa/fuse.cu",
+      "flat": "repbase_002_fuse.cu",
+      "bytes": 9252,
+      "sha256": "319b87af001e5ec21c7f9341c3224fb05a8b13b63bc5174eb17d91ba52760394",
+      "origin": "git:efe5503bfa74dd23dcb96cd9173e72f963be76c2"
+    },
+    {
+      "path": "csrc/vsa/generic/attn_bwd.cu",
+      "flat": "repbase_003_attn_bwd.cu",
+      "bytes": 19039,
+      "sha256": "7b5e642fae3fdaf80aff2c8c2ffe09ea5b0f90f112100807c1393e0ed3243a5c",
+      "origin": "git:efe5503bfa74dd23dcb96cd9173e72f963be76c2"
+    },
+    {
+      "path": "csrc/vsa/generic/attn_fwd.cu",
+      "flat": "repbase_004_attn_fwd.cu",
+      "bytes": 11289,
+      "sha256": "5adfdbd62aba30e813d4ef7835f4c1f5a996aa5e172ee017f57e080fed7ea403",
+      "origin": "git:efe5503bfa74dd23dcb96cd9173e72f963be76c2"
+    },
+    {
+      "path": "csrc/vsa/router/pool.cu",
+      "flat": "repbase_005_pool.cu",
+      "bytes": 2576,
+      "sha256": "0852476f1ca4f8ffd6068eee1776bd4c00f5792935c470fd751ca256aa0e21c4",
+      "origin": "git:efe5503bfa74dd23dcb96cd9173e72f963be76c2"
+    },
+    {
+      "path": "csrc/vsa/router/router.cu",
+      "flat": "repbase_006_router.cu",
+      "bytes": 8865,
+      "sha256": "5989ab1a2011f5c8eafe3474cb2fb23f25a1fef78a1b29ca361cf85485588148",
+      "origin": "git:efe5503bfa74dd23dcb96cd9173e72f963be76c2"
+    },
+    {
+      "path": "csrc/vsa/router/scores.cu",
+      "flat": "repbase_007_scores.cu",
+      "bytes": 3339,
+      "sha256": "be88e6b0695c26d5a64f9edd7952948817cccf1a940f4bc0a67952e7632c58c4",
+      "origin": "git:efe5503bfa74dd23dcb96cd9173e72f963be76c2"
+    },
+    {
+      "path": "csrc/vsa/router/topk.cu",
+      "flat": "repbase_008_topk.cu",
+      "bytes": 20720,
+      "sha256": "8c20bf18309742fedea0cc6790333148ed202638d3fefea290ba0a7b370d77b0",
+      "origin": "git:efe5503bfa74dd23dcb96cd9173e72f963be76c2"
+    },
+    {
+      "path": "csrc/vsa/sm90_tk/fine_tk_h100.cu",
+      "flat": "repbase_009_fine_tk_h100.cu",
+      "bytes": 28933,
+      "sha256": "4b30bc9803334c62ad9ae12342d76f1cb4ebf981e237c83c2393b07eaea44ec9",
+      "origin": "git:efe5503bfa74dd23dcb96cd9173e72f963be76c2"
+    },
+    {
+      "path": "csrc/vsa/split.cu",
+      "flat": "repbase_010_split.cu",
+      "bytes": 9826,
+      "sha256": "246e552c9cd07439aad6bc84954a269feec1dda60bffddbc30a6f8bdfcddc6e1",
+      "origin": "git:efe5503bfa74dd23dcb96cd9173e72f963be76c2"
+    },
+    {
+      "path": "csrc/vsa/vsa2_api.cpp",
+      "flat": "repbase_011_vsa2_api.cpp",
+      "bytes": 42449,
+      "sha256": "b8b28ee1b37543b4255474e5d7287086378f3cb2aa1a1e7a905f3b0e1222a9d9",
+      "origin": "git:efe5503bfa74dd23dcb96cd9173e72f963be76c2"
+    },
+    {
+      "path": "csrc/vsa/vsa2_kernels.h",
+      "flat": "repbase_012_vsa2_kernels.h",
+      "bytes": 12445,
+      "sha256": "81f4c580b3225fd899874144599bf2ad36b030da5ca2e74c04ceecbb5909657d",
+      "origin": "git:efe5503bfa74dd23dcb96cd9173e72f963be76c2"
+    },
+    {
+      "path": "experiments/vsa2_representative/bench_tk.py",
+      "flat": "repbase_013_bench_tk.py",
+      "bytes": 7960,
+      "sha256": "d08cc6e9359e244c8a584e20da95d85dc018efbf2de3230a33c157c6389272de",
+      "origin": "git:efe5503bfa74dd23dcb96cd9173e72f963be76c2"
+    },
+    {
+      "path": "experiments/vsa2_representative/csrc/rep/rep_api.cpp",
+      "flat": "repbase_014_rep_api.cpp",
+      "bytes": 30539,
+      "sha256": "c82033a13e6e93a7f4cf90bdf4ff014654b22a2f8702d69846add7cf0e801993",
+      "origin": "git:efe5503bfa74dd23dcb96cd9173e72f963be76c2"
+    },
+    {
+      "path": "experiments/vsa2_representative/csrc/rep/rep_attn_bwd.cu",
+      "flat": "repbase_015_rep_attn_bwd.cu",
+      "bytes": 14932,
+      "sha256": "6a087ce0f64e548ba92d8369976438ad8d31452122726395838ba56614e6bdb7",
+      "origin": "git:efe5503bfa74dd23dcb96cd9173e72f963be76c2"
+    },
+    {
+      "path": "experiments/vsa2_representative/csrc/rep/rep_attn_fwd.cu",
+      "flat": "repbase_016_rep_attn_fwd.cu",
+      "bytes": 12057,
+      "sha256": "1640118b88a68f93afc39765a169087533c85169814e22988580958986d4de3e",
+      "origin": "git:efe5503bfa74dd23dcb96cd9173e72f963be76c2"
+    },
+    {
+      "path": "experiments/vsa2_representative/csrc/rep/rep_common.cuh",
+      "flat": "repbase_017_rep_common.cuh",
+      "bytes": 9788,
+      "sha256": "1e30f1743a68a498360ee3e122591a3201e0966b5aa02445c70a8b5b69cceca7",
+      "origin": "git:efe5503bfa74dd23dcb96cd9173e72f963be76c2"
+    },
+    {
+      "path": "experiments/vsa2_representative/csrc/rep/rep_kernels.h",
+      "flat": "repbase_018_rep_kernels.h",
+      "bytes": 8842,
+      "sha256": "d86989b5663c4e753c5320f4e504a83c09b539f032b66c6f5fc98725fee03bc9",
+      "origin": "git:efe5503bfa74dd23dcb96cd9173e72f963be76c2"
+    },
+    {
+      "path": "experiments/vsa2_representative/csrc/rep/rep_pool.cu",
+      "flat": "repbase_019_rep_pool.cu",
+      "bytes": 7342,
+      "sha256": "d54e082c00bef05d7050f65d10e7f6f9de57b309418903c05b615005951754d9",
+      "origin": "git:efe5503bfa74dd23dcb96cd9173e72f963be76c2"
+    },
+    {
+      "path": "experiments/vsa2_representative/csrc/rep_tk/rep_tk.cu",
+      "flat": "repbase_020_rep_tk.cu",
+      "bytes": 59091,
+      "sha256": "6224637ff9a96404e170aa7de568a070c449ae83707564c37cbfae3cffdc784e",
+      "origin": "git:efe5503bfa74dd23dcb96cd9173e72f963be76c2"
+    },
+    {
+      "path": "experiments/vsa2_representative/setup.py",
+      "flat": "repbase_021_setup.py",
+      "bytes": 4522,
+      "sha256": "3884e551c0256eea7367fe4603d3e4442ac0542e8f0e472f5ea89f9fbd66ca7a",
+      "origin": "git:efe5503bfa74dd23dcb96cd9173e72f963be76c2"
+    },
+    {
+      "path": "experiments/vsa2_representative/tests/test_gpu.py",
+      "flat": "repbase_022_test_gpu.py",
+      "bytes": 11991,
+      "sha256": "7a855befa06b449f9b75748d34c9732d5df669612edc58785d8d7faeda8c2fe4",
+      "origin": "git:efe5503bfa74dd23dcb96cd9173e72f963be76c2"
+    },
+    {
+      "path": "experiments/vsa2_representative/tests/test_gpu_tk.py",
+      "flat": "repbase_023_test_gpu_tk.py",
+      "bytes": 7917,
+      "sha256": "69b441a14f2538226394d17ace7395d4b191e1a7c73d52e6acbffb9eea7d8ea4",
+      "origin": "git:efe5503bfa74dd23dcb96cd9173e72f963be76c2"
+    },
+    {
+      "path": "experiments/vsa2_representative/tests/test_reference_cpu.py",
+      "flat": "repbase_024_test_reference_cpu.py",
+      "bytes": 7075,
+      "sha256": "4f5e913856669740091b58c526e2e42ba34a301c3ccaef113c753214bb6b56a2",
+      "origin": "git:efe5503bfa74dd23dcb96cd9173e72f963be76c2"
+    },
+    {
+      "path": "experiments/vsa2_representative/tests/tk_probe.py",
+      "flat": "repbase_025_tk_probe.py",
+      "bytes": 2238,
+      "sha256": "fae34abe9af3de7311a9ad40ae32fdcf6c4def2986489a2f6965c96f968e5b20",
+      "origin": "git:efe5503bfa74dd23dcb96cd9173e72f963be76c2"
+    },
+    {
+      "path": "experiments/vsa2_representative/vsa2_rep/__init__.py",
+      "flat": "repbase_026___init__.py",
+      "bytes": 1096,
+      "sha256": "f0a25bd61722c4d567cea2eb8d0756b8bbb713bab74729d48e3fa27a2dc2e1d9",
+      "origin": "git:efe5503bfa74dd23dcb96cd9173e72f963be76c2"
+    },
+    {
+      "path": "experiments/vsa2_representative/vsa2_rep/ops.py",
+      "flat": "repbase_027_ops.py",
+      "bytes": 21322,
+      "sha256": "d58cba42f11624c4e5b3fbcc4de224b5388d61aa959f6e6fd8bd0b12507947d5",
+      "origin": "git:efe5503bfa74dd23dcb96cd9173e72f963be76c2"
+    },
+    {
+      "path": "experiments/vsa2_representative/vsa2_rep/reference.py",
+      "flat": "repbase_028_reference.py",
+      "bytes": 5415,
+      "sha256": "7918d35ff671dce9aab9b50c494308462dc9a5da06bb054b67887bdf7f759d39",
+      "origin": "git:efe5503bfa74dd23dcb96cd9173e72f963be76c2"
+    },
+    {
+      "path": "_control/TK_SOURCE_MANIFEST.yaml",
+      "flat": "repbase_control_TK_SOURCE_MANIFEST.yaml",
+      "bytes": 23932,
+      "sha256": "8bff31ad17918f9b6ccb61277bc6d2b3edf614e8aa4d14ca6ff0adac21bce31e",
+      "origin": "portable execution control"
+    },
+    {
+      "path": "_control/capture_legacy_bench.py",
+      "flat": "repbase_control_capture_legacy_bench.py",
+      "bytes": 1447,
+      "sha256": "9fc98ae30892a1380b6c08707c1eb85ccb41739bd70dab95113a589501fbdf30",
+      "origin": "portable execution control"
+    },
+    {
+      "path": "_control/check_suites.py",
+      "flat": "repbase_control_check_suites.py",
+      "bytes": 821,
+      "sha256": "5860fd1097e65f22248caaae2b52c2ae4136cee6d04989af2ca1db3e1fd46af2",
+      "origin": "portable execution control"
+    },
+    {
+      "path": "_control/job.sh",
+      "flat": "repbase_control_job.sh",
+      "bytes": 2673,
+      "sha256": "b7061735e37cc95aa09d9abea8a596ad2179521e76b70abe7553f7a9e867b936",
+      "origin": "portable execution control"
+    },
+    {
+      "path": "_control/probe.py",
+      "flat": "repbase_control_probe.py",
+      "bytes": 2065,
+      "sha256": "575acc451f07cccc2315856ff9545f6e460b8fdddeb87c5f2b11e093cccf7aac",
+      "origin": "portable execution control"
+    }
+  ],
+  "rep_tk_sha256": "6224637ff9a96404e170aa7de568a070c449ae83707564c37cbfae3cffdc784e",
+  "tk_pin": "6c27e28c8115d1839d9eeeb530913c184a75fc87",
+  "target": "H100 sm90a",
+  "scope": "execution subset only; inactive/unverified files, old results and machine handoff omitted"
+}

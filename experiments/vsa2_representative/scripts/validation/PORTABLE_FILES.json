@@ -1,0 +1,35 @@
+{
+  "schema": "portable-baseline-control-v1",
+  "files": [
+    {
+      "path": "SOURCE_MANIFEST.yaml",
+      "bytes": 9770,
+      "sha256": "cc2a46ef4996720a582a59b3c58fc91d3cf80363977ea26db2d670e74b50469e"
+    },
+    {
+      "path": "TK_SOURCE_MANIFEST.yaml",
+      "bytes": 23932,
+      "sha256": "8bff31ad17918f9b6ccb61277bc6d2b3edf614e8aa4d14ca6ff0adac21bce31e"
+    },
+    {
+      "path": "probe.py",
+      "bytes": 2065,
+      "sha256": "575acc451f07cccc2315856ff9545f6e460b8fdddeb87c5f2b11e093cccf7aac"
+    },
+    {
+      "path": "capture_legacy_bench.py",
+      "bytes": 1447,
+      "sha256": "9fc98ae30892a1380b6c08707c1eb85ccb41739bd70dab95113a589501fbdf30"
+    },
+    {
+      "path": "job.sh",
+      "bytes": 2673,
+      "sha256": "b7061735e37cc95aa09d9abea8a596ad2179521e76b70abe7553f7a9e867b936"
+    },
+    {
+      "path": "check_suites.py",
+      "bytes": 821,
+      "sha256": "5860fd1097e65f22248caaae2b52c2ae4136cee6d04989af2ca1db3e1fd46af2"
+    }
+  ]
+}
