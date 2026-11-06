@@ -38,6 +38,11 @@
 //                    default (2 at D = 128; at D = 64 the default is already 3, the same kernel). At D = 128
 //                    the 113,000 B of dynamic shared memory still allows only 2 CTAs per SM, so the probe
 //                    measures the register cap alone, not a third resident CTA.
+//   kStoreKV   (16): row_ptr (non-task) launch only, where each (b, h, kv block) has exactly one owner CTA
+//                    (MHA, grid NB x H x B): the CTA stores its dK/dV tiles (tma::store_async) instead of
+//                    reduce-adding them, and a CTA with an empty k2q list stores zeros, so kg/vg need no zero
+//                    fill. Same values except one sign of zero: the reduce path's 0 + (-0) leaves +0 where
+//                    the store leaves -0. Task mode ignores the bit (chunks of a split block sum in kg/vg).
 
 #include "kittens.cuh"
 #include <cooperative_groups.h>
@@ -327,7 +332,7 @@ struct bwd_globals {
   const int opts;                 // kDqReadWait | kRotate | kSkipDq
 };
 
-constexpr int kDqReadWait = 1, kRotate = 2, kSkipDq = 4, kMinb3 = 8;
+constexpr int kDqReadWait = 1, kRotate = 2, kSkipDq = 4, kMinb3 = 8, kStoreKV = 16;
 
 __device__ static inline void stream_tile(auto& reg_tile, auto& smem_vec, int tic) {
 #pragma unroll
@@ -378,7 +383,19 @@ __global__ __launch_bounds__(128, MINB) void bwd_attend_ker(const __grid_constan
     qo_blocks = rp[1] - beg;
   }
   const int* k2q_block_sparse_index_ptr = g.col_idx + beg;
-  if (qo_blocks <= 0) return;  // dK/dV accumulators stay zero
+  const bool store_kv = !TASK && (g.opts & kStoreKV);  // this CTA is the only writer of its kg/vg rows
+  if (qo_blocks <= 0) {  // dK/dV accumulators stay zero
+    if (store_kv) {      // kg/vg were not zero-filled: write this block's zeros
+      const size_t off = (((size_t)b * g.H + h) * g.NB + kb) * (size_t)(BLOCK_N * D);
+      float4* kz = reinterpret_cast<float4*>(g.kg.raw_ptr + off);
+      float4* vz = reinterpret_cast<float4*>(g.vg.raw_ptr + off);
+      for (int i = threadIdx.x; i < BLOCK_N * D / 4; i += blockDim.x) {
+        kz[i] = make_float4(0.f, 0.f, 0.f, 0.f);
+        vz[i] = make_float4(0.f, 0.f, 0.f, 0.f);
+      }
+    }
+    return;
+  }
   // kRotate: list position i -> (i + rot) mod qo_blocks
   int rot = 0;
   if ((g.opts & kRotate) && qo_blocks > 1)
@@ -534,7 +551,8 @@ __global__ __launch_bounds__(128, MINB) void bwd_attend_ker(const __grid_constan
   __syncthreads();
   if (threadIdx.x / 32 == 0) {
     coord<kg_tile> tile_idx = {b, kv_head_idx, kb, 0};
-    tma::store_add_async(g.kg, kg_smem[0], tile_idx);
+    if (store_kv) tma::store_async(g.kg, kg_smem[0], tile_idx);
+    else tma::store_add_async(g.kg, kg_smem[0], tile_idx);
     tma::store_commit_group();
   }
 
@@ -542,7 +560,8 @@ __global__ __launch_bounds__(128, MINB) void bwd_attend_ker(const __grid_constan
   __syncthreads();
   if (kittens::warpid() % 4 == 0) {
     coord<vg_tile> tile_idx = {b, kv_head_idx, kb, 0};
-    tma::store_add_async(g.vg, vg_smem[0], tile_idx);
+    if (store_kv) tma::store_async(g.vg, vg_smem[0], tile_idx);
+    else tma::store_add_async(g.vg, vg_smem[0], tile_idx);
     tma::store_commit_group();
   }
   tma::store_async_wait();

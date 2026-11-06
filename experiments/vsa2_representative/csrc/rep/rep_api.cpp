@@ -32,6 +32,7 @@ void rep_tk_bwd_b(torch::Tensor q, torch::Tensor k_sw, torch::Tensor v_sw, torch
                   torch::Tensor dk_mid, torch::Tensor dv_mid, int64_t RM);
 std::vector<torch::Tensor> tk_native_fwd(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor row_ptr,
                                          torch::Tensor col_idx, torch::Tensor blk_cnt);
+bool tk_bwd_store_kv();
 void tk_native_bwd(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor dout_f, torch::Tensor lse,
                    torch::Tensor delta, torch::Tensor row_ptr, torch::Tensor col_idx, torch::Tensor blk_cnt,
                    torch::Tensor qg, torch::Tensor kg, torch::Tensor vg);
@@ -666,6 +667,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rep_tk_bwd_b", &rep_tk_bwd_b);
   m.def("tk_native_fwd", &tk_native_fwd);
   m.def("tk_native_bwd", &tk_native_bwd);
+  m.def("tk_bwd_store_kv", &tk_bwd_store_kv);
   m.def("has_tk", []() { return true; });
 #else
   m.def("has_tk", []() { return false; });
