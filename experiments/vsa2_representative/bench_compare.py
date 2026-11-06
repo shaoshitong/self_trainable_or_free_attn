@@ -90,7 +90,8 @@ PROFILES = {
 }
 BACKWARD_ARMS = {"21": "C", "22": "C", "23": "A"}  # the only backward tier each one's setting reaches
 ALIASES = ("1", "10", "13")  # no dispatch line of their own needed
-OWN_FORWARD = ("20", "24", "32", "33", "34", "35")  # meaningless if they launch the default kernel
+OWN_FORWARD = ("20", "24", "32", "33")  # meaningless if they launch the default kernel
+RUNTIME_ARMS = {"34", "35"}  # deliberately the default kernel; a host-set diag flag selects the behaviour
 DISTINCT_FROM = {"24": ("11",), "32": ("11", "24"), "33": ("11", "24", "32"), "35": ("34",)}  # nor if they repeat an arm
 TWO_CTA = ("32", "33")  # their tiles leave no room for a third CTA; see launch_bound
 DEFAULT_PATH = ("34", "35")  # fwd_ker at bound 3: the premise is no more than 168 registers
@@ -142,6 +143,15 @@ def cfg_error(value, source):
     # config. Checking that token keeps the guard honest instead of exempting the arm outright.
     if value in BACKWARD_ARMS and not re.search(rf"rep_cfg\(\) == {value}\b", source):
         return f"REP_TK_FWD_CFG={value} is not implemented by the backward path"
+    # A runtime-flag arm launches the default kernel on purpose, so the dispatch text cannot distinguish it;
+    # the evidence is the flag assignment next to the config number.
+    if value in RUNTIME_ARMS:
+        if not re.search(rf"cfg == {value}\b", source) or not re.search(r"g\.diag \|=", source):
+            return f"REP_TK_FWD_CFG={value} is not implemented by a diag flag in this source"
+        table = fwd_dispatch(source) or {}
+        if table and table.get(value, table.get("default")) != table.get("default"):
+            return f"REP_TK_FWD_CFG={value} must launch the default kernel and select by flag"
+        return None
     if value in ("10", "13", *OWN_FORWARD, *BACKWARD_ARMS):
         table = fwd_dispatch(source)
         if not table:
