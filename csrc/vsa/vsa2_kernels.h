@@ -185,6 +185,7 @@ struct PoolParams {
   void* qc;  // [BH, NBc_pad, D] coarse block means
   void* kc;
   void* vc;
+  void* vr;  // [BH, Lr_pad, D] V group means, same layout as kr; null when not requested
   const int* blk_cnt;
   int BH, L, NB, R, G, Lr_pad, NBc_pad;
 };

@@ -178,6 +178,21 @@ def _coarse_meta(B: int, H: int, nb: int, nbc_pad: int, device):
     return cnt.contiguous(), ptr, idx
 
 
+_POOLED_TABLES_CFG = "42"
+
+
+def _pooled_tables_enabled() -> bool:
+    """REP_TK_FWD_CFG=42: build the representative tables from the router pass's pooled means.
+
+    pool_fwd_vr already produces the 16-token K/V group means (`kr`, `vr`) and the 64-token block means
+    (`kc`, `vc`), which are exactly what the tier-B and tier-C representatives are; the plain build re-reads
+    K and V (128 MiB) to recompute them. This is tolerance-equivalent, not bit-identical: the group means are
+    rounded to bf16 before the block mean is formed.
+    """
+    import os
+    return os.environ.get("REP_TK_FWD_CFG") == _POOLED_TABLES_CFG
+
+
 _ROUTE_GRAPH_CACHE = {}
 
 
@@ -455,7 +470,11 @@ class _RepAttentionFunction(torch.autograd.Function):
         C = ext()
         B, H, L, D = q.shape
         nb = L // 64
-        qr, kr, qc, kc, vc = C.pool_fwd(q, k, v, blk_cnt, R)
+        pooled = use_tk and _pooled_tables_enabled() and 64 // tiers.mid_reps == R
+        if pooled:
+            qr, kr, vrl, qc, kc, vc = C.pool_fwd_vr(q, k, v, blk_cnt, R)
+        else:
+            qr, kr, qc, kc, vc = C.pool_fwd(q, k, v, blk_cnt, R)
         if _cached_coarse_meta_enabled():
             c_cnt, c_ptr, c_idx = _coarse_meta_cached(B, H, nb, qc.shape[2], q.device)
         else:
@@ -479,7 +498,13 @@ class _RepAttentionFunction(torch.autograd.Function):
         else:
             sel = sel_in
         if use_tk:
-            if overlap:
+            if pooled:
+                sel = sel.with_tier_b()
+                tab = C.rep_tk_build_pooled(kr, vrl, kc, vc, blk_cnt, tiers.mid_reps)
+                tab = tab + [C.rep_tk_lcb(tab[2], sel.b_ptr, sel.b_idx, nb, tiers.mid_reps)]
+                of, lse_f = C.rep_tk_fwd(q, k, v, tab, sel.q2k_ptr, sel.q2k_idx, sel.b_ptr, sel.b_idx,
+                                         sel.bits_ab, blk_cnt, tiers.mid_reps, phases, 0)
+            elif overlap:
                 tab, of, lse_f = _rep_fwd_tk_prebuilt(C, q, k, v, blk_cnt, sel, tiers.mid_reps, phases, tab0)
             else:
                 tab, of, lse_f = _rep_fwd_tk(C, q, k, v, blk_cnt, sel, tiers.mid_reps, phases)

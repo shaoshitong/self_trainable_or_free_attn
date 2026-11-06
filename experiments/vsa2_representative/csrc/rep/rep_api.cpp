@@ -466,12 +466,42 @@ std::vector<torch::Tensor> pool_fwd(torch::Tensor q, torch::Tensor k, torch::Ten
   auto kc = torch::zeros({B, H, NBc_pad, D}, opt);
   auto vc = torch::zeros({B, H, NBc_pad, D}, opt);
   vsa2::PoolParams p{q.data_ptr(),  k.data_ptr(),  v.data_ptr(),  qr.data_ptr(), kr.data_ptr(),
-                     qc.data_ptr(), kc.data_ptr(), vc.data_ptr(), blk_cnt.data_ptr<int>(),
+                     qc.data_ptr(), kc.data_ptr(), vc.data_ptr(), nullptr,       blk_cnt.data_ptr<int>(),
                      B * H,         L,             NB,            (int)R,        G,
                      Lr_pad,        NBc_pad};
   vsa2::launch_pool(p, D, dtype_of(q), cur_stream());
   check_launch();
   return {qr, kr, qc, kc, vc};
+}
+
+// Same pass as pool_fwd plus the V group means (`vr`), which are exactly the tier-B V representatives when
+// R equals the mid-tier group size (64 / mid_reps). A separate entry point keeps pool_fwd's arity intact.
+std::vector<torch::Tensor> pool_fwd_vr(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor blk_cnt,
+                                       int64_t R) {
+  check_tokens(q, "q");
+  check_tokens(k, "k");
+  check_tokens(v, "v");
+  CHECK_I32(blk_cnt);
+  TORCH_CHECK(R == 4 || R == 8 || R == 16 || R == 32, "router pool size R must be 4, 8, 16 or 32");
+  const c10::cuda::OptionalCUDAGuard guard(q.device());
+  const int B = q.size(0), H = q.size(1), L = q.size(2), D = q.size(3), NB = L / kBlock;
+  TORCH_CHECK(blk_cnt.numel() == NB, "blk_cnt must have L/64 entries");
+  const int G = kBlock / (int)R;
+  const int Lr_pad = ceil_to((long long)NB * G, 64), NBc_pad = ceil_to(NB, 64);
+  auto opt = q.options();
+  auto qr = torch::zeros({B, H, Lr_pad, D}, opt);
+  auto kr = torch::zeros({B, H, Lr_pad, D}, opt);
+  auto vrl = torch::zeros({B, H, Lr_pad, D}, opt);
+  auto qc = torch::zeros({B, H, NBc_pad, D}, opt);
+  auto kc = torch::zeros({B, H, NBc_pad, D}, opt);
+  auto vc = torch::zeros({B, H, NBc_pad, D}, opt);
+  vsa2::PoolParams p{q.data_ptr(),  k.data_ptr(),  v.data_ptr(),  qr.data_ptr(),  kr.data_ptr(),
+                     qc.data_ptr(), kc.data_ptr(), vc.data_ptr(), vrl.data_ptr(), blk_cnt.data_ptr<int>(),
+                     B * H,         L,             NB,            (int)R,         G,
+                     Lr_pad,        NBc_pad};
+  vsa2::launch_pool(p, D, dtype_of(q), cur_stream());
+  check_launch();
+  return {qr, kr, vrl, qc, kc, vc};
 }
 
 std::vector<torch::Tensor> attn_fwd(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor row_ptr,
@@ -647,6 +677,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // No pybind default arguments anywhere: every caller in vsa2_rep/ops.py passes all of them
   // positionally, and a default for c10::optional<Tensor> has to be converted at registration time.
   m.def("pool_fwd", &pool_fwd);
+  m.def("pool_fwd_vr", &pool_fwd_vr);
   m.def("attn_fwd", &attn_fwd);
   m.def("attn_bwd", &attn_bwd);
   m.def("fuse_fwd", &fuse_fwd);

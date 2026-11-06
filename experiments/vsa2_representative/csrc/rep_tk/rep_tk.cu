@@ -253,6 +253,58 @@ __global__ void build_kernel(const bf16* __restrict__ k, const bf16* __restrict_
   if (d == 0) lc_tail[(size_t)bh * NBt + blk] = cnt > 0 ? __log2f((float)cnt) : ninf();
 }
 
+// Same tables as build_kernel, but sourced from the router pass's pooled means instead of re-reading K and V:
+// kr/vr are the 16-token group means (== the tier-B representatives when 64/RM == the pool size R) and kc/vc
+// are the 64-token block means (== the tier-C representatives). Requires 64/RM == R; the caller checks it.
+template <int D>
+__global__ void build_kernel_pooled(const bf16* __restrict__ kr, const bf16* __restrict__ vr,
+                                    const bf16* __restrict__ kc, const bf16* __restrict__ vc,
+                                    const int* __restrict__ blk_cnt, bf16* __restrict__ k_sw,
+                                    bf16* __restrict__ v_sw, float* __restrict__ lc_mid, bf16* __restrict__ kt,
+                                    bf16* __restrict__ vt, float* __restrict__ lc_tail, int Lr, int NB, int NBt,
+                                    int NBc, int RM) {
+  constexpr int NPAN = D / 64;
+  const int blk = blockIdx.x, bh = blockIdx.y, d = threadIdx.x;
+  const int NP = num_phases(RM), GS = kB / RM;
+  const int p = d >> 6, c = d & 63;
+  const size_t rec = (size_t)NPAN * RM * 64;
+  auto sw_off = [&](int pi, int b, int g) {
+    const int phi = (pi * RM) & 7;
+    const int chunk = (c >> 3) ^ ((phi + g) & 7);
+    return ((((size_t)bh * NP + pi) * (NB + 1) + b) * rec) + ((size_t)p * RM + g) * 64 + chunk * 8 + (c & 7);
+  };
+  if (blk >= NB) {  // padding: zero record NB of the mid tables, zero / -inf tail rows NB..NBt-1
+    if (blk == NB)
+      for (int pi = 0; pi < NP; ++pi)
+        for (int g = 0; g < RM; ++g) {
+          k_sw[sw_off(pi, NB, g)] = __float2bfloat16(0.f);
+          v_sw[sw_off(pi, NB, g)] = __float2bfloat16(0.f);
+        }
+    if (blk < NBt) {
+      kt[((size_t)bh * NBt + blk) * D + d] = __float2bfloat16(0.f);
+      vt[((size_t)bh * NBt + blk) * D + d] = __float2bfloat16(0.f);
+      if (d == 0) lc_tail[(size_t)bh * NBt + blk] = ninf();
+    }
+    return;
+  }
+  const int cnt = blk_cnt[blk];
+  const bf16* gk = kr + ((size_t)bh * Lr + (size_t)blk * GS) * D + d;
+  const bf16* gv = vr + ((size_t)bh * Lr + (size_t)blk * GS) * D + d;
+  for (int g = 0; g < RM; ++g) {
+    const int n = min(max(cnt - g * GS, 0), GS);
+    const float mk = n > 0 ? __bfloat162float(gk[(size_t)g * D]) : 0.f;
+    const float mv = n > 0 ? __bfloat162float(gv[(size_t)g * D]) : 0.f;
+    for (int pi = 0; pi < NP; ++pi) {
+      k_sw[sw_off(pi, blk, g)] = __float2bfloat16(mk);
+      v_sw[sw_off(pi, blk, g)] = __float2bfloat16(mv);
+    }
+    if (d == 0) lc_mid[((size_t)bh * NB + blk) * RM + g] = n > 0 ? __log2f((float)n) : ninf();
+  }
+  kt[((size_t)bh * NBt + blk) * D + d] = kc[((size_t)bh * NBc + blk) * D + d];
+  vt[((size_t)bh * NBt + blk) * D + d] = vc[((size_t)bh * NBc + blk) * D + d];
+  if (d == 0) lc_tail[(size_t)bh * NBt + blk] = cnt > 0 ? __log2f((float)cnt) : ninf();
+}
+
 // The block ids of the slots this lane copies for tier-B tile `tb` (slots lane and lane + 32): loaded
 // one stage ahead of the copies, so warp 0 never stalls on them while it is also a consumer.
 __device__ __forceinline__ void slot_blocks(const int* b_idx, int nb_list, int tb, int NB, int RM, int (&blk)[2]) {
@@ -2216,6 +2268,44 @@ std::vector<torch::Tensor> rep_tk_build(torch::Tensor k, torch::Tensor v, torch:
                                                           bfp(v_sw), lc_mid.data_ptr<float>(), bfp(kt), bfp(vt),
                                                           lc_tail.data_ptr<float>(), L, NB, NBt, (int)RM);
   check_launch("build");
+  return {k_sw, v_sw, lc_mid, kt, vt, lc_tail};
+}
+
+// Same seven tables as rep_tk_build (+ rep_tk_lcb at the caller), but built from the router pass's pooled
+// means. `mid_reps` must satisfy 64 / mid_reps == the pool size R used to produce kr/vr, and kc/vc must come
+// from the same pool call, otherwise the group means do not line up with the tier structure.
+std::vector<torch::Tensor> rep_tk_build_pooled(torch::Tensor kr, torch::Tensor vr, torch::Tensor kc,
+                                               torch::Tensor vc, torch::Tensor blk_cnt, int64_t RM) {
+  check_bf16(kr, "kr");
+  check_bf16(vr, "vr");
+  check_bf16(kc, "kc");
+  check_bf16(vc, "vc");
+  check_rm(RM);
+  const c10::cuda::OptionalCUDAGuard guard(kr.device());
+  const int B = kr.size(0), H = kr.size(1), Lr = kr.size(2), D = kr.size(3);
+  const int NBc = kc.size(2), NB = blk_cnt.numel();
+  TORCH_CHECK(D == 64 || D == 128, "rep_tk: D must be 64 or 128");
+  TORCH_CHECK((int64_t)Lr == (int64_t)NB * (64 / RM), "kr rows must be NB * (64 / mid_reps)");
+  TORCH_CHECK(NBc >= NB && NBc % 64 == 0, "kc rows must be a 64-aligned count covering NB");
+  const int NBt = (NB + 63) / 64 * 64, NP = rep_tk::num_phases((int)RM);
+  auto opt = kr.options();
+  auto f32 = opt.dtype(torch::kFloat32);
+  auto k_sw = torch::empty({B, H, NP, NB + 1, D / 64, RM, 64}, opt);
+  auto v_sw = torch::empty_like(k_sw);
+  auto lc_mid = torch::empty({B, H, NB * RM}, f32);
+  auto kt = torch::empty({B, H, NBt, D}, opt);
+  auto vt = torch::empty_like(kt);
+  auto lc_tail = torch::empty({B, H, NBt}, f32);
+  dim3 grid(std::max(NB + 1, NBt), B * H);
+  if (D == 64)
+    rep_tk::build_kernel_pooled<64><<<grid, 64, 0, stream()>>>(
+        bfp(kr), bfp(vr), bfp(kc), bfp(vc), blk_cnt.data_ptr<int>(), bfp(k_sw), bfp(v_sw),
+        lc_mid.data_ptr<float>(), bfp(kt), bfp(vt), lc_tail.data_ptr<float>(), Lr, NB, NBt, NBc, (int)RM);
+  else
+    rep_tk::build_kernel_pooled<128><<<grid, 128, 0, stream()>>>(
+        bfp(kr), bfp(vr), bfp(kc), bfp(vc), blk_cnt.data_ptr<int>(), bfp(k_sw), bfp(v_sw),
+        lc_mid.data_ptr<float>(), bfp(kt), bfp(vt), lc_tail.data_ptr<float>(), Lr, NB, NBt, NBc, (int)RM);
+  check_launch("build_pooled");
   return {k_sw, v_sw, lc_mid, kt, vt, lc_tail};
 }
 

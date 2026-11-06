@@ -33,10 +33,13 @@ __global__ void pool_kernel(const PoolParams p) {
       a0 += x.x;
       a1 += x.y;
     }
+    const float inv_g = re > rb ? 1.f / (float)(re - rb) : 0.f;
     if (tensor < 2) {
-      float inv = re > rb ? 1.f / (float)(re - rb) : 0.f;
       size_t row = (size_t)bh * p.Lr_pad + (size_t)blk * p.G + gi;
-      reinterpret_cast<uint32_t*>(rdst + row * D)[cp] = T::pack2(a0 * inv, a1 * inv);
+      reinterpret_cast<uint32_t*>(rdst + row * D)[cp] = T::pack2(a0 * inv_g, a1 * inv_g);
+    } else if (p.vr != nullptr) {  // V group means, same rows as kr: the tier-B V representatives
+      size_t row = (size_t)bh * p.Lr_pad + (size_t)blk * p.G + gi;
+      reinterpret_cast<uint32_t*>(reinterpret_cast<Elt*>(p.vr) + row * D)[cp] = T::pack2(a0 * inv_g, a1 * inv_g);
     }
     tot0 += a0;
     tot1 += a1;

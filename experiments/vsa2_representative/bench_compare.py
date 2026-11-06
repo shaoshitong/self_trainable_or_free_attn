@@ -85,6 +85,7 @@ FWD_CFGS = {
     "39": ("operator", "CFG1 with the shape-only coarse CSR metadata cached across calls"),
     "40": ("operator", "pre-round-16 behaviour: the coarse CSR metadata is rebuilt on every call"),
     "41": ("operator", "CFG1 with route_tiers replayed from a captured CUDA graph (pooled inputs copied in)"),
+    "42": ("operator", "CFG1 with the representative tables built from the router pools (tolerance-equivalent)"),
     "2": ("tier_a_path", "tier-A-only specialisation at MINB 4; other phases run the default kernel"),
     "3": ("tier_a_path", "tier-A-only specialisation at MINB 3; other phases run the default kernel"),
     "4": ("timing_only", "copied native loop, native softmax"),
@@ -97,13 +98,15 @@ PROFILES = {
                                candidate="REP_TK_FWD_CFG=5"),
 }
 BACKWARD_ARMS = {"21": "C", "22": "C", "23": "A", "37": "A"}  # the only backward tier each one's setting reaches
-ALIASES = ("1", "10", "13", "36", "38", "39", "40", "41")  # no dispatch line of their own needed
+ALIASES = ("1", "10", "13", "36", "38", "39", "40", "41", "42")  # no dispatch line of their own needed
 OWN_FORWARD = ("20", "24", "32", "33")  # meaningless if they launch the default kernel
 RUNTIME_ARMS = {"34", "35"}  # deliberately the default kernel; a host-set diag flag selects the behaviour
 DISTINCT_FROM = {"24": ("11",), "32": ("11", "24"), "33": ("11", "24", "32"), "35": ("34",)}  # nor if they repeat an arm
 TWO_CTA = ("32", "33")  # their tiles leave no room for a third CTA; see launch_bound
 BYTE_EQUAL_PREMISE = ("35",)  # skipping a rescale by exactly 1.0f must not change a byte
-FORWARD_EQUAL = {*ALIASES, *BACKWARD_ARMS}  # one forward kernel by definition; see forward_must_match
+# CFG42 launches the same forward kernel but builds the representative tables from pooled means, so its output
+# differs from CFG1 by a bf16 ulp: it must not be held to byte equality.
+FORWARD_EQUAL = ({*ALIASES, *BACKWARD_ARMS} - {"42"})  # one forward kernel by definition; see forward_must_match
 BACKWARD_READ_ROWS = ("kernel.tk.bwd.A", "kernel.tk.bwd.C", "fine_op.tk.A|B|C.b_direct", "full_op.tk.routed.b_direct",
                       "fine_op.tk.A|B|C.f_plus_b", "full_op.tk.routed.f_plus_b")
 HISTORICAL_LIMIT = "historical H200 measurements are from other hardware and must not be compared with this run"
