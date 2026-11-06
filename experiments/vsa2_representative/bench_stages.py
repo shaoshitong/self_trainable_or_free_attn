@@ -61,7 +61,11 @@ def compare_stages(a, b):
 
 
 def attribute(rows):
-    """Derived figures, all labelled unmeasured. A residual outside the floor is reported, never hidden."""
+    """Derived figures, all labelled unmeasured. A residual outside the floor is reported, never hidden.
+
+    `sum_of_parts` mixes rows from the fine-only and the routed paths, so since the routed operator builds its
+    tables from the pooled means it is reported, never asserted.
+    """
     median = {r["id"]: statistics.median(r["ms"]) for r in rows}
     totals = [x for r in rows if r["id"].startswith("total") for x in r["ms"]]
     total, parts = statistics.median(totals), [r["id"] for r in rows if r["in_sum"]]
@@ -171,8 +175,14 @@ def main():
         ("fuse", True, None, lambda: C.fuse_fwd(of, oc, gate, cnt, gate_act)),
         ("total.repeat", False, "second measurement of total, for the floor", total),
     )
+    # Which API each row describes. Since the routed operator builds its representative tables from the pooled
+    # means (CFG42 is the default), `fine` and `fine.tables` describe the fine-only entry point and no longer
+    # belong to a decomposition of the routed operator; only `total` does. Summing them overstates the operator.
+    path = {"fine": "fine_only", "fine.tables": "fine_only", "fine.kernel": "fine_only",
+            "total": "routed", "total.repeat": "routed"}
     rows = [dict(id=n, ms=loop(fn), in_sum=in_sum, label="measurement_only", measured=True, note=note or NOTE,
-                 reads_fwd_cfg=n in READS_FWD_CFG, **({"config_note": BACKWARD_ONLY_NOTE} if cfg in FORWARD_EQUAL - {"1", "10"} else {}))
+                 reads_fwd_cfg=n in READS_FWD_CFG, describes=path.get(n, "both"),
+                 **({"config_note": BACKWARD_ONLY_NOTE} if cfg in FORWARD_EQUAL - {"1", "10"} else {}))
             for n, in_sum, note, fn in stages]
     res = dict(schema="vsa2-rep-stages/1", measurement_only=True, note=NOTE, fwd_cfg=cfg, fwd_cfg_meaning=meaning,
                shape=dict(B=B, H=H, L=L, D=D, NB=nb, RM=rm, R=R, dtype="bf16", blk_cnt="full"),
