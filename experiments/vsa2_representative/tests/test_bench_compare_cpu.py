@@ -9,7 +9,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bench_stages import attribute, compare_stages
-from bench_compare import (BACKWARD_READ_ROWS, FWD_CFGS, PROFILES, abba, active_fwd_cfg, arms_error, assemble,
+from bench_compare import (BACKWARD_READ_ROWS, launch_bound, FWD_CFGS, PROFILES, abba, active_fwd_cfg, arms_error, assemble,
                            backward_row_is_control, cfg_error, claims, forward_must_match, fwd_dispatch, fwd_kernel_name,
                            parse_config, summarize)
 
@@ -37,11 +37,11 @@ def test_configs_keep_their_semantics():
         {"REP_TK_FWD_CFG": "1", "REP_TK_BWDC_SPLITS": "8"}
     for cfg in "23457":
         assert rejected(f"REP_TK_FWD_CFG={cfg}", "representative"), "a diagnostic passed as production"
-    for cfg in ("0", "1", "2", "6", "8", "9", "10", "11", "13", "20", "21", "22", "23", "24", "32", "33"):
+    for cfg in ("0", "1", "2", "6", "8", "9", "10", "11", "13", "20", "21", "22", "23", "24", "32", "33", "34", "35"):
         assert rejected(f"REP_TK_FWD_CFG={cfg}", "controlled-softmax"), "only CFG 4/5/7 are this diagnostic"
     for cfg in "457":
         assert parse_config(f"REP_TK_FWD_CFG={cfg}", "controlled-softmax")
-    for cfg in ("8", "9", "10", "11", "13", "20", "21", "22", "23", "24", "32", "33"):
+    for cfg in ("8", "9", "10", "11", "13", "20", "21", "22", "23", "24", "32", "33", "34", "35"):
         assert parse_config(f"REP_TK_FWD_CFG={cfg}", "representative")
     assert rejected("REP_TK_FWD_CFG=25", "representative"), "the kernel would silently run its default path"
     assert parse_config("REP_TK_FWD_CFG=1,REP_TK_BWDC_SPLITS=wave", "representative"), "the kernel accepts wave"
@@ -141,6 +141,33 @@ def test_deep_pipeline_arms_are_two_cta_forwards():
         b["output_check"] = [dict(name="o", ok=False)]
         assert assemble({}, "representative", pair, [], [a, b])["claims"]["output_validated"] is False
     assert arms_error({"baseline": {"REP_TK_FWD_CFG": "33"}, "candidate": {"REP_TK_FWD_CFG": "21"}}), "two variables"
+
+
+def test_softmax_reductions_stay_on_the_default_path():
+    bound = "template <int D, int MINB> __global__ __launch_bounds__(128, MINB) void fwd_ker(const G g) {}\n"
+    fold = "(cfg == 34) launch(rep_tk::fwd_ker<D, 3, false, false, true, 1>);"
+    skip = "(cfg == 35) launch(rep_tk::fwd_ker<D, 3, false, false, true, 2>);"
+    src = kernel(BULK, fold, skip) + bound
+    assert launch_bound("rep_tk::fwd_ker<D, 3, false, false, true, 1>", src) == "3"
+    assert cfg_error("34", src) is None and cfg_error("35", src) is None
+    assert cfg_error("34", kernel(BULK, skip) + bound), "must not pass before the kernel has it"
+    assert "bound 3" in cfg_error("34", kernel(BULK, "(cfg == 34) launch(rep_tk::fwd_ker<D, 2, false, false, true, 1>);") + bound)
+    other = "(cfg == 35) {\n    rep_tk::fwd_kdb_ker<D, 9><<<g>>>(x);\n  }\n"
+    assert "bound 3" in cfg_error("35", kernel(BULK, other) + bound), "a separate kernel is not the default path"
+    assert cfg_error("35", kernel(BULK, fold, "(cfg == 35) launch(rep_tk::fwd_ker<D, 3, false, false, true, 1>);") + bound), "CFG34 again"
+    assert cfg_error("34", kernel(BULK, "(cfg == 34) launch(rep_tk::fwd_ker<D, 3, false, false, true>);") + bound), "the default"
+    pair = lambda cfg: {"baseline": {"REP_TK_FWD_CFG": "1"}, "candidate": {"REP_TK_FWD_CFG": cfg}}
+    a, b = child("baseline", 1), child("candidate", 1)
+    a["forward_output"], b["forward_output"] = {"B": dict(o="x")}, {"B": dict(o="y")}
+    res = assemble({}, "representative", pair("35"), [], [a, b])
+    assert res["status"] == "ok" and res["claims"]["may_claim_op_level_change"] is False, "premise falsified"
+    assert any("alpha premise" in x and "False" in x for x in res["claims"]["limits"])
+    res = assemble({}, "representative", pair("34"), [], [a, b])
+    assert res["claims"]["may_claim_op_level_change"] is True, "a fused multiply-add may change rounding"
+    b["forward_output"] = {"B": dict(o="x")}
+    res = assemble({}, "representative", pair("35"), [], [a, b])
+    assert res["claims"]["may_claim_op_level_change"] is True
+    assert any("does not show alpha is exactly" in x for x in res["claims"]["limits"])
 
 
 def test_backward_arm_is_single_variable():
@@ -278,6 +305,7 @@ if __name__ == "__main__":
     test_arm_meanings_hold_in_the_source()
     test_two_stage_arm_is_its_own_forward()
     test_deep_pipeline_arms_are_two_cta_forwards()
+    test_softmax_reductions_stay_on_the_default_path()
     test_backward_arm_is_single_variable()
     test_backward_arm_reaches_only_its_tier()
     test_forward_change_under_backward_arm_is_invalid()

@@ -66,8 +66,12 @@ FWD_CFGS = {
     "11": ("operator", "measured negative arm, not a candidate: fwd_kdb_ker, CFG1 plus a double-buffered K tile; V unchanged"),
     "24": ("operator", "measured negative arm: fwd_pipe_ker, CFG11's K double buffer plus a two-stage softmax, the "
                        "next tile's QK issued before the current softmax finishes"),
-    "32": ("operator", "two CTAs per SM: K and V both double-buffered, 80 KB of tiles per CTA"),
-    "33": ("operator", "two CTAs per SM: K and V both triple-buffered, 112 KB of tiles per CTA, 224 KB per SM"),
+    "32": ("operator", "measured negative arm: two CTAs per SM, K and V both double-buffered, 80 KB of tiles per CTA"),
+    "33": ("operator", "measured negative arm: two CTAs per SM, K and V both triple-buffered, 112 KB of tiles per CTA, "
+                       "224 KB per SM"),
+    "34": ("operator", "CFG1 with the log2(e)*scale multiply and the tier-B/C bias add folded into one FFMA"),
+    "35": ("operator", "CFG1 skipping the O rescale when no row's running maximum moved in this tile (__any_sync); "
+                       "assumes alpha is exactly 1.0f then, unverified"),
     "13": ("operator", "alias of CFG1 since the num_splits_heuristic split became the default"),
     "20": ("operator", "the pre-round-4 forward: per-slot cp.async.bulk tier-B gather; CFG1's backward"),
     "21": ("operator", "CFG1 forward; tier-C backward split by the old wave policy"),
@@ -86,9 +90,11 @@ PROFILES = {
 }
 BACKWARD_ARMS = {"21": "C", "22": "C", "23": "A"}  # the only backward tier each one's setting reaches
 ALIASES = ("1", "10", "13")  # no dispatch line of their own needed
-OWN_FORWARD = ("20", "24", "32", "33")  # meaningless if they launch the default kernel
-DISTINCT_FROM = {"24": ("11",), "32": ("11", "24"), "33": ("11", "24", "32")}  # nor if they repeat an earlier arm
+OWN_FORWARD = ("20", "24", "32", "33", "34", "35")  # meaningless if they launch the default kernel
+DISTINCT_FROM = {"24": ("11",), "32": ("11", "24"), "33": ("11", "24", "32"), "35": ("34",)}  # nor if they repeat an arm
 TWO_CTA = ("32", "33")  # their tiles leave no room for a third CTA; see launch_bound
+DEFAULT_PATH = ("34", "35")  # fwd_ker at bound 3: the premise is no more than 168 registers
+BYTE_EQUAL_PREMISE = ("35",)  # skipping a rescale by exactly 1.0f must not change a byte
 FORWARD_EQUAL = {*ALIASES, *BACKWARD_ARMS}  # one forward kernel by definition; see forward_must_match
 BACKWARD_READ_ROWS = ("kernel.tk.bwd.A", "kernel.tk.bwd.C", "fine_op.tk.A|B|C.b_direct", "full_op.tk.routed.b_direct",
                       "fine_op.tk.A|B|C.f_plus_b", "full_op.tk.routed.f_plus_b")
@@ -150,6 +156,8 @@ def cfg_error(value, source):
     if value in TWO_CTA and launch_bound(table.get(value), source) != "2":
         return f"REP_TK_FWD_CFG={value} is a two-CTA arm; {table.get(value)} has launch bound " \
                f"{launch_bound(table.get(value), source)}"
+    if value in DEFAULT_PATH and (fwd_kernel_name(value, source) != "fwd_ker" or launch_bound(table.get(value), source) != "3"):
+        return f"REP_TK_FWD_CFG={value} must stay on fwd_ker at launch bound 3 (168-register cap); it launches {table.get(value)}"
     return None
 
 
@@ -157,6 +165,9 @@ def launch_bound(kernel, source):
     """The minimum blocks in `kernel`'s __launch_bounds__, as written in the source, or None."""
     name = re.match(r"rep_tk::(\w+)", kernel or "")
     found = name and re.search(rf"__launch_bounds__\(\s*\d+\s*,\s*([^)]*?)\s*\)\s*void\s+{name.group(1)}\b", source)
+    if found and found.group(1) == "MINB":  # a template argument, as in fwd_ker<D, 3, ...>
+        arg = re.search(r"<\s*D\s*,\s*(\d+)", kernel)
+        return arg.group(1) if arg else None
     return found.group(1) if found else None
 
 
@@ -297,6 +308,13 @@ def assemble(args_dict, profile, configs, order, children):
         bad = bad + [f"missing row {r}" for r in BACKWARD_READ_ROWS if r not in ids]
     if bad:
         claim["may_claim_op_level_change"] = False
+    arms = {c.get("REP_TK_FWD_CFG") for c in configs.values()}
+    if arms & set(BYTE_EQUAL_PREMISE) and arms & set(ALIASES):
+        if identical is not True:
+            claim["may_claim_op_level_change"] = False
+        claim["limits"] = claim["limits"] + [
+            f"alpha premise: forward outputs byte-identical to CFG1: {identical}. This resolves bf16 o and fp32 lse only, "
+            "so an alpha within bf16 rounding of 1.0f passes; it does not show alpha is exactly 1.0f"]
     return dict(schema=SCHEMA, profile=profile, created_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 settings=args_dict, configs=configs, run_order=order,
                 status="invalid: arms differ in " + ", ".join(bad) if bad else "ok",
