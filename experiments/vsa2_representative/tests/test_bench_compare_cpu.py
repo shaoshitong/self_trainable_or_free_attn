@@ -8,6 +8,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from bench_stages import attribute
 from bench_compare import FWD_CFGS, PROFILES, abba, active_fwd_cfg, assemble, claims, implemented, parse_config, summarize
 
 
@@ -34,13 +35,13 @@ def test_configs_keep_their_semantics():
         {"REP_TK_FWD_CFG": "1", "REP_TK_BWDC_SPLITS": "8"}
     for cfg in "23457":
         assert rejected(f"REP_TK_FWD_CFG={cfg}", "representative"), "a diagnostic passed as production"
-    for cfg in "012689":
+    for cfg in ("0", "1", "2", "6", "8", "9", "10"):
         assert rejected(f"REP_TK_FWD_CFG={cfg}", "controlled-softmax"), "only CFG 4/5/7 are this diagnostic"
     for cfg in "457":
         assert parse_config(f"REP_TK_FWD_CFG={cfg}", "controlled-softmax")
-    for cfg in "89":
+    for cfg in ("8", "9", "10"):
         assert parse_config(f"REP_TK_FWD_CFG={cfg}", "representative")
-    assert rejected("REP_TK_FWD_CFG=10", "representative"), "the kernel would silently run its default path"
+    assert rejected("REP_TK_FWD_CFG=11", "representative"), "the kernel would silently run its default path"
     assert PROFILES["representative"]["baseline"].endswith("=6") and PROFILES["representative"]["candidate"].endswith("=1")
     assert rejected("", "representative") and rejected("OTHER=1,REP_TK_FWD_CFG=1", "representative")
     assert rejected("REP_TK_FWD_CFG=1,REP_TK_BWDC_SPLITS=0", "representative")
@@ -49,13 +50,14 @@ def test_configs_keep_their_semantics():
 def test_standalone_scripts_see_what_runs():
     new = "if (cfg == 4) a; else if (cfg == 5) b; else if (cfg == 7) c; else if (cfg == 0) d; " \
           "else if (cfg == 2 && phases == 1) e; else if (cfg == 3 && phases == 1) f; else if (cfg == 6) g; " \
-          "else if (cfg == 8) h; else if (cfg == 9) i;"
+          "else if (cfg == 8) h; else if (cfg == 9) i; else if (cfg == 10) j;"
     assert all(implemented(v, new) for v in FWD_CFGS)
     old = "if (cfg == 4) a; else if (cfg == 5) b; else if (cfg == 0) d;"
     assert active_fwd_cfg({}, old)[:2] == ("1", "operator")
     assert active_fwd_cfg({"REP_TK_FWD_CFG": "6"}, new)[1] == "operator"
     assert active_fwd_cfg({"REP_TK_FWD_CFG": "7"}, new)[1] == "timing_only", "CFG7 must never print operator rows"
-    for value, source in (("6", old), ("7", old), ("8", old), ("9", old), ("10", new)):  # would run the default kernel
+    # would run the default kernel, and CFG10 must not pass on a source that only has `cfg == 1`
+    for value, source in (("6", old), ("7", old), ("8", old), ("9", old), ("10", old + " cfg == 1;"), ("11", new)):
         assert not (value in FWD_CFGS and implemented(value, source))
         try:
             active_fwd_cfg({"REP_TK_FWD_CFG": value}, source)
@@ -99,6 +101,32 @@ def test_differing_arms_are_invalid():
     assert assemble({}, "representative", {}, [], [a, b])["status"] == "ok"
 
 
+def test_byte_identity_is_reported_only_when_recorded():
+    a, b = child("baseline", 1), child("candidate", 1)
+    assert assemble({}, "representative", {}, [], [a, b])["forward_outputs_byte_identical"] is None
+    a["forward_output"], b["forward_output"] = dict(o="x", lse="y"), dict(o="x", lse="y")
+    assert assemble({}, "representative", {}, [], [a, b])["forward_outputs_byte_identical"] is True
+    b["forward_output"] = dict(o="z", lse="y")
+    assert assemble({}, "representative", {}, [], [a, b])["forward_outputs_byte_identical"] is False
+
+
+def stage_rows(residual):
+    row = lambda n, ms, in_sum: dict(id=n, ms=[ms, ms, ms], in_sum=in_sum)
+    return [dict(id="total", ms=[10.0, 10.1, 10.0], in_sum=False), row("pool", 1.0, True),
+            row("route", 3.0, True), row("route.one_budget", 2.0, False), row("fine", 6.0 - residual, True),
+            row("fine.tables", 0.5, False), dict(id="total.repeat", ms=[10.0, 9.9, 10.0], in_sum=False)]
+
+
+def test_stage_attribution_counts_each_part_once():
+    t = attribute(stage_rows(0.0))
+    assert t["measured"] is False and "measurement_only" in t["note"]
+    assert t["parts"] == ["pool", "route", "fine"], "a sub-row or the total was summed"
+    assert t["sum_of_parts_ms"] == 10.0 and t["sum_within_floor"] is True
+    assert t["outside_fine_ms"] == 4.0
+    t = attribute(stage_rows(1.0))
+    assert t["residual_ms"] == 1.0 and t["sum_within_floor"] is False, "an unexplained residual must show"
+
+
 def test_claims():
     good = [child("baseline", 1), child("candidate", 1)]
     assert claims("representative", good)["may_claim_op_level_change"] is True
@@ -117,5 +145,7 @@ if __name__ == "__main__":
     test_estimate_is_labelled_and_stages_are_not_summed()
     test_row_is_a_control_only_if_it_is_in_every_arm()
     test_differing_arms_are_invalid()
+    test_byte_identity_is_reported_only_when_recorded()
+    test_stage_attribution_counts_each_part_once()
     test_claims()
     print("all bench_compare CPU tests passed")

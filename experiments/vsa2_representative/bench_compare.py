@@ -8,7 +8,8 @@ whose extension, sources, inputs, selection, shape or timing settings differ.
 Profiles (see docs/vsa2_representative_handoff.md, section 7):
 
   representative      all-tier fwd_ker, diag=0, warmup 10, iters 30. Default arms: CFG6 (hand-written softmax)
-                      vs CFG1 (TK-vector softmax), both MINB 3. CFG8/9 are the same pair at MINB 2. Kernel,
+                      vs CFG1 (TK-vector softmax), both MINB 3. CFG8/9 are the same pair at MINB 2. CFG10 is
+                      CFG1 with the tier-B gather by warpgroup-wide cp.async. Kernel,
                       fine-op and full-operator scope. Output cross-checked against the generic backend.
   controlled-softmax  CFG 4/5/7, warmup 10, iters 50, kernel forward only. TIMING ONLY: these kernels run
                       tier A whatever `phases` says, write no lse and do not mask padded output.
@@ -60,6 +61,7 @@ FWD_CFGS = {
     "6": ("operator", "fwd_ker: hand-written softmax, MINB 3"),
     "8": ("operator", "fwd_ker: TK-vector softmax, MINB 2"),
     "9": ("operator", "fwd_ker: hand-written softmax, MINB 2"),
+    "10": ("operator", "fwd_ker: TK-vector softmax, MINB 3, tier-B gather by warpgroup-wide cp.async"),
     "2": ("tier_a_path", "tier-A-only specialisation at MINB 4; other phases run the default kernel"),
     "3": ("tier_a_path", "tier-A-only specialisation at MINB 3; other phases run the default kernel"),
     "4": ("timing_only", "copied native loop, native softmax"),
@@ -181,12 +183,14 @@ def claims(profile, children):
 def assemble(args_dict, profile, configs, order, children):
     bad = identity_differences(children)
     claim = claims(profile, children)
+    digests = [c.get("forward_output") for c in children]
+    identical = None if None in digests else len({json.dumps(d, sort_keys=True) for d in digests}) == 1
     if bad:
         claim["may_claim_op_level_change"] = False
     return dict(schema=SCHEMA, profile=profile, created_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 settings=args_dict, configs=configs, run_order=order,
                 status="invalid: arms differ in " + ", ".join(bad) if bad else "ok",
-                identity_differences=bad, claims=claim,
+                identity_differences=bad, claims=claim, forward_outputs_byte_identical=identical,
                 counters=dict(collected=False, reason="not collected by this harness; no counter workaround is authorized"),
                 summary=summarize(children) if not bad else [], children=children)
 
@@ -373,7 +377,7 @@ def child_main(spec):
     add("kernel.native_tk.fwd.A", "kernel", "fwd", "native_tk", "tier_a_only", True,
         loop(lambda: C.tk_native_fwd(q, k, v, qp, qi, cnt), W, I, N))
     add("kernel.tk.fwd.A", "kernel", "fwd", "tk", "tier_a_only", False, loop(kernel_fwd(PHASE_A), W, I, N))
-    output_check = None
+    output_check = forward_output = None
     if spec["profile"] == "representative":
         for name, ph, work in (("A|B", PHASE_A | PHASE_B, "tier_subset"), ("A|B|C", PHASE_ALL, "64/4/1"),
                                ("B|C", PHASE_B | PHASE_C, "tier_subset"), ("B", PHASE_B, "tier_b_only"),
@@ -457,6 +461,7 @@ def child_main(spec):
             return dict(name=name, max_err=err, scale=scale, tol_rel=tol, ok=err <= tol * max(scale, 1.0))
 
         o_t, lse_t = kernel_fwd(PHASE_ALL)()
+        forward_output = dict(o=digest(o_t), lse=digest(lse_t))
         o_g, lse_g = C.rep_attn_fwd(q, k, v, *gtab, qp, qi, sel.bits_a, sel.bits_ab, cnt, rm, PHASE_ALL, 0)
         output_check = [compare("o vs generic", o_t, o_g, TOL_O), compare("lse vs generic", lse_t, lse_g, TOL_LSE)]
         grads = {}
@@ -497,7 +502,7 @@ def child_main(spec):
         selection={n: digest(getattr(sel, n)) for n in sel_fields},
     )
     Path(spec["out"]).write_text(json.dumps(dict(identity=identity, telemetry_before=telemetry_before, rows=rows,
-                                                 output_check=output_check, telemetry_after=telemetry())))
+                                                 output_check=output_check, forward_output=forward_output, telemetry_after=telemetry())))
     return 0
 
 

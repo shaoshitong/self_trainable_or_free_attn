@@ -61,6 +61,7 @@ vsa2_rep/reference.py       pure-PyTorch reference (fp64) + bitmap pack/unpack
 tests/test_reference_cpu.py representative softmax semantics, no GPU and no build needed
 tests/test_gpu.py           kernels vs the reference: routing, tables, forward, backward, unpool
 bench.py / prof.py          end-to-end comparison / per-kernel breakdown with measured scopes
+bench_stages.py             measurement-only stages of the full operator's forward
 one_launch.py               one generic or TK kernel after warmup, for a profiler to select by name
 ```
 

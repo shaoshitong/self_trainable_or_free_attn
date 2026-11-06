@@ -358,8 +358,9 @@ Forward configurations, with D=128 `ptxas` resources from a fresh build of sourc
 |---:|---|---|---:|---:|---:|
 | 1 (default) | `fwd_ker`, all tiers | TK vector | 3 | 168 | 24 |
 | 6 | `fwd_ker`, all tiers | hand-written | 3 | 168 | 16 |
-| 8 | `fwd_ker`, all tiers | TK vector | 2 | not built yet | not built yet |
-| 9 | `fwd_ker`, all tiers | hand-written | 2 | not built yet | not built yet |
+| 8 | `fwd_ker`, all tiers | TK vector | 2 | not recorded here | not recorded here |
+| 9 | `fwd_ker`, all tiers | hand-written | 2 | not recorded here | not recorded here |
+| 10 | `fwd_ker`, all tiers, tier-B gather by warpgroup-wide `cp.async` | TK vector | 3 | not built yet | not built yet |
 | 0 | `fwd_ker`, all tiers | TK vector | 4 | 128 | 184 |
 | 2 | `fwd_ker`, `A_ONLY` | TK vector | 4 | 128 | 8 |
 | 3 | `fwd_ker`, `A_ONLY` | TK vector | 3 | 160 | 0 |
@@ -368,13 +369,14 @@ Forward configurations, with D=128 `ptxas` resources from a fresh build of sourc
 | 7 | `nat_copy_ker` | TK vector | 4 | 128 | 0 |
 
 CFG 2/3 use their `A_ONLY` kernel only for `phases=A`; other phases run the default kernel. CFG 8/9 change
-only MINB relative to CFG 1/6. `REP_TK_BWDC_SPLITS=<positive>` forces the tier-C query split count. Without
+only MINB relative to CFG 1/6. CFG 10 changes only the tier-B gather relative to CFG 1, from per-slot
+`cp.async.bulk`, and is intended to load byte-identical data in the same layout. `REP_TK_BWDC_SPLITS=<positive>` forces the tier-C query split count. Without
 it, the split at D=128 is `min(2 * SMs / (tail_tiles * H * B), NB / 16)` with integer division. At 16K, H=16
 and B=1 there are 4 tail tiles, so 132 SMs give a split of 4.
 
 `REP_TK_FWD_CFG` is cached on first use, so one process measures one value. A value the kernel does not
 dispatch on silently runs the default kernel, so `bench_compare.py`, `bench_tk.py` and `fwd_cfg.py` refuse a
-value missing from the kernel source on disk, for example CFG 8 or 9 on a build from before they existed. The check looks for `cfg == <value>` in
+value missing from the kernel source on disk, for example CFG 10 on a build from before they existed. The check looks for `cfg == <value>` in
 `rep_tk.cu`.
 
 CFG 4/5/7 are measurement code. They ignore `phases` and run tier A only, write no `lse` and do not mask
@@ -422,6 +424,7 @@ ThunderKittens commit are recorded.
 | `stage=b_estimate` | `median(f_plus_b) - median(f)`, `measured=false`, an estimate |
 | `work=tier_a_only` | 10% of the pairs; not equivalent to the 64/4/1 operator |
 | `work=tier_b_only`, `tier_c_only`, `tier_subset` | part of the tile stream, tables prebuilt; locates cost, and these rows do not add up to `A\|B\|C` |
+| `forward_outputs_byte_identical` | whether the arms' `A\|B\|C` `o` and `lse` have equal digests; informational, and CFG 1 vs CFG 10 is expected to be true when its A/A run is |
 | `control=true` | does not read the compared setting; a ratio away from 1 is run drift |
 
 Backward kernels and table builds do not read `REP_TK_FWD_CFG`, so their kernel rows are controls in a
@@ -471,25 +474,52 @@ Round 2, source `3c291f2`, 16K/H16/D128/RM4: the fresh build and the CPU, generi
 TK suite also with CFG 6. CFG 6 vs CFG 1 gave no measured operator improvement above A/A displacement: routed
 full-operator F+B ratio 1.002 against an A/A ratio of 0.997. No second length was run.
 
-Next matrix, one variable per row, at the same shape and on one build containing CFG 8/9:
+Round 3: the MINB 2 controls were slower than MINB 3, 22-23% on the forward kernels and 5.0% on fine F+B,
+against a +0.9% A/A displacement. The softmax and register-cap line of work is closed. On that build,
+kernel-scope forward was tier A 0.574, tier B 0.217, tier C 0.143 and `A|B|C` 0.862 ms. Forward was 1.376 ms
+for the routed operator and 0.916 ms for the fine path on a frozen selection, leaving about 0.46 ms to attribute.
 
-| # | Variable | Run | When |
-|---:|---|---|---|
-| 1 | none (noise floor) | CFG 1 vs CFG 1 | always; a new build needs its own floor |
-| 2 | MINB 3 to 2, vector softmax | CFG 1 vs CFG 8 | always |
-| 3 | MINB 3 to 2, hand-written softmax | CFG 6 vs CFG 9 | if row 2 clears the floor, or to see whether the softmax changes the MINB effect |
-| 4 | tier-C split | CFG 1 vs `REP_TK_FWD_CFG=1,REP_TK_BWDC_SPLITS=4` | only if `multi_processor_count` in the result is not 132; with 132 SMs the default is already 4 and this repeats row 1 |
+Next matrix, at the same shape and on one build containing CFG 10:
+
+| # | Purpose | Run |
+|---:|---|---|
+| 1 | attribute the operator's forward | `bench_stages.py` with CFG 1 |
+| 2 | noise floor | CFG 1 vs CFG 1 |
+| 3 | tier-B gather, one variable | CFG 1 vs CFG 10 |
 
 ```bash
+REP_TK_FWD_CFG=1 <gpu-runner> python bench_stages.py --out results/raw/stages-cfg1.json
 <gpu-runner> python bench_compare.py --baseline REP_TK_FWD_CFG=1 --candidate REP_TK_FWD_CFG=1 --out results/raw/aa.json
-<gpu-runner> python bench_compare.py --baseline REP_TK_FWD_CFG=1 --candidate REP_TK_FWD_CFG=8 --out results/raw/cfg1-cfg8.json
-<gpu-runner> python bench_compare.py --baseline REP_TK_FWD_CFG=6 --candidate REP_TK_FWD_CFG=9 --out results/raw/cfg6-cfg9.json
-<gpu-runner> python bench_compare.py --baseline REP_TK_FWD_CFG=1 --candidate REP_TK_FWD_CFG=1,REP_TK_BWDC_SPLITS=4 --out results/raw/split4.json
+<gpu-runner> python bench_compare.py --baseline REP_TK_FWD_CFG=1 --candidate REP_TK_FWD_CFG=10 --out results/raw/cfg1-cfg10.json
 ```
 
-The result that matters is measured `A|B|C` kernel, fine-op and full-op F+B against the A/A displacement.
-Partial rows and profiler output locate cost, and adding them does not produce a measured total. CFG 8/9 also
-need the suites to pass on their build before any claim.
+In row 3, read `kernel.tk.fwd.B` for the gather in isolation and `kernel.tk.fwd.A|B|C` for its effect inside
+the full tile stream. Both go through `issue_tile` and the same kernel template as the operator. The B-only
+row has no A or C tiles to overlap with, so the two deltas can differ. `kernel.tk.bwd.B` should stay a control,
+provided CFG 10 does not change the `issue_tier_b` path the tier-B backward also uses. The result that matters
+is measured `A|B|C` kernel, fine-op and full-op F+B against the A/A displacement, with the suites passing on that
+build. Partial rows and profiler output locate cost, and adding them does not produce a measured total.
+
+### Full-operator forward stages
+
+`bench_stages.py` times the stages of the routed forward on one configuration. Every row is `measurement_only`:
+these times are not a performance claim and must not be added to the kernel rows.
+
+| Row | In the sum | Contents |
+|---|---:|---|
+| `pool` | yes | `pool_fwd`; one call makes the router pools and the coarse means |
+| `route` | yes | router lse and scores, top-k at two budgets, tier-B lists; one native call |
+| `route.one_budget` | no | different work: one top-k, no tier-B lists |
+| `coarse.meta`, `coarse.attn` | yes | the coarse CSR, and `attn_fwd` on the coarse means |
+| `fine` | yes | `rep_fine_attention` on the built selection |
+| `fine.tables`, `fine.kernel` | no | inside `fine`: tables and log counts, and `rep_tk_fwd` |
+| `fuse` | yes | `fuse_fwd`; the forward has no finalize |
+| `total`, `total.repeat` | no | `rep_attention`, first and last; their spread is the run's floor |
+
+Table build and the flattened tier-B log counts run inside the fine path, so they are not part of `route` or of
+the gap between `total` and `fine`. `attribution` is derived and marked `measured=false`. A residual outside
+the floor is reported rather than spread over the stages: isolated loops overlap differently on the stream, and
+the operator's own autograd wrapper cannot be timed on its own.
 
 ## 8. Measured evidence
 
