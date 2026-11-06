@@ -20,6 +20,11 @@ Outputs are compared as max abs differences on o, dq, dk and dv, against the sam
 dQ, dK and dV include fp32 reductions in a nondeterministic order, so the eager pair is the floor they can be read
 against. `equivalent` uses bench_compare.py's tolerances for the generic cross-check.
 
+That comparison runs on the captured inputs, so it cannot see a kernel that escaped the capture: the escaped kernel ran
+once during capture, its output stays right for those inputs, and the replay also looks faster for skipping it.
+`fresh_input_equivalent` therefore writes different values into the captured inputs and compares a replay with an eager
+call on them. recoverable_ms is only meaningful if that is true.
+
 Stage times are not a performance claim and must not be added to bench_compare's kernel rows.
 
   REP_TK_FWD_CFG=1 <gpu-runner> python bench_graph.py --out graph.json
@@ -56,7 +61,8 @@ def attribute(rows, reason=None):
                unavailable_reason=reason, floor_method="max - min of the eager batches of this run")
     if reason is None:
         replay = statistics.median(by["graph.replay"]["ms"])
-        res.update(replay_ms=replay, recoverable_ms=med - replay, recoverable_above_floor=med - replay > floor)
+        res.update(replay_ms=replay, recoverable_ms=med - replay, recoverable_above_floor=med - replay > floor,
+                   recoverable_valid_only_if="outputs.fresh_input_equivalent is true")
     if by["eager.same_stream"]["available"]:
         res["stream_and_threading_ms"] = statistics.median(by["eager.same_stream"]["ms"]) - med
     return res
@@ -152,6 +158,7 @@ def main():
 
     stream = torch.cuda.Stream()
     graph_rows, reason, replay_vs_eager, equivalent = None, None, None, None
+    fresh_vs_eager, fresh_equivalent = None, None
     try:
         graph = torch.cuda.CUDAGraph()
         with torch.autograd.set_multithreading_enabled(False):
@@ -166,6 +173,23 @@ def main():
             graph.replay()
         torch.cuda.synchronize()
         replay_vs_eager, equivalent = compare_outputs(differences(captured, ref), tol)
+
+        # Different values in the captured inputs: an escaped kernel would now leave a stale output behind.
+        torch.manual_seed(seed + 1)
+        fresh = [torch.randn_like(t) for t in (q, k, v)] + [(0.1 * torch.randn(B, H, L, device=dev)).to(dt)]
+        with torch.no_grad():
+            for t, x in zip(leaves, fresh):
+                t.copy_(x)
+        ref_fresh = snapshot()
+        with torch.cuda.stream(stream):
+            graph.replay()
+        torch.cuda.synchronize()
+        fresh_vs_eager, fresh_equivalent = compare_outputs(differences(captured, ref_fresh), tol)
+        inputs_moved = all(err > 0 for err, _ in differences(ref_fresh, ref).values())
+        fresh_equivalent = fresh_equivalent and inputs_moved  # otherwise this check saw nothing
+        with torch.no_grad():
+            for t, x in zip(leaves, (q, k, v, gate)):
+                t.copy_(x)
 
         with torch.cuda.stream(stream):
             replay_ms = loop(graph.replay)
@@ -228,7 +252,8 @@ def main():
                build=dict(extension_sha256=sha256_file(C.__file__), rep_tk_sha256=sha256_file(HERE / "csrc/rep_tk/rep_tk.cu")),
                inputs=dict(seed=seed, q=digest(q), k=digest(k), v=digest(v), dout=digest(dout), gate=digest(gate),
                            q2k_idx=digest(sel.q2k_idx), bits_ab=digest(sel.bits_ab)),
-               rows=rows, outputs=dict(eager_vs_eager=eager_pair, replay_vs_eager=replay_vs_eager, equivalent=equivalent),
+               rows=rows, outputs=dict(eager_vs_eager=eager_pair, replay_vs_eager=replay_vs_eager, equivalent=equivalent,
+                            fresh_vs_eager=fresh_vs_eager, fresh_input_equivalent=fresh_equivalent),
                attribution=attribute(rows, reason))
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(res, indent=1) + "\n")
@@ -243,7 +268,7 @@ def main():
             print(f"{name}: " + "  ".join(f"{n} {x['max_abs_diff']:.3e}" for n, x in report.items()))
     t = res["attribution"]
     if reason is None:
-        print(f"equivalent: {equivalent}")
+        print(f"equivalent: {equivalent}; fresh_input_equivalent: {fresh_equivalent}")
         print(f"derived, not timed: eager {t['eager_ms']:.3f}  replay {t['replay_ms']:.3f}  recoverable "
               f"{t['recoverable_ms']:+.3f}  floor {t['floor_ms']:.3f}  above floor: {t['recoverable_above_floor']}")
     print(f"wrote {out}")

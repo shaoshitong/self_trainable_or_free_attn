@@ -1,61 +1,120 @@
 # VSA2 64/4/1 representative-block handoff
 
-Date: 2026-11-06
+Start with [section 1](#1-start-here). It holds the current state, the arm model and the measurement rules. The numbered
+sections after it hold the operator, the build, the rows and the record of each round.
 
-Branch:
-<https://github.com/shaoshitong/self_trainable_or_free_attn/tree/vsa2-representative-tk-tma-handoff-20261106>
+## 1. Start here
 
-This document hands off the completed VSA2 representative-block work and its H100
-ThunderKittens/TMA implementation. It is a release and continuation boundary, not a claim that the
-last unverified softmax experiment is complete.
+### Status
 
-## 1. Status and version boundary
+The work is a ThunderKittens/TMA implementation of VSA2's 64/4/1 representative-block fine branch on H100 (sm_90), measured at
+16K/H16/D128/RM4 with the same-build harness in [section 7](#7-tests-and-benchmarks).
 
-The active CUDA source is:
+| Measure | Start | Now | Change |
+|---|---:|---:|---:|
+| Full forward | 1.3704 ms | about 1.128 ms | -17.7% |
+| Full F+B | 4.1789 ms | about 3.873 ms | -7.3% |
 
-```text
-experiments/vsa2_representative/csrc/rep_tk/rep_tk.cu
-SHA-256 6224637ff9a96404e170aa7de568a070c449ae83707564c37cbfae3cffdc784e
-```
+These are as reported by the coordinator; this document does not re-derive them. The campaign's count is six accepted changes and
+fourteen measured refutations plus one analytical one. The refutations this document records are in
+[H100 status](#h100-status), and it does not name all fifteen.
 
-This is the remote snapshot read from:
+Source of truth: `vsa2_rep/ops.py`, `csrc/rep/rep_api.cpp` and `csrc/rep_tk/rep_tk.cu` for what each config does, and `FWD_CFGS` in
+`bench_compare.py` for what each one means.
 
-```text
-aster-debug-1105-worker-0:/efs/astershao/vsa2_rep_work/pkg/csrc/rep_tk/rep_tk.cu
-```
+### Accepted changes
 
-The project instruction selects this remote snapshot as the last built/tested baseline. The test log
-contains successful complete CPU, generic GPU, and TK GPU suites in the tested sequence. Later
-diagnostic native-copy builds and timing runs are also present; the log has no later full-suite pass
-line after those diagnostic-only additions. If an exact byte-to-run attestation is required, rerun
-the suites before changing the source.
+The default path carries six accepted changes, each with a config that restores what it replaced. Each row was checked against
+the source.
 
-The separate local file was modified after an automatic model downgrade and was never synchronized,
-rebuilt, or tested. It is preserved, but is not active:
+| Restored by | What it restores | Read in | Accepted alias | Output against CFG 1 |
+|---:|---|---|---:|---|
+| 20 | the pre-round-4 tier-B gather (32 x 512 B bulk copies) | `rep_tk.cu` dispatch | 10 | generic cross-check |
+| 37 | the pre-round-11 tier-A backward (`zeros(kg)`, `zeros(vg)`, reduce-add kernel) | `rep_tk.cu`, `ops.py` | 36 | forward byte-equal |
+| 40 | coarse CSR metadata rebuilt on every call | `ops.py` | 39 | byte-equal |
+| 43 | representative tables rebuilt from K and V | `ops.py` | 42 | tolerance only |
+| 45 | the two top-k budget chains run one after the other | `rep_api.cpp` | 44 | byte-equal |
+| 47 | each top-k chain builds its kv->q CSR with cols / colscan / cols | `rep_api.cpp` | 46 | byte-equal |
 
-```text
-experiments/vsa2_representative/unverified/rep_tk.softmax-vector-ops-UNVERIFIED.cu
-SHA-256 b7f48a21c910ac5e41b1d6c860abde1a8808c00171c5c8b4fb07f835794b4a65
-```
+CFG 13 is also an alias, of the heuristic tier-C backward split, which has no history arm of its own: CFG 21 restores the old wave
+policy.
 
-Its diff against the active source is:
+CFG 43 is conditional. The routed operator uses the pooled tables only with the TK backend, when `64 // mid_reps == R` and
+`(nb * mid_reps) % 64 == 0`. Outside those it builds from K and V under every config, so CFG 1 vs CFG 43 is an A/A run there.
+`rep_fine_attention` always builds from K and V.
 
-```text
-experiments/vsa2_representative/patches/softmax-vector-ops-UNVERIFIED.patch
-```
+### Arm model
 
-The patch is not applied. It has not been compiled or tested. Do not replace the active file with it
-until the checks in section 9 pass.
+Every config is one kind of arm, and the kind decides what it may be compared with and which rows can mean anything. "History" is a
+label on top of a kind: CFG 20 is a kernel arm, 37 a backward arm, and 40, 43, 45 and 47 routed arms.
 
-No algorithm implementation or GPU test was added during release packaging. This branch is an
-organized snapshot plus handoff.
+| Kind | Arms | Compare with | Output rule | Rows that may move | Controls: a ratio away from 1 is drift |
+|---|---|---|---|---|---|
+| Alias | 1, 10, 13, 36, 39, 42, 44, 46 | each other | byte-equal, or invalid | none; this is an A/A run | all forward rows |
+| Backward | 21, 22, 37 | an alias; 21 with 22 | forward byte-equal, or invalid | the tier it reaches, `b_direct`, `f_plus_b` | forward rows, other tiers |
+| Backward | 23 | 37 only, because it runs on 37's path | as above | as above | as above |
+| Routed, byte-equal | 38, 40, 41, 45, 47 | an alias | byte-equal, or invalid | `full_op` `f` and `f_plus_b` | `kernel` and `fine_op` forward rows |
+| Routed, byte-equal | 48, 49 | CFG 1 only | byte-equal, or invalid | `full_op` `f` and `f_plus_b` | `kernel` and `fine_op` forward rows |
+| Routed, tolerance-equal | 43 | an alias | digests reported; routed cross-check within tolerance | `full_op` `f` and `f_plus_b` | `kernel` and `fine_op` forward rows |
+| Kernel | 11, 20, 24, 32, 33, 34, 35 | CFG 1; each other where one variable differs | digests reported; generic cross-check | any | backward kernels and tables |
+| Kernel, bulk gather | 0, 6, 8, 9 | CFG 20 or each other | digests reported; generic cross-check | any | backward kernels and tables |
+| Diagnostic | 2, 3, 4, 5, 7 | see [section 7](#7-tests-and-benchmarks) | timing only, never a numerical reference | tier-A rows only | native row |
 
-The first packaged snapshot on this branch was already published before the handoff was resumed.
-Because publishing this release was explicitly authorized and the snapshot is public, the resumed
-session preserves that commit rather than rewriting it or force-pushing the branch. Any follow-up
-release commit is authored with the verified GitHub account identity; no upstream commit metadata or
-placeholder WIP identity is reused. The top-level README now scopes its older Triton "ordinary pointer
-loads" statement separately from this package's implemented ThunderKittens/TMA data path.
+`arms_error` refuses the other pairings, because they would change two things at once. CFG 35 is also held to byte equality against
+CFG 1 or it cannot claim a change, and CFG 34 is not, because a fused multiply-add rounds differently.
+
+Byte equality means the `o` and `lse` digests of every forward phase, the digests of the pooled tensors and of the routed operator's `o`
+all match. Each arm's routed selection is also digested in `identity.selection`, including `bits_a` and `bits_ab`, and any difference
+invalidates the result, so CFG 45, 47 and 49 are checked on their bitmaps directly. CFG 41's replay is only reached through
+`rep_attention`, so its check is the output check that the router reproduces the frozen selection. Tolerance equality means the routed
+operator's `o`, dQ, dK, dV and dgate agree with the generic backend at the run's shape.
+
+The guards refuse a routed arm unless host code reads it as `strcmp(x, "N")`, an `REP_TK_FWD_CFG` comparison or `cfg == N`, and refuse any
+alias, backward or routed arm whose forward dispatch is not the default.
+
+CFG 38 is superseded while the pooled tables apply. Its earlier negative stands, and it must not be re-measured on the current default. `ops.py` still starts `rep_tk_build` on the side stream under CFG 38, but the
+pooled branch comes first and never uses that result, so the arm adds a discarded build and cannot measure the overlap it was
+written for. Its overlap path runs only where the pooled guard fails. `bench_stages.py`'s `fine.tables` row calls `tk_tables` directly
+on the main stream, so it is not expected to go to zero under CFG 38 and says nothing about an overlap.
+
+### Measurement rules
+
+Each of these cost real time.
+
+- **Same-run A/B only.** Runs drift by about 2% against each other. Decide with `bench_compare.py`, which interleaves arms in one job, and
+  read the result against that build's own A/A run. `bench_stages.py --compare` and `bench_bwd_stages.py --compare` compare two separate
+  runs: they locate cost and say so in their output, with drift from the rows that cannot move.
+- **Suites before timing.** Run the CPU, generic and TK suites on the build, the TK suite under the arm as well, before reading a timing. The
+  harness cannot enforce this.
+- **No per-call stream or event creation in a hot path.** Creating them per call costs more than some of what is being measured. CFG 44 was
+  fixed for this, and now creates its side stream and events once per process. `bench_bwd_stages.py` preallocates its events for the same reason.
+- **`bench_stages.py`'s `fine` and `fine.tables` describe the fine-only API.** The routed operator builds its tables from the pooled means, so
+  they must not be summed into a decomposition of it. Each row carries `describes`, and `attribution.routed_decomposition` is false.
+- **Do not sum stages into a total.** Only `f_plus_b` and `b_direct` are measured calls, and `b_estimate` is a subtraction, labelled as one.
+- **H200 figures are historical.** Do not compare them with an H100 run.
+
+### What the harness does not prove
+
+- **That an arm took effect.** A byte-equal arm that silently does nothing looks like a neutral result. The guards read source, not the
+  compiled extension. A result cannot claim a change if a source is newer than the extension, but that compares file times only.
+- **That outputs match below their resolution.** Digests resolve bf16 `o` and fp32 `lse`, and cross-checks are tolerances.
+- **Correctness away from the run's shape.** Harness cross-checks use full blocks at one shape. Zero-count blocks, partial blocks and
+  empty selections are only in the test suites, so the suites come first.
+- **That a difference is real.** `may_claim_op_level_change` says the outputs passed. It does not compare a ratio with the A/A displacement,
+  and `control_drift` is reported, not gated.
+- **That the compiled forward is the same, or equally fast**, for arms held to byte equality: read the control rows.
+
+### Where things are
+
+| Entry point | Use |
+|---|---|
+| `tests/test_bench_compare_cpu.py`, `tests/test_reference_cpu.py` | CPU checks, no extension |
+| `tests/test_gpu.py`, `tests/test_gpu_tk.py` | generic and TK suites |
+| `bench_compare.py` | same-build A/B and the decision |
+| `bench_stages.py`, `bench_bwd_stages.py`, `bench_tables.py` | measurement-only stages of the forward, the backward and the table build |
+| `bench_graph.py`, `bench_route_graph.py` | measurement-only CUDA graph probes |
+| `fwd_cfg.py`, `bwdc_split.py`, `one_launch.py`, `prof.py`, `bench_tk.py`, `bench.py` | single-configuration diagnostics |
+| `unverified/`, `patches/` | the original softmax patch, superseded by CFG 1's vector softmax, kept for the record |
 
 ## 2. Operator and softmax semantics
 
@@ -124,19 +183,20 @@ The coarse branch and tanh gate remain VSA2's existing `pool_fwd`, `attn_fwd`, a
 
 - Tier A forward loads native full-block tensors with tensor TMA.
 - Tier B forward uses a pre-swizzled representative table. Each possible 128-byte swizzle phase has a
-  matching record. The selected record's RM rows are copied into a wgmma-ready shared tile with 1-D
-  `cp.async.bulk`; the tile's mbarrier still controls completion.
+  matching record. By default all 128 threads copy the selected rows into a wgmma-ready shared tile with
+  16-byte `cp.async`; CFG 20 restores per-slot 1-D `cp.async.bulk` on an mbarrier.
 - Tier C forward loads the contiguous block-mean table with tensor TMA and masks it with the A/B
   bitmap.
 - All tiers feed one online softmax and `mma_AB` output accumulation.
-- Tier A backward reuses VSA2's native TK backward on the tier-A k2q lists.
+- Tier A backward is VSA2's native TK backward on the tier-A k2q lists. By default each kv block's single owner CTA
+  stores its dK/dV, so `kg` and `vg` need no memset; CFG 37 restores the zero fill and reduce-add.
 - Tier B backward is query-owner. dQ remains in registers. Representative dK/dV are staged and
   reduce-added into the fp32 mid-gradient table with
   `cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32`.
 - Tier C backward is KV-owner over block means. dQ uses tensor-TMA store-add into the shared fp32 dQ
   accumulator.
-- The C backward query range is split across CTAs. The automatic split targets one resident wave
-  rather than launching only one CTA per KV tile.
+- The C backward query range is split across CTAs by FlashAttention's `num_splits_heuristic`; CFG 21 restores
+  the older policy of filling one resident wave.
 
 No Triton, clustering, historical LSE, or new router is used.
 
@@ -164,31 +224,21 @@ csrc/vsa/fuse.cu
 csrc/vsa/sm90_tk/fine_tk_h100.cu              # TK build only
 ```
 
-ThunderKittens is not vendored here. The actual local headers used were:
+ThunderKittens is not vendored here. Use the repository checked out at the commit the VSA2 source tree pins:
 
 ```text
-/Users/astershao/Documents/Codex/2026-11-05/c-kan/work/vsa2/vendor/ThunderKittens
-HEAD 6c27e28c8115d1839d9eeeb530913c184a75fc87
+6c27e28c8115d1839d9eeeb530913c184a75fc87
 ```
 
-That SHA is the pin used by the VSA2 source tree and the experiment setup. A clean get is the
-ThunderKittens repository checked out at that exact commit.
-
-Validated remote environment:
+Environment of the H100 runs, from the sanitized round 2 report:
 
 | Item | Value |
 |---|---|
-| Host | `aster-debug-1105-worker-0` |
-| GPU | NVIDIA H200, sm_90, use GPU 0 only |
-| Python | `/opt/venv/bin/python`, Python 3.12 paths |
-| PyTorch | `2.13.0+cu130` |
+| GPU | NVIDIA H100 80GB HBM3, sm_90, one GPU |
+| PyTorch | `2.11.0+cu130` |
 | CUDA runtime | 13.0 |
-| nvcc | 13.0.48 |
-| CUDA home | `/usr/local/cuda` |
-| Work root | `/efs/astershao/vsa2_rep_work` |
-| Package | `/efs/astershao/vsa2_rep_work/pkg` |
-| VSA2 source | `/efs/astershao/vsa2_rep_work/vsa2_src` |
-| ThunderKittens | `/efs/astershao/vsa2_rep_work/ThunderKittens` |
+| nvcc | 13.2.78 |
+| Compiler | GCC 12.5.0 |
 
 `setup.py` is the authority for build variables. It does not declare a Python dependency set. Use an
 already provisioned PyTorch/CUDA environment matching the measured one. The enclosing repository's
@@ -213,7 +263,7 @@ VSA2_REP_BUILD=1 \
 VSA2_REP_SOURCE="$VSA2_REP_SOURCE" \
 TORCH_CUDA_ARCH_LIST=9.0 \
 MAX_JOBS=24 \
-/opt/venv/bin/python setup.py build_ext --inplace
+python setup.py build_ext --inplace
 ```
 
 TK/TMA backend, sm_90a:
@@ -225,7 +275,7 @@ VSA2_REP_TK_ROOT=/path/to/ThunderKittens \
 VSA2_REP_SOURCE="$VSA2_REP_SOURCE" \
 TORCH_CUDA_ARCH_LIST=9.0a \
 MAX_JOBS=24 \
-/opt/venv/bin/python setup.py build_ext --inplace
+python setup.py build_ext --inplace
 ```
 
 The variables enforced by `setup.py` and `ops.py` are:
@@ -238,16 +288,8 @@ The variables enforced by `setup.py` and `ops.py` are:
 - `CUDA_HOME`: defaults to `/usr/local/cuda`; the linker needs the toolkit driver stub.
 - `VSA2_REP_PTXAS_VERBOSE=1`: optional register/spill diagnostics.
 
-The scripts under `scripts/` are optional parameterized wrappers. They have no host-specific defaults:
-
-```bash
-export VSA2_REP_HOST=aster-debug-1105-worker-0
-export VSA2_REP_REMOTE=/efs/astershao/vsa2_rep_work
-export VSA2_REP_SOURCE=/efs/astershao/vsa2_rep_work/vsa2_src
-export VSA2_REP_TK_ROOT=/efs/astershao/vsa2_rep_work/ThunderKittens
-./scripts/sync_build.sh all
-./scripts/wait_run.sh "CUDA_VISIBLE_DEVICES=0 /opt/venv/bin/python tests/test_gpu_tk.py"
-```
+The scripts under `scripts/` are optional parameterized wrappers. They have no host-specific defaults and read `VSA2_REP_HOST`,
+`VSA2_REP_REMOTE`, `VSA2_REP_SOURCE` and `VSA2_REP_TK_ROOT` from the environment.
 
 ## 6. API
 
@@ -297,22 +339,19 @@ CPU tests need no extension:
 
 ```bash
 cd experiments/vsa2_representative
-CUDA_VISIBLE_DEVICES= \
-  /opt/venv/bin/python tests/test_reference_cpu.py
+python tests/test_reference_cpu.py
 ```
 
 Generic GPU suite:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 \
-  /opt/venv/bin/python tests/test_gpu.py
+<gpu-runner> python tests/test_gpu.py
 ```
 
 TK GPU suite:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 \
-  /opt/venv/bin/python tests/test_gpu_tk.py
+<gpu-runner> python tests/test_gpu_tk.py
 ```
 
 The TK suite checks tables and swizzle, per-tier and all-tier forward/LSE against fp64, agreement with
@@ -320,14 +359,12 @@ native TK on tier A, TK-vs-generic backward dQ/dK/dV, and the routed autograd op
 successful coverage includes D=64/128, `mid_reps=2/4/8`, and an incomplete final block.
 
 `test_masked_and_empty` (generic and TK suites) adds zero-count blocks, all-masked first and intermediate
-tiles, empty selections and per-tier gradients. It has not been run yet, so the recorded passes above do
-not include it.
+tiles, empty selections and per-tier gradients. It is part of the suites from round 2 on.
 
 First fair kernel/op benchmark:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 \
-  /opt/venv/bin/python bench_tk.py \
+<gpu-runner> python bench_tk.py \
   --len 16384 --heads 16 --dim 128 --mid-reps 4 \
   --warmup 10 --iters 30
 ```
@@ -335,8 +372,7 @@ CUDA_VISIBLE_DEVICES=0 \
 Generic op benchmark:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 \
-  /opt/venv/bin/python bench.py \
+<gpu-runner> python bench.py \
   --len 16384 --heads 16 --dim 128 --batch 1 --iters 20
 ```
 
@@ -348,8 +384,8 @@ one final synchronize.
 Targeted timing helpers:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 /opt/venv/bin/python fwd_cfg.py
-CUDA_VISIBLE_DEVICES=0 /opt/venv/bin/python bwdc_split.py
+<gpu-runner> python fwd_cfg.py
+<gpu-runner> python bwdc_split.py
 ```
 
 Configurations. The config table in `bench_compare.py` describes the kernel that has the CFG 20 history arm.
@@ -377,8 +413,8 @@ from a build containing CFG 20.
 | 24 | measured negative arm: `fwd_pipe_ker`, CFG 11's K double buffer plus a two-stage softmax, the next tile's QK issued before the current softmax finishes | TK vector | 2 | `cp.async` | not recorded here | not recorded here |
 | 32 | measured negative arm: `fwd_ring_ker`, two CTAs/SM, K and V both double-buffered | TK vector | 2 | `cp.async` | not recorded here | not recorded here |
 | 33 | measured negative arm: `fwd_ring_ker`, two CTAs/SM, K and V both triple-buffered | TK vector | 2 | `cp.async` | not recorded here | not recorded here |
-| 34 | CFG 1 with the log2(e)*scale multiply and the tier-B/C bias add folded into one FFMA | TK vector | 3 | `cp.async` | not built yet | not built yet |
-| 35 | CFG 1 skipping the O rescale when no row's running maximum moved in the tile | TK vector | 3 | `cp.async` | not built yet | not built yet |
+| 34 | CFG 1 with the log2(e)*scale multiply and the tier-B/C bias add folded into one FFMA | TK vector | 3 | `cp.async` | not recorded here | not recorded here |
+| 35 | CFG 1 skipping the O rescale when no row's running maximum moved in the tile | TK vector | 3 | `cp.async` | not recorded here | not recorded here |
 | 20 | the pre-round-4 forward, with CFG 1's backward | TK vector | 3 | bulk | 168 | 24 |
 | 6 | `fwd_ker`, all tiers; a softmax pair with CFG 20 | hand-written | 3 | bulk | 168 | 16 |
 | 8 | `fwd_ker`, all tiers | TK vector | 2 | bulk | not recorded here | not recorded here |
@@ -397,7 +433,7 @@ CFG 32 and 33 are also refused if the launched kernel's `__launch_bounds__` does
 kernel on purpose, with a host-set `diag` flag; they are refused without that flag assignment or if they launch anything
 else. CFG 21/22/23 are measured negative or neutral arms; see H100 status.
 
-Occupancy of the forward arms, D=128. Fill the `not built yet` cells from the build's `ptxas` output:
+Occupancy of the forward arms, D=128. Cells marked `not recorded here` come from a build's `ptxas` output:
 
 | CFG | Registers | Spills | Dynamic shared memory | Register limit | Shared-memory limit | Implied CTAs/SM |
 |---:|---:|---|---:|---:|---:|---:|
@@ -406,8 +442,8 @@ Occupancy of the forward arms, D=128. Fill the `not built yet` cells from the bu
 | 24 | not recorded here | not recorded here | 66,560 B | not recorded here | 3 | 3, as reported in round 7 |
 | 32 | not recorded here | not recorded here | 82,984 B | not recorded here | 2 | 2 |
 | 33 | not recorded here | not recorded here | 115,256 B | not recorded here | 2 | 2 |
-| 34 | not built yet | not built yet | 50,176 B if unchanged | 3, while `__launch_bounds__(128, 3)` | 4 | 3 |
-| 35 | not built yet | not built yet | 50,176 B if unchanged | 3, while `__launch_bounds__(128, 3)` | 4 | 3 |
+| 34 | not recorded here | not recorded here | 50,176 B | 3, while `__launch_bounds__(128, 3)` | 4 | 3 |
+| 35 | not recorded here | not recorded here | 50,176 B | 3, while `__launch_bounds__(128, 3)` | 4 | 3 |
 
 These limits are derived, not measured, and the implied figure is the smaller of the two. The register limit is 4
 CTAs/SM up to 128 registers, 3 up to 168 and 2 up to 255, the caps stated in the kernel's comments. The shared-memory
@@ -448,53 +484,7 @@ cannot claim a change. This resolves bf16 `o` and fp32 `lse`, and the skip does 
 within bf16 rounding of 1.0f passes. Read CFG 35 with that in mind. CFG 34 is not held to byte identity, because a fused
 multiply-add rounds differently; the generic cross-check and the TK suite are its checks.
 
-The default path carries six accepted changes, each with a config that restores what it replaced. Together they took the full
-forward from 1.3704 to about 1.128 ms (-17.7%) and F+B from 4.1789 to about 3.873 ms (-7.3%). CFG 36, 39, 42, 44 and 46 stay as
-accepted aliases of the changes they introduced:
-
-| Config | Restores | Output against CFG 1 | Forward rows |
-|---:|---|---|---|
-| 20 | the pre-round-4 tier-B gather (32 x 512 B bulk copies) | generic cross-check | may move |
-| 37 | the pre-round-11 tier-A backward (`zeros(kg)`, `zeros(vg)`, reduce-add kernel) | forward byte-equal | controls |
-| 40 | coarse CSR metadata rebuilt on every call | byte-equal | `full_op` may move; others controls |
-| 43 | representative tables rebuilt from K and V | tolerance only | `full_op` may move; others controls |
-| 45 | the two top-k budget chains run one after the other | byte-equal | `full_op` may move; others controls |
-| 47 | each top-k chain builds its kv->q CSR with cols / colscan / cols | byte-equal | `full_op` may move; others controls |
-
-There are four kinds of arm besides these labels:
-
-| Kind | Arms | What the harness asserts |
-|---|---|---|
-| Aliases | 1, 10, 13, 36, 39, 42, 44, 46 | forward dispatch is the default; byte-equal to each other; forward rows are controls |
-| Backward | 21, 22, 23, 37 | as aliases for the forward; the tier each reaches stops being a control; backward rows required |
-| Routed | 38, 40, 41, 43, 45, 47, 48, 49 | host code reads the config; forward dispatch is the default; byte-equal to CFG 1 except 43; `kernel` and `fine_op` forward rows are controls; `full_op.tk.routed.f` and `f_plus_b` required |
-| Kernel | 0, 6, 8, 9, 11, 20, 24, 32, 33, 34, 35 | launch what they claim; generic cross-check; CFG 35 also byte-equal or no claim |
-
-Byte equality means the `o` and `lse` digests of every forward phase, the digests of the pooled tensors and of the routed operator's
-`o` all match, or the result is invalid. The last two matter for router-pass arms: coarse means and pooled tables reach none of the
-phase rows, so a pool change could otherwise pass unseen. Each arm's routed selection is also digested in `identity.selection`,
-including `bits_a` and `bits_ab`, and any difference invalidates the result. Those are computed by `route_tiers`, so CFG 45, 47 and 49
-are checked on their bitmaps directly. CFG 41's replay is only reached through `rep_attention`, so its check is the output check that
-the router reproduces the frozen selection.
-
-CFG 48 and 49 are routed arms, not aliases, and are comparable against CFG 1 only. CFG 47 is comparable against CFG 1 or an alias. Each
-is refused until `ops.py`, `rep_api.cpp` or `rep_tk.cu` reads it, as a quoted number or a `cfg == <value>` test. The rows to read:
-
-| Arm | `bench_compare.py` | `bench_stages.py` | Controls |
-|---|---|---|---|
-| 48 | `full_op.tk.routed.f`, `f_plus_b` | `pool` | `kernel` and `fine_op` forward rows |
-| 49 | `full_op.tk.routed.f`, `f_plus_b` | `route` | `kernel` and `fine_op` forward rows |
-
-Their forward kernel does not change, so a `kernel.tk.fwd.*` or `fine_op` forward ratio away from 1 is run drift, not an effect.
-
-CFG 43 is conditional. The routed operator uses the pooled tables only with the TK backend, when `64 // mid_reps == R` and
-`(nb * mid_reps) % 64 == 0`. Outside those it builds from K and V under every config, so CFG 1 vs CFG 43 is an A/A run there.
-`rep_fine_attention` always builds from K and V.
-
-CFG 38 is superseded while the pooled tables apply. Its earlier negative stands, and it must not be re-measured on the current default. `ops.py` still starts `rep_tk_build` on the side stream under CFG 38, but the
-pooled branch comes first and never uses that result, so the arm adds a discarded build and cannot measure the overlap it was
-written for. Its overlap path runs only where the pooled guard fails. `bench_stages.py`'s `fine.tables` row calls `tk_tables` directly
-on the main stream, so it is not expected to go to zero under CFG 38 and says nothing about an overlap.
+The accepted changes and the arm model are in [section 1](#1-start-here).
 
 `REP_TK_BWDC_SPLITS=<positive>` forces the tier-C split and `REP_TK_BWDC_SPLITS=wave` selects the old policy. At
 D=128, B=1, H=16 and 132 SMs, read from the kernel's formulas, many pairs of policies coincide, so a comparison
@@ -682,7 +672,7 @@ Round 12: CFG 36 is confirmed as the default: CFG 37 read 1.0369 on `fine_op` `b
 `bench_graph.py` measured a replay of one forward and backward at 3.9256 ms against 4.0435 ms eager, 0.118 ms or 2.9% of F+B,
 above the run's 0.030 ms floor, with a bit-identical forward and one bf16 ulp on dQ, dK and dV. It is available, not adopted.
 
-Next: CFG 48 and CFG 49, once each lands, on one build, with the suites passing on it.
+CFG 48 and CFG 49 are in the source and are not defaults. No outcome is recorded here yet. On one build, with the suites passing on it:
 
 ```bash
 REP_TK_FWD_CFG=48 <gpu-runner> python tests/test_gpu_tk.py
@@ -706,6 +696,7 @@ plus its `backward()` into a CUDA graph on a non-default stream, on static input
 | `eager`, `eager.repeat` | routed F+B on the default stream, first and last; their spread is the floor |
 | `eager.same_stream` | the same call on the capture stream with autograd multithreading off |
 | `graph.replay` | replays in a loop with no synchronize inside, the same boundaries as `eager` |
+| `graph.replay_with_copy` | the same with inputs copied into the captured buffers each step, which a real caller must do |
 | `graph.event_pair` | an event pair around one replay |
 | `graph.host_call` | host wall time of the `graph.replay()` call |
 
@@ -721,8 +712,13 @@ something this measures.
 `outputs` reports max absolute differences on `o`, `dq`, `dk` and `dv` for replay against eager and for eager against eager. The
 second is the floor, since dQ, dK and dV include fp32 reductions in a nondeterministic order. `equivalent` uses the generic
 cross-check's tolerances. If capture or replay raises, the reason is recorded and printed, the graph rows are marked
-`available=false`, and the eager rows are still produced. A kernel launched outside the capture would not raise, and would show
-as a failed `equivalent`.
+`available=false`, and the eager rows are still produced.
+
+`equivalent` runs on the captured inputs, so it cannot see a kernel that escaped the capture: that kernel ran once during capture, its output
+stays right for those inputs, and the replay also looks faster for skipping it. `fresh_input_equivalent` writes different values into the
+captured inputs and compares a replay with an eager call on them. `recoverable_ms` is only meaningful if it is true. Round 12's figure predates
+this check, so it should be rerun before being relied on. `graph.replay_with_copy` copies the original values back in, so it times the copy without
+testing it. `bench_route_graph.py` has its own check, `replay_vs_eager_changed_input`.
 
 ### Backward stages
 
@@ -849,50 +845,14 @@ describe the sum as a measured op result. A new same-build full op run is still 
 The raw, extracted benchmark text is under `experiments/vsa2_representative/results/`. Raw model
 logs and prompts are intentionally not committed.
 
-## 9. Unfinished softmax optimization
+## 9. Softmax line, closed
 
-The remaining performance question was isolated with a controlled same-build test:
+The original question was a controlled pair at 0.471 and 0.579 ms: the copied native loop with the native softmax, and with the hand-written
+one. That roughly 0.108 ms is confounded: the CFG 5 of that run divided only the `.x` lanes of `o`, by one row's sum, while CFG 4 ran a complete
+`div_row`, so the pair also compared two epilogues. It should not be quoted as a softmax cost.
 
-| Diagnostic path | Time |
-|---|---:|
-| Copied native TK loop + native TK softmax | 0.471 ms |
-| Same copied loop + experiment hand-written softmax | 0.579 ms |
-| Independent native TK kernel | about 0.486 ms |
-
-The controlled pair attributes about 0.108 ms to the hand-written softmax under that test. It does not
-identify TMA setup or the harness as the cause.
-
-This figure is confounded and must be rerun. The CFG 5 of that run divided only the `.x` lanes of `o`, by
-one row's sum, while CFG 4 ran a complete `div_row`, so the pair also compared two epilogues. The current
-CFG 5 normalizes both rows and all elements, and CFG 7 adds the TK-vector softmax to the same copied loop.
-
-The intended follow-up was to replace the hand-written row max/sum/rescale loop with ThunderKittens
-vector operations. The local patch attempts that change, plus LSE staging through a TK column vector
-and TMA store. It is unverified and may contain compile or numerical errors.
-
-The automatic downgrade edit was the last action involving that file. There was no subsequent rsync,
-build, or test command. Do not apply, "fix while publishing", or benchmark it as accepted work.
-
-Suggested controlled continuation:
-
-1. Work on a separate branch and keep the active tested file unchanged.
-2. Inspect the patch; do not assume its vector-op types or LSE descriptor are valid.
-3. Apply only in a disposable checkout.
-4. Build with the exact TK command in section 5 and capture nvcc/ptxas output.
-5. Run CPU, generic GPU, and full TK GPU suites.
-6. Repeat the controlled pair in one build with `bench_compare.py --profile controlled-softmax`, which
-   keeps the same inputs and warmup/iteration settings. That result is timing only.
-7. Run the representative profile of `bench_compare.py`, which includes complete-call scope, before
-   claiming an op-level improvement.
-
-To inspect the patch without applying it:
-
-```bash
-cd experiments/vsa2_representative
-git apply --check patches/softmax-vector-ops-UNVERIFIED.patch
-```
-
-Successful `--check` would prove textual applicability only, not correctness.
+The vector softmax now in CFG 1 was measured against the hand-written CFG 6 in round 2 and gave no operator improvement above A/A. The patch
+under `patches/` and `unverified/` was an earlier attempt, is not applied and was never compiled.
 
 ## 10. Problems already resolved
 
@@ -902,9 +862,9 @@ Successful `--check` would prove textual applicability only, not correctness.
 - **Mid-table swizzle phase.** Tier-B records are pre-swizzled for each start phase a slot can take.
   Tests un-swizzle the stored table and compare it bit-exactly with plain bf16 group means.
 - **Register spill/pressure, not resolved for the all-tier path.** An earlier note here reported 128
-  registers and no spill for the target forward. That does not describe the all-tier kernel: at D=128, CFG 1
-  and CFG 6 use 168 registers and spill (see the table in section 7). Recheck resource output after every
-  kernel edit.
+  registers and no spill for the target forward. That does not describe the all-tier kernel: at D=128 the bulk-gather
+  CFG 20 and CFG 6 use 168 registers and spill, and the `cp.async` gather in CFG 1 reported 166 and no spills (see the
+  table in section 7). Recheck resource output after every kernel edit.
 - **Tier-C backward under-occupancy.** One CTA per tail tile gave only 64 CTAs at 16K/H16. Splitting
   each tile's query range across CTAs reduced measured tier-C backward from 0.792 to 0.247 ms.
 - **Tier-B dependency/load ordering.** Table indices are read into registers before issuing volatile
@@ -915,14 +875,8 @@ Successful `--check` would prove textual applicability only, not correctness.
 
 ## 11. Counter and measurement limits
 
-`ncu` returns:
-
-```text
-ERR_NVGPUCTRPERM
-```
-
-No permission or driver workaround was attempted. There are therefore no measured MFU, occupancy,
-stall-reason, or DRAM-throughput numbers in this work. Do not infer them from CUDA-event timings.
+The harness collects no hardware counters, and no permission or driver workaround is authorized. It reports no MFU, occupancy, stall-reason
+or DRAM-throughput numbers. Do not infer them from CUDA-event timings.
 
 Timing labels are equally important:
 
@@ -932,33 +886,18 @@ Timing labels are equally important:
 - all-tier rows compute the 64/4/1 approximation;
 - partial sums from later iterations are not a complete measurement.
 
-## 12. Machine and file ownership
+## 12. Execution and file ownership
 
-Use only:
-
-```text
-SSH host: aster-debug-1105-worker-0
-Remote package: /efs/astershao/vsa2_rep_work/pkg
-GPU: CUDA_VISIBLE_DEVICES=0
-```
-
-Do not use `aster-sparse-attn-fwd-1105-06713-worker-0`; its four GPUs belong to another chat.
-Do not alter the nvidia driver or counter permissions on the shared H200 host.
-
-The original WIP checkout under the local source workspace was left untouched. It contains an
-unrequested WIP commit with placeholder identity; this branch does not copy that `.git` directory,
-history, or identity.
-
-Release inventory:
+GPU execution goes through the coordinator. `<gpu-runner>` in this document stands for however the coordinator launches a command on one GPU with
+the provisioned Python. The harness requires exactly one visible GPU and records no node name, address or raw device id.
 
 ```text
 experiments/vsa2_representative/                  portable package and 64/4/1 sources
 experiments/vsa2_representative/results/          selected measured output extracts
-experiments/vsa2_representative/patches/          unverified softmax patch, not applied
-experiments/vsa2_representative/unverified/       full unverified source snapshot
+experiments/vsa2_representative/patches/          the original softmax patch, not applied
+experiments/vsa2_representative/unverified/       its full source snapshot
 experiments/vsa2_representative/scripts/          parameterized remote build wrappers
 docs/vsa2_representative_handoff.md               this handoff
 ```
 
-Excluded: `.git`, build trees, `.so`, `__pycache__`, vendored ThunderKittens, weights/media, raw model
-logs, system prompts, credentials, and SSH material.
+Excluded: `.git`, build trees, `.so`, `__pycache__`, vendored ThunderKittens, weights and media, raw model logs, and credentials.

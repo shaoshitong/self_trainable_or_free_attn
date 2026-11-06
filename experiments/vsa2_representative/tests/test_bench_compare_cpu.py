@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from bench_bwd_stages import ZEROS, attribute as attribute_backward, batches, fill_absent, intervals
 from bench_graph import GRAPH_ROWS, attribute as attribute_graph, compare_outputs, row as graph_row
 from bench_stages import attribute, compare_stages
-from bench_compare import (ALIASES, HISTORY_ARMS, BACKWARD_READ_ROWS, launch_bound, FWD_CFGS, PROFILES, abba, active_fwd_cfg, arms_error, assemble,
+from bench_compare import (ALIASES, HISTORY_ARMS, control_drift, BACKWARD_READ_ROWS, launch_bound, FWD_CFGS, PROFILES, abba, active_fwd_cfg, arms_error, assemble,
                            backward_row_is_control, cfg_error, claims, forward_must_match, fwd_dispatch, fwd_kernel_name,
                            parse_config, summarize)
 
@@ -233,6 +233,50 @@ def test_router_pass_arms_are_byte_equal_against_cfg1_only():
         assert assemble({}, "representative", pair("1", value), [], [a, b])["status"].startswith("invalid"), "a pool byte moved"
 
 
+def test_comparisons_that_change_two_things_are_refused():
+    pair = lambda x, y: {"baseline": {"REP_TK_FWD_CFG": x}, "candidate": {"REP_TK_FWD_CFG": y}}
+    assert arms_error(pair("20", "45")) and arms_error(pair("40", "45")) and arms_error(pair("43", "47")), "two changes at once"
+    assert arms_error(pair("1", "45")) is None and arms_error(pair("42", "43")) is None
+    assert arms_error(pair("1", "6")) and arms_error(pair("1", "8")), "softmax or MINB, and the gather as well"
+    assert arms_error(pair("20", "6")) is None and arms_error(pair("20", "8")) is None and arms_error(pair("8", "9")) is None
+    assert arms_error(pair("20", "1")) is None and arms_error(pair("11", "24")) is None and arms_error(pair("32", "33")) is None
+
+
+def test_evidence_must_be_code_that_reads_the_config():
+    assert cfg_error("45", ROUND5, 'tol = {"45": 1}  # a quoted number that reads nothing'), "not evidence"
+    assert cfg_error("45", ROUND5, 'std::strcmp(cfg_env, "45") == 0') is None
+    assert cfg_error("48", ROUND5, 'std::strcmp(e, "48") == 0') is None
+    assert cfg_error("43", ROUND5, 'os.environ.get("REP_TK_FWD_CFG") != "43"') is None
+    src = kernel(BULK) + "if (cfg == 34) x = 1;\n  g.diag |= rep_tk::kDiagFma;\n"
+    assert cfg_error("34", src), "a flag set elsewhere is not this arm's flag"
+    for alias in ("39", "42", "44", "46"):
+        assert cfg_error(alias, kernel(BULK, f"(cfg == {alias}) launch(rep_tk::fwd_ker<D, 4>);")), "an alias must launch the default"
+
+
+def test_passing_outputs_are_not_reported_as_a_passing_comparison():
+    a, b = child("baseline", 1), child("candidate", 1)
+    res = assemble({}, "representative", {}, [], [a, b])
+    assert any("does not say a difference" in x for x in res["claims"]["limits"])
+    assert control_drift([dict(id="x", control=True, candidate_over_baseline=1.05), dict(id="y", control=True, candidate_over_baseline=0.99),
+                          dict(id="z", control=False, candidate_over_baseline=3.0)]) == dict(rows=2, worst_row="x", worst_ratio=1.05)
+    assert control_drift([])["rows"] == 0
+    b["stale_extension_sources"] = ["rep_api.cpp"]
+    res = assemble({}, "representative", {}, [], [a, b])
+    assert res["claims"]["may_claim_op_level_change"] is False, "a stale extension may not contain the arm"
+    a["forward_output"], b["forward_output"] = {"B": "x"}, {"B": "y"}
+    same = {"baseline": {"REP_TK_FWD_CFG": "1"}, "candidate": {"REP_TK_FWD_CFG": "1"}}
+    assert any("A/A run was not byte-identical" in x for x in assemble({}, "representative", same, [], [a, b])["claims"]["limits"])
+
+
+def test_stage_compare_says_it_is_not_a_same_run_comparison():
+    run = lambda cfg, ms: dict(fwd_cfg=cfg, build={}, inputs={}, shape={}, timing={}, hardware={},
+                               rows=[dict(id="pool", ms=[ms], reads_fwd_cfg=False), dict(id="fine", ms=[ms], reads_fwd_cfg=True)])
+    res = compare_stages(run("1", 1.0), run("48", 1.02))
+    assert res["same_run"] is False and abs(res["unread_row_drift"] - 0.02) < 1e-9
+    row = lambda n, ms, in_sum: dict(id=n, ms=[ms], in_sum=in_sum)
+    assert attribute([row("total", 1.0, False), row("fine", 1.0, True)])["routed_decomposition"] is False
+
+
 def test_backward_arm_is_single_variable():
     cfg = lambda v, **kw: dict(REP_TK_FWD_CFG=v, **kw)
     pair = lambda a, b: {"baseline": a, "candidate": b}
@@ -440,6 +484,10 @@ if __name__ == "__main__":
     test_history_and_alias_arms_are_registered()
     test_routed_arms_read_host_code_and_keep_full_op_timing_visible()
     test_router_pass_arms_are_byte_equal_against_cfg1_only()
+    test_comparisons_that_change_two_things_are_refused()
+    test_evidence_must_be_code_that_reads_the_config()
+    test_passing_outputs_are_not_reported_as_a_passing_comparison()
+    test_stage_compare_says_it_is_not_a_same_run_comparison()
     test_backward_arm_is_single_variable()
     test_backward_arm_reaches_only_its_tier()
     test_forward_change_under_backward_arm_is_invalid()

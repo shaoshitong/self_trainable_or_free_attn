@@ -117,7 +117,7 @@ def main():
             res = compare_stages(x, y)
         except ValueError as e:
             sys.exit(str(e))
-        print(f"{NOTE}\nCFG{res['fwd_cfgs'][0]} vs CFG{res['fwd_cfgs'][1]}, same build")
+        print(f"{NOTE}\nCFG{res['fwd_cfgs'][0]} vs CFG{res['fwd_cfgs'][1]}, same build, {res['cross_run_note']}")
         for r in res["rows"]:
             ratio = "n/a" if r["b_over_a"] is None else f"{r['b_over_a']:.3f}"
             print(f"{r['id']:46s} {r['a_ms']:9.3f} {r['b_ms']:9.3f} {ratio:>7s}")

@@ -57,7 +57,10 @@ def compare_stages(a, b):
     for n in ids:  # a row only one configuration has reads as zero in the other, never as a dropped row
         x, y = med["a"].get(n, 0.0), med["b"].get(n, 0.0)
         rows.append(dict(id=n, reads_fwd_cfg=reads[n], a_ms=x, b_ms=y, b_over_a=y / x if x else None))
-    return dict(measured_rows=True, note=NOTE, fwd_cfgs=[a["fwd_cfg"], b["fwd_cfg"]], rows=rows)
+    unread = [abs(r["b_over_a"] - 1.0) for r in rows if r["reads_fwd_cfg"] is False and r["b_over_a"]]
+    return dict(measured_rows=True, note=NOTE, fwd_cfgs=[a["fwd_cfg"], b["fwd_cfg"]], rows=rows, same_run=False,
+                cross_run_note="two runs, not an interleaved A/B: read differences against unread_row_drift, and decide "
+                               "with bench_compare.py", unread_row_drift=max(unread, default=None))
 
 
 def attribute(rows):
@@ -71,7 +74,7 @@ def attribute(rows):
     total, parts = statistics.median(totals), [r["id"] for r in rows if r["in_sum"]]
     sum_parts = sum(median[p] for p in parts)
     floor = max(totals) - min(totals)
-    return dict(measured=False, note=NOTE, total_ms=total, parts=parts, sum_of_parts_ms=sum_parts,
+    return dict(measured=False, note=NOTE, routed_decomposition=False, total_ms=total, parts=parts, sum_of_parts_ms=sum_parts,
                 residual_ms=total - sum_parts, floor_ms=floor, sum_within_floor=abs(total - sum_parts) <= floor,
                 outside_fine_ms=total - median["fine"], floor_method="max - min of the total batches of this run")
 
@@ -90,7 +93,8 @@ def main():
             res = compare_stages(x, y)
         except ValueError as e:
             sys.exit(str(e))
-        print(f"{NOTE}\nCFG{res['fwd_cfgs'][0]} vs CFG{res['fwd_cfgs'][1]}, same build")
+        print(f"{NOTE}\nCFG{res['fwd_cfgs'][0]} vs CFG{res['fwd_cfgs'][1]}, same build, {res['cross_run_note']}; "
+              f"unread row drift {res['unread_row_drift']}")
         for r in res["rows"]:
             tag = "" if r["reads_fwd_cfg"] else "  does not read the config"
             ratio = "n/a" if r["b_over_a"] is None else f"{r['b_over_a']:.3f}"
@@ -160,11 +164,11 @@ def main():
     total = lambda: rep_attention(qq, kk, vv, gg, cnt, R=R, tiers=tiers, backend="tk")
     stages = (
         ("total", False, None, total),
-        ("pool", True, None, lambda: C.pool_fwd(q, k, v, cnt, R)),
+        ("pool", True, "pool_fwd; the routed default uses pool_fwd_vr", lambda: C.pool_fwd(q, k, v, cnt, R)),
         ("route", True, None, lambda: C.route_tiers(qr, kr, cnt, R, ba, bab, row_norm, max_score)),
         ("route.one_budget", False, "different work: one top-k and no tier-B lists; not a part of route",
          lambda: C.route_tiers(qr, kr, cnt, R, one, one, row_norm, max_score)),
-        ("coarse.meta", True, None, lambda: _coarse_meta(B, H, nb, qc.shape[2], q.device)),
+        ("coarse.meta", True, "uncached; the routed default caches this", lambda: _coarse_meta(B, H, nb, qc.shape[2], q.device)),
         ("coarse.attn", True, None, lambda: C.attn_fwd(qc, kc, vc, c_ptr, c_idx, c_cnt)),
         ("fine", True, None, lambda: rep_fine_attention(qq, kk, vv, cnt, sel, mid_reps=rm, backend="tk")),
         ("fine.tables", False, "inside fine: representative tables and flattened tier-B log counts",

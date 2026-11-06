@@ -121,6 +121,7 @@ HISTORY_ARMS = {"20": "the pre-round-4 tier-B gather (32 x 512 B bulk copies)",
 ROUTED_ARMS = {"38", "40", "41", "43", "45", "47", "48", "49"}
 CFG1_ONLY = {"48", "49"}  # one change each to the router pass; comparable against CFG1 and nothing else
 TOLERANCE_EQUAL = {"43"}  # the group means are rounded to bf16 before the block mean is formed
+BULK_GATHER = {"0", "6", "8", "9"}  # measured against the old default, whose forward CFG20 now is
 ROUTED_READ_ROWS = ("full_op.tk.routed.f", "full_op.tk.routed.f_plus_b")
 OWN_FORWARD = ("20", "24", "32", "33")  # meaningless if they launch the default kernel
 RUNTIME_ARMS = {"34", "35"}  # deliberately the default kernel; a host-set diag flag selects the behaviour
@@ -177,7 +178,8 @@ def cfg_error(value, source, host=None):
         return "this kernel source has no CFG20 history arm; the config table does not describe it"
     if value in ROUTED_ARMS:
         host = host_source() if host is None else host
-        if not re.search(rf'"{value}"', host) and not re.search(rf"\w*cfg\w*(\(\))? [=!]= {value}\b", source + host):
+        reads = rf'(REP_TK_FWD_CFG"\)|strcmp\(\w+,)[^\n]*"{value}"'
+        if not re.search(reads, host) and not re.search(rf"\w*cfg\w*(\(\))? [=!]= {value}\b", source + host):
             return f"REP_TK_FWD_CFG={value} is not read by the host code or this kernel source"
     if value not in ALIASES and value not in ROUTED_ARMS and value not in BACKWARD_ARMS and not re.search(rf"\w*cfg\w* == {value}\b", source):
         return f"REP_TK_FWD_CFG={value} is not implemented by this kernel source"
@@ -188,13 +190,13 @@ def cfg_error(value, source, host=None):
     # A runtime-flag arm launches the default kernel on purpose, so the dispatch text cannot distinguish it;
     # the evidence is the flag assignment next to the config number.
     if value in RUNTIME_ARMS:
-        if not re.search(rf"cfg == {value}\b", source) or not re.search(r"g\.diag \|=", source):
+        if not re.search(rf"cfg == {value}\)\s*g\.diag \|=", source):
             return f"REP_TK_FWD_CFG={value} is not implemented by a diag flag in this source"
         table = fwd_dispatch(source) or {}
         if table and table.get(value, table.get("default")) != table.get("default"):
             return f"REP_TK_FWD_CFG={value} must launch the default kernel and select by flag"
         return None
-    if value in ("10", "13", "36", *ROUTED_ARMS, *OWN_FORWARD, *BACKWARD_ARMS):
+    if value in (*(set(ALIASES) - {"1"}), *ROUTED_ARMS, *OWN_FORWARD, *BACKWARD_ARMS):
         table = fwd_dispatch(source)
         if not table:
             return f"cannot read the forward dispatch to check REP_TK_FWD_CFG={value}"
@@ -242,8 +244,12 @@ def arms_error(configs):
     for value in arms & CFG1_ONLY:
         if not arms <= {value, "1"}:
             return f"CFG{value} is comparable against CFG1 only, not {sorted(arms)}"
-    if "47" in arms and not arms <= {"47", *ALIASES}:
-        return f"CFG47 merges router kernels; compare it with CFG1 so that nothing else changes, not {sorted(arms)}"
+    for value in arms & ROUTED_ARMS:
+        if not arms <= {value, *ALIASES}:
+            return f"CFG{value} changes the routed path; compare it with CFG1 so that nothing else changes, not {sorted(arms)}"
+    if arms & BULK_GATHER and arms & FORWARD_EQUAL:
+        return f"{sorted(arms & BULK_GATHER)} keep the bulk gather, so against {sorted(arms & FORWARD_EQUAL)} they change the " \
+               "gather as well; CFG20 is their single-variable partner"
     if "23" in arms and arms != {"23"} and arms != {"23", "37"}:
         return "CFG23 runs on CFG37's reduce-add path, so only CFG37 vs CFG23 changes one thing"
     if len({BACKWARD_ARMS[a] for a in backward}) > 1:
@@ -333,6 +339,13 @@ def summarize(children):
     return out
 
 
+def control_drift(summary):
+    """How far the rows that cannot move did move. Reported, because no threshold here could be justified."""
+    ratios = {s["id"]: s["candidate_over_baseline"] for s in summary if s.get("control") and "candidate_over_baseline" in s}
+    worst = max(ratios, key=lambda n: abs(ratios[n] - 1.0), default=None)
+    return dict(rows=len(ratios), worst_row=worst, worst_ratio=ratios.get(worst))
+
+
 def mark_shared_forward(summary, configs):
     """Forward rows a pair of arms cannot move are controls. A routed arm can still move the full operator's forward."""
     arms = {c.get("REP_TK_FWD_CFG") for c in configs.values()}
@@ -369,19 +382,28 @@ def assemble(args_dict, profile, configs, order, children):
         bad = bad + [f"missing row {r}" for r in ROUTED_READ_ROWS if r not in ids]
     if bad:
         claim["may_claim_op_level_change"] = False
+    claim["limits"] = claim["limits"] + ["may_claim_op_level_change says the outputs passed; it does not say a difference "
+                                         "exceeds the A/A displacement or that the control rows held still"]
+    stale = sorted({n for c in children for n in c.get("stale_extension_sources", ())})
+    if stale:
+        claim["may_claim_op_level_change"] = False
+        claim["limits"] = claim["limits"] + [f"extension is older than these sources, so an arm may not be in it: {stale}"]
     arms = {c.get("REP_TK_FWD_CFG") for c in configs.values()}
+    if len(arms) == 1 and identical is False:
+        claim["limits"] = claim["limits"] + ["an A/A run was not byte-identical, so forward digests cannot separate arms"]
     if arms & set(BYTE_EQUAL_PREMISE) and arms & set(ALIASES):
         if identical is not True:
             claim["may_claim_op_level_change"] = False
         claim["limits"] = claim["limits"] + [
             f"alpha premise: forward outputs byte-identical to CFG1: {identical}. This resolves bf16 o and fp32 lse only, "
             "so an alpha within bf16 rounding of 1.0f passes; it does not show alpha is exactly 1.0f"]
+    summary = [] if bad else mark_shared_forward(summarize(children), configs)
     return dict(schema=SCHEMA, profile=profile, created_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                settings=args_dict, configs=configs, run_order=order,
+                settings=args_dict, configs=configs, run_order=order, control_drift=control_drift(summary),
                 status="invalid: arms differ in " + ", ".join(bad) if bad else "ok",
                 identity_differences=bad, claims=claim, forward_outputs_byte_identical=identical,
                 counters=dict(collected=False, reason="not collected by this harness; no counter workaround is authorized"),
-                summary=[] if bad else mark_shared_forward(summarize(children), configs), children=children)
+                summary=summary, children=children)
 
 
 def run_child(a, arm, config, round_idx):
@@ -408,6 +430,9 @@ def report(res):
         else:
             print(f"{s['id']:44s} {s['work']:12s} {s['baseline']['median_ms']:9.3f} {s['candidate']['median_ms']:9.3f}"
                   f"  {s['candidate_over_baseline']:.3f}{'  control' if s['control'] else ''}")
+    drift = res["control_drift"]
+    print(f"forward outputs byte-identical: {res['forward_outputs_byte_identical']}; "
+          f"worst control row: {drift['worst_row']} {drift['worst_ratio']}")
     print(f"output validated: {res['claims']['output_validated']}; "
           f"may claim op-level change: {res['claims']['may_claim_op_level_change']}")
     for lim in res["claims"]["limits"]:
@@ -676,6 +701,17 @@ def child_main(spec):
         output_check += [compare(f"{n} vs generic", grads["tk"][i], grads["generic"][i], TOL_GRAD)
                          for i, n in enumerate(("dQ", "dK", "dV"))]
         output_check.append(dict(name="router reproduces the frozen selection", ok=routed_same))
+        # The rows above run the fine path. Only this reaches what the routed operator does on its own: the pooled
+        # tables, the coarse branch and the fusion, with the routed-operator tolerance of tests/test_gpu_tk.py.
+        routed_grads = {}
+        for be in ("tk", "generic"):
+            o_r = rep_attention(qq, kk, vv, gg, cnt, R=16, tiers=tiers, backend=be)
+            o_r.backward(dout)
+            routed_grads[be] = dict(o=o_r.detach().clone(), dQ=qq.grad.clone(), dK=kk.grad.clone(), dV=vv.grad.clone(),
+                                    dgate=gg.grad.clone())
+            qq.grad = kk.grad = vv.grad = gg.grad = None
+        output_check += [compare(f"routed {n} vs generic", routed_grads["tk"][n], routed_grads["generic"][n], TOL_GRAD)
+                         for n in routed_grads["tk"]]
 
     props = torch.cuda.get_device_properties(0)
     source = os.environ.get("VSA2_REP_SOURCE")
@@ -705,7 +741,12 @@ def child_main(spec):
                                                                      ("gate", gate), ("blk_cnt", cnt))}),
         selection={n: digest(getattr(sel, n)) for n in sel_fields},
     )
-    Path(spec["out"]).write_text(json.dumps(dict(identity=identity, telemetry_before=telemetry_before, rows=rows,
+    built = os.path.getmtime(C.__file__)
+    compiled = [p for p in (HERE / "csrc").rglob("*") if p.is_file()]
+    if source:
+        compiled += [p for p in (Path(source) / "csrc/vsa").rglob("*") if p.is_file()]
+    stale = sorted(p.name for p in compiled if p.stat().st_mtime > built)
+    Path(spec["out"]).write_text(json.dumps(dict(identity=identity, stale_extension_sources=stale, telemetry_before=telemetry_before, rows=rows,
                                                  output_check=output_check, forward_output=forward_output, telemetry_after=telemetry())))
     return 0
 
