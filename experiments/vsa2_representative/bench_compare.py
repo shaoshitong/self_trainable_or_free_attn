@@ -81,14 +81,17 @@ FWD_CFGS = {
                        "of CFG37"),
     "36": ("operator", "alias of CFG1 since the single-writer dK/dV store became the default"),
     "37": ("operator", "CFG1 forward; the pre-round-11 tier-A backward: zeros(kg), zeros(vg) and the reduce-add kernel"),
-    "38": ("operator", "CFG1 with the representative-table build overlapped with route_tiers on a second stream"),
-    "39": ("operator", "CFG1 with the shape-only coarse CSR metadata cached across calls"),
-    "40": ("operator", "pre-round-16 behaviour: the coarse CSR metadata is rebuilt on every call"),
+    "38": ("operator", "CFG1 asking for the table build on a second stream during route_tiers; superseded while the pooled "
+                       "tables apply, because that path ignores the side-stream build"),
+    "39": ("operator", "alias of CFG1 since the shape-only coarse CSR metadata cache became the default"),
+    "40": ("operator", "history arm: the coarse CSR metadata is rebuilt on every call"),
     "41": ("operator", "CFG1 with route_tiers replayed from a captured CUDA graph (pooled inputs copied in)"),
-    "42": ("operator", "CFG1 with the representative tables built from the router pools (tolerance-equivalent)"),
-    "43": ("operator", "pre-round-19 behaviour: the representative tables are rebuilt from K and V"),
-    "44": ("operator", "CFG1 with the two top-k budget chains running on two streams"),
-    "45": ("operator", "pre-round-23 behaviour: the two top-k budget chains run one after the other"),
+    "42": ("operator", "alias of CFG1 since the representative tables built from the router pools became the default"),
+    "43": ("operator", "history arm: the representative tables are rebuilt from K and V; tolerance-equivalent to CFG1"),
+    "44": ("operator", "alias of CFG1 since the two top-k budget chains on two streams became the default"),
+    "45": ("operator", "history arm: the two top-k budget chains run one after the other"),
+    "46": ("operator", "CFG1 with some of the router's mask/cut/emit or cols/colscan/cols kernels merged; bitmaps held "
+                       "bit-identical"),
     "2": ("tier_a_path", "tier-A-only specialisation at MINB 4; other phases run the default kernel"),
     "3": ("tier_a_path", "tier-A-only specialisation at MINB 3; other phases run the default kernel"),
     "4": ("timing_only", "copied native loop, native softmax"),
@@ -101,15 +104,25 @@ PROFILES = {
                                candidate="REP_TK_FWD_CFG=5"),
 }
 BACKWARD_ARMS = {"21": "C", "22": "C", "23": "A", "37": "A"}  # the only backward tier each one's setting reaches
-ALIASES = ("1", "10", "13", "36", "38", "39", "40", "41", "42", "43", "44", "45")  # no dispatch line of their own needed
+ALIASES = ("1", "10", "13", "36", "39", "42", "44")  # the default path under an old name; no dispatch line needed
+# Each accepted change to the default path and the config that restores what it replaced.
+HISTORY_ARMS = {"20": "the pre-round-4 tier-B gather (32 x 512 B bulk copies)",
+                "37": "the pre-round-11 tier-A backward (zeros(kg), zeros(vg), reduce-add kernel)",
+                "40": "coarse CSR metadata rebuilt on every call",
+                "43": "representative tables rebuilt from K and V",
+                "45": "the two top-k budget chains run one after the other"}
+# These reach only the routed operator: fwd_impl launches the default kernel, and their evidence is host code that
+# reads the config. Their full-op forward may move, so it is not a control. All but CFG43 keep every output byte.
+ROUTED_ARMS = {"38", "40", "41", "43", "45", "46"}
+TOLERANCE_EQUAL = {"43"}  # the group means are rounded to bf16 before the block mean is formed
+ROUTED_READ_ROWS = ("full_op.tk.routed.f", "full_op.tk.routed.f_plus_b")
 OWN_FORWARD = ("20", "24", "32", "33")  # meaningless if they launch the default kernel
 RUNTIME_ARMS = {"34", "35"}  # deliberately the default kernel; a host-set diag flag selects the behaviour
 DISTINCT_FROM = {"24": ("11",), "32": ("11", "24"), "33": ("11", "24", "32"), "35": ("34",)}  # nor if they repeat an arm
 TWO_CTA = ("32", "33")  # their tiles leave no room for a third CTA; see launch_bound
 BYTE_EQUAL_PREMISE = ("35",)  # skipping a rescale by exactly 1.0f must not change a byte
-# CFG42 launches the same forward kernel but builds the representative tables from pooled means, so its output
-# differs from CFG1 by a bf16 ulp: it must not be held to byte equality.
-FORWARD_EQUAL = ({*ALIASES, *BACKWARD_ARMS} - {"42", "43"})  # one forward kernel by definition; see forward_must_match
+FORWARD_EQUAL = {*ALIASES, *BACKWARD_ARMS}  # one forward path by definition, so its forward rows are controls
+BYTE_EQUAL = FORWARD_EQUAL | (ROUTED_ARMS - TOLERANCE_EQUAL)  # see forward_must_match
 BACKWARD_READ_ROWS = ("kernel.tk.bwd.A", "kernel.tk.bwd.C", "fine_op.tk.A|B|C.b_direct", "full_op.tk.routed.b_direct",
                       "fine_op.tk.A|B|C.f_plus_b", "full_op.tk.routed.f_plus_b")
 HISTORICAL_LIMIT = "historical H200 measurements are from other hardware and must not be compared with this run"
@@ -140,7 +153,13 @@ def fwd_dispatch(source):
     return dict(table, default=default.group(1)) if default else {}
 
 
-def cfg_error(value, source):
+def host_source():
+    """The host code that reads configs the kernel's dispatch does not."""
+    paths = (HERE / "vsa2_rep/ops.py", HERE / "csrc/rep/rep_api.cpp")
+    return "".join(p.read_text() for p in paths if p.exists())
+
+
+def cfg_error(value, source, host=None):
     """Why this rep_tk.cu cannot run `value` as FWD_CFGS describes it, or None.
 
     An undispatched value silently runs the default kernel, and FWD_CFGS describes the kernel that has the
@@ -150,7 +169,11 @@ def cfg_error(value, source):
         return f"REP_TK_FWD_CFG={value} is not in the config table"
     if not re.search(r"\bcfg == 20\b", source):
         return "this kernel source has no CFG20 history arm; the config table does not describe it"
-    if value not in ALIASES and value not in BACKWARD_ARMS and not re.search(rf"\w*cfg\w* == {value}\b", source):
+    if value in ROUTED_ARMS:
+        host = host_source() if host is None else host
+        if not re.search(rf'"{value}"', host) and not re.search(rf"\w*cfg\w*(\(\))? [=!]= {value}\b", source + host):
+            return f"REP_TK_FWD_CFG={value} is not read by the host code or this kernel source"
+    if value not in ALIASES and value not in ROUTED_ARMS and value not in BACKWARD_ARMS and not re.search(rf"\w*cfg\w* == {value}\b", source):
         return f"REP_TK_FWD_CFG={value} is not implemented by this kernel source"
     # A backward-only arm has no forward dispatch line: its evidence is the backward code that reads the
     # config. Checking that token keeps the guard honest instead of exempting the arm outright.
@@ -165,7 +188,7 @@ def cfg_error(value, source):
         if table and table.get(value, table.get("default")) != table.get("default"):
             return f"REP_TK_FWD_CFG={value} must launch the default kernel and select by flag"
         return None
-    if value in ("10", "13", "36", *OWN_FORWARD, *BACKWARD_ARMS):
+    if value in ("10", "13", "36", *ROUTED_ARMS, *OWN_FORWARD, *BACKWARD_ARMS):
         table = fwd_dispatch(source)
         if not table:
             return f"cannot read the forward dispatch to check REP_TK_FWD_CFG={value}"
@@ -199,9 +222,9 @@ def fwd_kernel_name(value, source):
 
 
 def forward_must_match(configs):
-    """Two different arms that are one forward kernel by definition, so their outputs must be byte-equal."""
+    """Two different arms defined to produce the same bytes, whether or not their forward takes the same time."""
     arms = {c.get("REP_TK_FWD_CFG") for c in configs.values()}
-    return len(arms) == 2 and arms <= FORWARD_EQUAL
+    return len(arms) == 2 and arms <= BYTE_EQUAL
 
 
 def arms_error(configs):
@@ -210,6 +233,8 @@ def arms_error(configs):
     backward = arms & BACKWARD_ARMS.keys()
     if backward and not arms <= FORWARD_EQUAL:
         return f"CFG{min(backward)} changes only the backward; compare it with CFG1, not {sorted(arms)}"
+    if "46" in arms and not arms <= {"46", *ALIASES}:
+        return f"CFG46 merges router kernels; compare it with CFG1 so that nothing else changes, not {sorted(arms)}"
     if "23" in arms and arms != {"23"} and arms != {"23", "37"}:
         return "CFG23 runs on CFG37's reduce-add path, so only CFG37 vs CFG23 changes one thing"
     if len({BACKWARD_ARMS[a] for a in backward}) > 1:
@@ -300,10 +325,11 @@ def summarize(children):
 
 
 def mark_shared_forward(summary, configs):
-    """Between arms sharing a forward kernel, forward-only rows are controls; byte-equal output is checked apart."""
-    if forward_must_match(configs):
+    """Forward rows a pair of arms cannot move are controls. A routed arm can still move the full operator's forward."""
+    arms = {c.get("REP_TK_FWD_CFG") for c in configs.values()}
+    if len(arms) == 2 and arms <= FORWARD_EQUAL | ROUTED_ARMS:
         for s in summary:
-            if s["stage"] in ("fwd", "f"):
+            if s["stage"] in ("fwd", "f") and (arms <= FORWARD_EQUAL or s["scope"] != "full_op"):
                 s["control"] = True
     return summary
 
@@ -329,6 +355,9 @@ def assemble(args_dict, profile, configs, order, children):
     if {c.get("REP_TK_FWD_CFG") for c in configs.values()} & BACKWARD_ARMS.keys():
         ids = {row["id"] for c in children for row in c["rows"]}
         bad = bad + [f"missing row {r}" for r in BACKWARD_READ_ROWS if r not in ids]
+    if {c.get("REP_TK_FWD_CFG") for c in configs.values()} & ROUTED_ARMS:
+        ids = {row["id"] for c in children for row in c["rows"]}
+        bad = bad + [f"missing row {r}" for r in ROUTED_READ_ROWS if r not in ids]
     if bad:
         claim["may_claim_op_level_change"] = False
     arms = {c.get("REP_TK_FWD_CFG") for c in configs.values()}

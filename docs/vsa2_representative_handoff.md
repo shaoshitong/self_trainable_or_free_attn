@@ -360,11 +360,17 @@ from a build containing CFG 20.
 | CFG | Kernel | Softmax | MINB | Tier-B gather | Registers | Stack bytes |
 |---:|---|---|---:|---|---:|---:|
 | 1 (default) | `fwd_ker`, all tiers; heuristic tier-C backward split; tier-A dK/dV stored by each kv block's single owner CTA, no `kg`/`vg` memset | TK vector | 3 | `cp.async` | 166 | no spills |
-| 10, 13, 36 | aliases of CFG 1, kept so old logs stay reproducible | as CFG 1 | 3 | as CFG 1 | as CFG 1 | as CFG 1 |
+| 10, 13, 36, 39, 42, 44 | aliases of CFG 1, kept so old logs stay reproducible | as CFG 1 | 3 | as CFG 1 | as CFG 1 | as CFG 1 |
 | 21 | CFG 1 forward; tier-C backward split by the old wave policy | as CFG 1 | 3 | as CFG 1 | as CFG 1 | as CFG 1 |
 | 22 | CFG 1 forward; tier-C backward split forced to 4 | as CFG 1 | 3 | as CFG 1 | as CFG 1 | as CFG 1 |
 | 23 | CFG 1 forward; tier-A backward `__launch_bounds__(128, 3)` probe, on CFG 37's reduce-add path | as CFG 1 | 3 | as CFG 1 | as CFG 1 | as CFG 1 |
 | 37 | CFG 1 forward; the pre-round-11 tier-A backward: `zeros(kg)`, `zeros(vg)` and the reduce-add kernel | as CFG 1 | 3 | as CFG 1 | as CFG 1 | as CFG 1 |
+| 38 | CFG 1 asking for the table build on a side stream during `route_tiers`; superseded, see below | as CFG 1 | 3 | as CFG 1 | as CFG 1 | as CFG 1 |
+| 40 | history arm: coarse CSR metadata rebuilt on every call | as CFG 1 | 3 | as CFG 1 | as CFG 1 | as CFG 1 |
+| 41 | CFG 1 with `route_tiers` replayed from a captured CUDA graph | as CFG 1 | 3 | as CFG 1 | as CFG 1 | as CFG 1 |
+| 43 | history arm: representative tables rebuilt from K and V | as CFG 1 | 3 | as CFG 1 | as CFG 1 | as CFG 1 |
+| 45 | history arm: the two top-k budget chains run one after the other | as CFG 1 | 3 | as CFG 1 | as CFG 1 | as CFG 1 |
+| 46 | CFG 1 with some of the router's mask/cut/emit or cols/colscan/cols kernels merged | as CFG 1 | 3 | as CFG 1 | as CFG 1 | as CFG 1 |
 | 11 | measured negative arm: `fwd_kdb_ker`, CFG 1 plus a double-buffered K tile | TK vector | 3 | `cp.async` | not recorded here | not recorded here |
 | 24 | measured negative arm: `fwd_pipe_ker`, CFG 11's K double buffer plus a two-stage softmax, the next tile's QK issued before the current softmax finishes | TK vector | 2 | `cp.async` | not recorded here | not recorded here |
 | 32 | measured negative arm: `fwd_ring_ker`, two CTAs/SM, K and V both double-buffered | TK vector | 2 | `cp.async` | not recorded here | not recorded here |
@@ -439,6 +445,41 @@ What the harness does check: compared with CFG 1, CFG 35's six forward phase out
 cannot claim a change. This resolves bf16 `o` and fp32 `lse`, and the skip does not touch `lse` directly, so an `alpha`
 within bf16 rounding of 1.0f passes. Read CFG 35 with that in mind. CFG 34 is not held to byte identity, because a fused
 multiply-add rounds differently; the generic cross-check and the TK suite are its checks.
+
+The default path carries five accepted changes, each with a config that restores what it replaced. CFG 42 and 44 stay as the
+accepted aliases of two of them, and CFG 39 and 36 of two others:
+
+| Config | Restores | Output against CFG 1 | Forward rows |
+|---:|---|---|---|
+| 20 | the pre-round-4 tier-B gather (32 x 512 B bulk copies) | generic cross-check | may move |
+| 37 | the pre-round-11 tier-A backward (`zeros(kg)`, `zeros(vg)`, reduce-add kernel) | forward byte-equal | controls |
+| 40 | coarse CSR metadata rebuilt on every call | byte-equal | `full_op` may move; others controls |
+| 43 | representative tables rebuilt from K and V | tolerance only | `full_op` may move; others controls |
+| 45 | the two top-k budget chains run one after the other | byte-equal | `full_op` may move; others controls |
+
+There are four kinds of arm besides these labels:
+
+| Kind | Arms | What the harness asserts |
+|---|---|---|
+| Aliases | 1, 10, 13, 36, 39, 42, 44 | forward dispatch is the default; byte-equal to each other; forward rows are controls |
+| Backward | 21, 22, 23, 37 | as aliases for the forward; the tier each reaches stops being a control; backward rows required |
+| Routed | 38, 40, 41, 43, 45, 46 | host code reads the config; forward dispatch is the default; byte-equal to CFG 1 except 43; `kernel` and `fine_op` forward rows are controls; `full_op.tk.routed.f` and `f_plus_b` required |
+| Kernel | 0, 6, 8, 9, 11, 20, 24, 32, 33, 34, 35 | launch what they claim; generic cross-check; CFG 35 also byte-equal or no claim |
+
+Byte equality means every forward phase's `o` and `lse` digests match, or the result is invalid. Each arm's routed selection is
+also digested in `identity.selection`, including `bits_a` and `bits_ab`, and any difference invalidates the result. Those are computed
+by `route_tiers`, so CFG 45 and 46 are checked on their bitmaps directly. CFG 41's replay is only reached through `rep_attention`, so
+its check is the output check that the router reproduces the frozen selection. CFG 46 can be compared only with CFG 1 or an alias.
+It is refused until `ops.py`, `rep_api.cpp` or `rep_tk.cu` reads it, as a `"46"` string or a `cfg == 46` test.
+
+CFG 43 is conditional. The routed operator uses the pooled tables only with the TK backend, when `64 // mid_reps == R` and
+`(nb * mid_reps) % 64 == 0`. Outside those it builds from K and V under every config, so CFG 1 vs CFG 43 is an A/A run there.
+`rep_fine_attention` always builds from K and V.
+
+CFG 38 is superseded while the pooled tables apply. `ops.py` still starts `rep_tk_build` on the side stream under CFG 38, but the
+pooled branch comes first and never uses that result, so the arm adds a discarded build and cannot measure the overlap it was
+written for. Its overlap path runs only where the pooled guard fails. `bench_stages.py`'s `fine.tables` row calls `tk_tables` directly
+on the main stream, so it is not expected to go to zero under CFG 38 and says nothing about an overlap.
 
 `REP_TK_BWDC_SPLITS=<positive>` forces the tier-C split and `REP_TK_BWDC_SPLITS=wave` selects the old policy. At
 D=128, B=1, H=16 and 132 SMs, read from the kernel's formulas, many pairs of policies coincide, so a comparison
@@ -618,14 +659,20 @@ That store is now the default. CFG 36 is its alias and CFG 37 is the old path, s
 the same forward-identical checks as CFG 21/22/23. In `bench_bwd_stages.py` the `kg` and `vg` rows are now `present=false` under
 CFG 1 and timed under CFG 37. CFG 23 runs on CFG 37's path, so it is comparable only with CFG 37.
 
-Next: measure launch cost with `bench_graph.py`, below. The reported figures are 0.118 ms between the start of `backward()` and
-its first kernel, then about 13 launch gaps of about 3 us each, roughly 0.16 ms or 5% of F+B.
+Round 12: CFG 36 is confirmed as the default: CFG 37 read 1.0369 on `fine_op` `b_direct` and 1.0254 on `full_op` F+B.
+`bench_graph.py` measured a replay of one forward and backward at 3.9256 ms against 4.0435 ms eager, 0.118 ms or 2.9% of F+B,
+above the run's 0.030 ms floor, with a bit-identical forward and one bf16 ulp on dQ, dK and dV. It is available, not adopted.
+
+Next: CFG 46, once it lands, on one build, with the suites passing on it.
 
 ```bash
-REP_TK_FWD_CFG=1 <gpu-runner> python bench_graph.py --out results/raw/graph-cfg1.json
+REP_TK_FWD_CFG=46 <gpu-runner> python tests/test_gpu_tk.py
 <gpu-runner> python bench_compare.py --candidate REP_TK_FWD_CFG=1 --out results/raw/aa-16k.json
-<gpu-runner> python bench_compare.py --baseline REP_TK_FWD_CFG=37 --candidate REP_TK_FWD_CFG=1 --out results/raw/cfg37-cfg1-16k.json
+<gpu-runner> python bench_compare.py --candidate REP_TK_FWD_CFG=46 --out results/raw/cfg1-cfg46-16k.json
 ```
+
+Read `status` first: differing bitmaps or forward digests make the result invalid. Then read `full_op.tk.routed.f` and `f_plus_b` against
+the A/A displacement.
 
 ### CUDA graph measurement
 
@@ -718,8 +765,13 @@ the gap between `total` and `fine`. `attribution` is derived and marked `measure
 the floor is reported rather than spread over the stages: isolated loops overlap differently on the stream, and
 the operator's own autograd wrapper cannot be timed on its own.
 
+Each row carries `describes`: `routed`, `fine_only` or `both`. `fine` and `fine.tables` describe the fine-only entry point and must not
+be summed into a decomposition of the routed operator, which builds its tables from the pooled means. `attribution.sum_of_parts_ms` still
+adds `fine`, so it is reported and not asserted. `pool` and `coarse.meta` also time the non-default calls: the routed operator now uses
+`pool_fwd_vr` and the cached metadata.
+
 Every row keeps its meaning under every all-tier configuration. `reads_fwd_cfg` marks the rows that can change with
-`REP_TK_FWD_CFG` (`total`, `fine`, `fine.kernel`); the others should match another configuration within the floor.
+`REP_TK_FWD_CFG` (`total`, `fine`, `fine.kernel`, `route`, `route.one_budget`); the others should match another configuration within the floor.
 Under CFG 13, 21, 22 and 23 each row carries a `config_note`, because the forward repeats CFG 1's. `--compare` prints per-row
 ratios and refuses runs that differ in build, inputs, shape, timing or hardware. The round 4 stage figures came from
 an earlier build with the old default, so they cannot serve as the CFG 1 side.

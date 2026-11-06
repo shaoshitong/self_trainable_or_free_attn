@@ -41,8 +41,8 @@ from pathlib import Path
 from bench_compare import FORWARD_EQUAL, HERE, active_fwd_cfg, sha256_file
 
 NOTE = "measurement_only: not a performance claim; do not add to kernel rows"
-READS_FWD_CFG = {"total", "total.repeat", "fine", "fine.kernel"}
-BACKWARD_ONLY_NOTE = "this configuration changes only the backward: this forward row repeats CFG1's"
+READS_FWD_CFG = {"total", "total.repeat", "fine", "fine.kernel", "route", "route.one_budget"}
+BACKWARD_ONLY_NOTE = "this configuration is an alias or changes only the backward: this forward row repeats CFG1's"
 
 
 def compare_stages(a, b):

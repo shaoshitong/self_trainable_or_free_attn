@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from bench_bwd_stages import ZEROS, attribute as attribute_backward, batches, fill_absent, intervals
 from bench_graph import GRAPH_ROWS, attribute as attribute_graph, compare_outputs, row as graph_row
 from bench_stages import attribute, compare_stages
-from bench_compare import (BACKWARD_READ_ROWS, launch_bound, FWD_CFGS, PROFILES, abba, active_fwd_cfg, arms_error, assemble,
+from bench_compare import (ALIASES, HISTORY_ARMS, BACKWARD_READ_ROWS, launch_bound, FWD_CFGS, PROFILES, abba, active_fwd_cfg, arms_error, assemble,
                            backward_row_is_control, cfg_error, claims, forward_must_match, fwd_dispatch, fwd_kernel_name,
                            parse_config, summarize)
 
@@ -39,11 +39,11 @@ def test_configs_keep_their_semantics():
         {"REP_TK_FWD_CFG": "1", "REP_TK_BWDC_SPLITS": "8"}
     for cfg in "23457":
         assert rejected(f"REP_TK_FWD_CFG={cfg}", "representative"), "a diagnostic passed as production"
-    for cfg in ("0", "1", "2", "6", "8", "9", "10", "11", "13", "20", "21", "22", "23", "24", "32", "33", "34", "35", "36", "37"):
+    for cfg in ("0", "1", "2", "6", "8", "9", "10", "11", "13", "20", "21", "22", "23", "24", "32", "33", "34", "35", "36", "37", "38", "39", "40", "41", "42", "43", "44", "45", "46"):
         assert rejected(f"REP_TK_FWD_CFG={cfg}", "controlled-softmax"), "only CFG 4/5/7 are this diagnostic"
     for cfg in "457":
         assert parse_config(f"REP_TK_FWD_CFG={cfg}", "controlled-softmax")
-    for cfg in ("8", "9", "10", "11", "13", "20", "21", "22", "23", "24", "32", "33", "34", "35", "36", "37"):
+    for cfg in ("8", "9", "10", "11", "13", "20", "21", "22", "23", "24", "32", "33", "34", "35", "36", "37", "38", "39", "40", "41", "42", "43", "44", "45", "46"):
         assert parse_config(f"REP_TK_FWD_CFG={cfg}", "representative")
     assert rejected("REP_TK_FWD_CFG=25", "representative"), "the kernel would silently run its default path"
     assert parse_config("REP_TK_FWD_CFG=1,REP_TK_BWDC_SPLITS=wave", "representative"), "the kernel accepts wave"
@@ -167,6 +167,50 @@ def test_softmax_reductions_stay_on_the_default_path():
     res = assemble({}, "representative", pair("35"), [], [a, b])
     assert res["claims"]["may_claim_op_level_change"] is True
     assert any("does not show alpha is exactly" in x for x in res["claims"]["limits"])
+
+
+def test_history_and_alias_arms_are_registered():
+    assert set(HISTORY_ARMS) == {"20", "37", "40", "43", "45"} and all(v in FWD_CFGS for v in HISTORY_ARMS)
+    assert {"42", "44"} <= set(ALIASES) and not set(HISTORY_ARMS) & set(ALIASES), "a history arm is not an alias"
+    pair = lambda x, y: {"baseline": {"REP_TK_FWD_CFG": x}, "candidate": {"REP_TK_FWD_CFG": y}}
+    for value in ("20", "43"):
+        assert not forward_must_match(pair("1", value)), "their outputs may differ"
+    for value in ("37", "40", "45", "42", "44", "46"):
+        assert forward_must_match(pair("1", value)), f"CFG{value} is held to byte equality"
+    assert not forward_must_match(pair("42", "43")), "a pair containing CFG43 is tolerance-equivalent"
+
+
+def test_routed_arms_read_host_code_and_keep_full_op_timing_visible():
+    host = 'os.environ.get("REP_TK_FWD_CFG") != "40"'
+    assert cfg_error("40", ROUND5, host) is None
+    assert cfg_error("46", ROUND5, host), "must not pass before something reads it"
+    assert cfg_error("46", ROUND5, 'strcmp(cfg_env, "46")') is None
+    assert cfg_error("46", ROUND5 + "bool m() { return rep_cfg() == 46; }\n", host) is None
+    moved = kernel(BULK, "(cfg == 46) launch(rep_tk::fwd_ker<D, 4>);")
+    assert cfg_error("46", moved, 'strcmp(cfg_env, "46")'), "a forward kernel change under a router arm"
+    pair = {"baseline": {"REP_TK_FWD_CFG": "1"}, "candidate": {"REP_TK_FWD_CFG": "46"}}
+    assert arms_error(pair) is None
+    assert arms_error({"baseline": {"REP_TK_FWD_CFG": "45"}, "candidate": {"REP_TK_FWD_CFG": "46"}}), "two variables"
+    meta = dict(scope="full_op", stage="f", implementation="tk", work="64/4/1", control=False, measured=True, complete_call=True)
+    def run(arm, digest="x", sel="s"):
+        rows = [dict(id="full_op.tk.routed.f", ms=[1.0], meta=meta),
+                dict(id="full_op.tk.routed.f_plus_b", ms=[2.0], meta=dict(meta, stage="f_plus_b")),
+                dict(id="kernel.tk.fwd.A|B|C", ms=[1.0], meta=dict(meta, scope="kernel", stage="fwd"))]
+        return dict(arm=arm, identity=dict(selection=dict(bits_a=sel)), output_check=[dict(name="o", ok=True)], rows=rows,
+                    forward_output={"B": dict(o=digest)})
+    res = assemble({}, "representative", pair, [], [run("baseline"), run("candidate")])
+    assert res["status"] == "ok"
+    control = {s["id"]: s["control"] for s in res["summary"]}
+    assert control["kernel.tk.fwd.A|B|C"] is True and control["full_op.tk.routed.f"] is False, "its forward may move"
+    assert assemble({}, "representative", pair, [], [run("baseline"), run("candidate", digest="y")])["status"].startswith("invalid")
+    res = assemble({}, "representative", pair, [], [run("baseline"), run("candidate", sel="t")])
+    assert res["identity_differences"] == ["selection.bits_a"], "bitmaps must stay bit-identical"
+    short = [run("baseline"), run("candidate")]
+    for c in short:
+        c["rows"] = c["rows"][1:]
+    assert "missing row full_op.tk.routed.f" in assemble({}, "representative", pair, [], short)["status"]
+    for value in ("38", "40", "41", "42", "43", "44", "45"):  # the host code in this tree
+        assert cfg_error(value, ROUND5) is None, value
 
 
 def test_backward_arm_is_single_variable():
@@ -373,6 +417,8 @@ if __name__ == "__main__":
     test_two_stage_arm_is_its_own_forward()
     test_deep_pipeline_arms_are_two_cta_forwards()
     test_softmax_reductions_stay_on_the_default_path()
+    test_history_and_alias_arms_are_registered()
+    test_routed_arms_read_host_code_and_keep_full_op_timing_visible()
     test_backward_arm_is_single_variable()
     test_backward_arm_reaches_only_its_tier()
     test_forward_change_under_backward_arm_is_invalid()
