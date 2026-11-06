@@ -1530,6 +1530,16 @@ namespace {
 inline bf16* bfp(const torch::Tensor& t) { return reinterpret_cast<bf16*>(t.data_ptr<c10::BFloat16>()); }
 inline int words_of(int nb) { return (nb + 31) >> 5; }
 inline cudaStream_t stream() { return at::cuda::getCurrentCUDAStream().stream(); }
+// REP_TK_FWD_CFG, read once. Forward-only values are dispatched in fwd_impl; 21 / 22 select the tier-C
+// backward split (previous "wave" policy / 4), each with
+// the default forward, so every one of them differs from cfg 1 (13) in one backward choice only.
+inline int rep_cfg() {
+  static const int cfg = [] {
+    const char* e = std::getenv("REP_TK_FWD_CFG");
+    return e ? std::atoi(e) : 1;
+  }();
+  return cfg;
+}
 inline void check_launch(const char* what) {
   const cudaError_t e = cudaGetLastError();
   TORCH_CHECK(e == cudaSuccess, "rep_tk ", what, " launch failed: ", cudaGetErrorString(e));
@@ -1718,11 +1728,14 @@ static void bwd_c_impl(torch::Tensor q, torch::Tensor kt, torch::Tensor vt, torc
   // num_splits_heuristic over the resident CTA slots, SMs x CTAs/SM from the launch bounds (2 at D=128, 3
   // at D=64), as FlashAttention passes 2 x SMs for its 2-CTA kernels; that gives 4 at the measured shape
   // on 132 SMs. REP_TK_BWDC_SPLITS=<n> forces n; REP_TK_BWDC_SPLITS=wave is the previous policy (fill one
-  // wave, >= 16 query blocks per CTA).
+  // wave, >= 16 query blocks per CTA). Without the variable, REP_TK_FWD_CFG=21 selects the wave policy and
+  // 22 forces 4: single-variable arms against cfg 13 (= the default, num_splits_heuristic).
   int splits;
   const long long ctas = (long long)(NBt / 64) * H * B;
   const int slots = device_sms() * (D == 64 ? 3 : 2);
   const char* e = std::getenv("REP_TK_BWDC_SPLITS");
+  if (!e && rep_cfg() == 21) e = "wave";
+  if (!e && rep_cfg() == 22) e = "4";
   if (e && std::strcmp(e, "wave") == 0)
     splits = (int)std::max<long long>(1, std::min<long long>(slots / ctas, NB / 16));
   else if (e)
