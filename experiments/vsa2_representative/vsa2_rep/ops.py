@@ -182,13 +182,14 @@ _COARSE_META_CACHE = {}
 
 
 def _cached_coarse_meta_enabled() -> bool:
-    """REP_TK_FWD_CFG=39: reuse the coarse CSR metadata across calls.
+    """Reuse the coarse CSR metadata across calls; the default since it was measured at -2.6% forward.
 
     It is shape-only (B, H, nb, nbc_pad), so the same three tensors serve every call of a given shape;
     rebuilding them per call costs a handful of tiny kernel launches inside the forward.
+    REP_TK_FWD_CFG=39 is the accepted alias, 40 rebuilds them every call (the pre-cache behaviour).
     """
     import os
-    return os.environ.get("REP_TK_FWD_CFG") == "39"
+    return os.environ.get("REP_TK_FWD_CFG") != "40"
 
 
 def _coarse_meta_cached(B: int, H: int, nb: int, nbc_pad: int, device):
