@@ -347,9 +347,12 @@ struct fwd_globals {
   int H, L, NB, NBt, RM, W, phases;
   // Measurement only (wrong results): bit 0 = tier-B tiles take bias 0 (no bias loads), bit 1 = tier-B
   // tiles are loaded as one tensor-TMA tile (tail tile 0) instead of per-slot bulk copies. Bit 2 (correct
-  // results) = spread a tier-B tile's copies one per lane instead of one slot per lane.
+  // results) = spread a tier-B tile's copies one per lane instead of one slot per lane. Bits 3 and 4
+  // (kDiagFma, kDiagSkipRescale; correct results) are set by fwd_impl for cfg 34 / 35 and read only by the
+  // default kernel fwd_ker<D, 3, false, false, true>.
   int diag;
 };
+enum { kDiagFma = 8, kDiagSkipRescale = 16 };
 
 template <int D>
 __device__ __forceinline__ void issue_tile(int2 tile, typename fwd_globals<D>::tile& dst,
@@ -395,6 +398,31 @@ __device__ __forceinline__ void online_softmax_tk(rt_fl<16, 64>& att, col_vec<rt
   mul(l, l, alpha);
   row_sum(l, att, l);
   mul_row(o, o, alpha);
+}
+
+// online_softmax_tk for the default kernel, with cfg 35's option: skip o's rescale in a warp none of whose
+// 16 rows has alpha != 1. alpha = exp2f(m_old - mu); when a row's max is unchanged, m_old - mu is +0 exactly
+// and exp2f(+0) is exactly 1 (no fast-math in this build), and wherever alpha == 1.0f, x * 1.0f == x
+// bitwise (no flush-to-zero), so skipping changes no bit of o. The vote is warp-uniform: every lane of the
+// warp takes the same branch, and mul_row is per-thread, so warps may differ.
+template <int D>
+__device__ __forceinline__ void online_softmax_tk_opt(rt_fl<16, 64>& att, col_vec<rt_fl<16, 64>>& m,
+                                                      col_vec<rt_fl<16, 64>>& l, rt_fl<16, D>& o,
+                                                      bool skip_unmoved) {
+  constexpr float kLowest = -3.40282347e38f;
+  col_vec<rt_fl<16, 64>> alpha, mu;
+  copy(alpha, m);
+  row_max(m, att, m);
+  kittens::max(mu, m, kLowest);
+  sub_row(att, att, mu);
+  exp2(att, att);
+  sub(alpha, alpha, mu);
+  exp2(alpha, alpha);
+  mul(l, l, alpha);
+  row_sum(l, att, l);
+  static_assert(decltype(alpha)::outer_dim == 1 && decltype(alpha)::inner_dim == 1, "col_vec layout");
+  if (!skip_unmoved || __any_sync(0xffffffffu, alpha.data[0][0].x != 1.f || alpha.data[0][0].y != 1.f))
+    mul_row(o, o, alpha);
 }
 
 // MINB: CTAs per SM the register budget is sized for. 4 is VSA2's TK forward, capping at 128 registers;
@@ -524,23 +552,38 @@ __global__ __launch_bounds__(128, MINB) void fwd_ker(const __grid_constant__ fwd
     }
 
     if constexpr (!HAND_SM) {
-      // log2 domain, then each column's + log2(c) bias (or -inf mask) before the row max
-      mul(att, att, SL2);
-      if constexpr (BC) {
-        if (masked) {
+      // cfg 34 / 35 (diag bits, default kernel only: B_CPASYNC is a constant, so every other instantiation
+      // compiles exactly the code below the `else`s)
+      const bool fma_bias = B_CPASYNC && BC && masked && (g.diag & kDiagFma);
+      if (fma_bias) {  // cfg 34: scale and + log2(c) bias in one FFMA per element
 #pragma unroll
-          for (int i = 0; i < 4; ++i)
+        for (int i = 0; i < 4; ++i)
 #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-              float2& e = att.tiles[0][i].data[j];
-              e.x += cb.v[i][(j >> 1) * 2];
-              e.y += cb.v[i][(j >> 1) * 2 + 1];
-            }
+          for (int j = 0; j < 4; ++j) {
+            float2& e = att.tiles[0][i].data[j];
+            e.x = fmaf(e.x, SL2, cb.v[i][(j >> 1) * 2]);
+            e.y = fmaf(e.y, SL2, cb.v[i][(j >> 1) * 2 + 1]);
+          }
+      } else {
+        // log2 domain, then each column's + log2(c) bias (or -inf mask) before the row max
+        mul(att, att, SL2);
+        if constexpr (BC) {
+          if (masked) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+#pragma unroll
+              for (int j = 0; j < 4; ++j) {
+                float2& e = att.tiles[0][i].data[j];
+                e.x += cb.v[i][(j >> 1) * 2];
+                e.y += cb.v[i][(j >> 1) * 2 + 1];
+              }
+          }
+        } else if (kcA < kB) {  // partial tier-A block: VSA2's own column mask
+          right_fill(att, att, kcA, base_types::constants<float>::neg_infty());
         }
-      } else if (kcA < kB) {  // partial tier-A block: VSA2's own column mask
-        right_fill(att, att, kcA, base_types::constants<float>::neg_infty());
       }
-      online_softmax_tk<D>(att, m_vec, l_vec, o_reg);
+      if (B_CPASYNC) online_softmax_tk_opt<D>(att, m_vec, l_vec, o_reg, (g.diag & kDiagSkipRescale) != 0);
+      else online_softmax_tk<D>(att, m_vec, l_vec, o_reg);
     } else {
       // the previous hand-written softmax; rows gq (data 0, 2) and gq + 8 (data 1, 3)
       float mx[2] = {ninf(), ninf()};
@@ -2210,6 +2253,10 @@ static void fwd_impl(torch::Tensor q, torch::Tensor k, torch::Tensor v, const st
     const char* e = std::getenv("REP_TK_FWD_CFG");
     cfg = e ? std::atoi(e) : 1;
   }
+  // cfg 34 / 35: the default kernel with one FFMA for tier-B/C scale + bias / the o rescale skipped in warps
+  // whose rows' maxima did not move (diag bits; both fall through to the default launch below)
+  if (cfg == 34) g.diag |= rep_tk::kDiagFma;
+  if (cfg == 35) g.diag |= rep_tk::kDiagSkipRescale;
   auto launch = [&](auto kern) {
     cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, mem);
     kern<<<dim3(NB, H, B), 128, mem, stream()>>>(g);
