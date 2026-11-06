@@ -78,6 +78,12 @@ __device__ __forceinline__ void cp_async_16(uint32_t dst_smem, const void* src) 
 __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
 template <int N>
 __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory"); }
+// the same with a (block-uniform) run-time count 0..2; the instruction takes an immediate
+__device__ __forceinline__ void cp_async_wait_n(int n) {
+  if (n <= 0) cp_async_wait<0>();
+  else if (n == 1) cp_async_wait<1>();
+  else cp_async_wait<2>();
+}
 
 // Number of distinct swizzle phases a tier-B slot can start on: slot s begins at tile row RM*s, and the
 // 128-byte swizzle repeats every 8 rows.
@@ -393,10 +399,14 @@ __device__ __forceinline__ void online_softmax_tk(rt_fl<16, 64>& att, col_vec<rt
 // selects 4 for comparison. HAND_SM = true keeps the previous hand-written softmax (log2 domain, deferred
 // row sums) as a same-build control, REP_TK_FWD_CFG=6. At MINB 3 the D=128 A|B|C path sits on the
 // 168-register cap and spills; REP_TK_FWD_CFG=8 / 9 are the same two kernels at MINB 2 (cap 255), to
-// measure that cap against the occupancy it buys. B_CPASYNC = true (REP_TK_FWD_CFG=10) loads tier-B tiles
-// with issue_tier_b_cta instead of the bulk-copy gather; every other tile and all arithmetic are unchanged.
-template <int D, int MINB, bool A_ONLY = false, bool HAND_SM = false, bool B_CPASYNC = false>
+// measure that cap against the occupancy it buys. B_CPASYNC = true loads tier-B tiles with
+// issue_tier_b_cta instead of the bulk-copy gather, every other tile and all arithmetic unchanged: the
+// production default (REP_TK_FWD_CFG=1, alias 10; measured 166 registers, no spill, against 168 with
+// spills for the bulk gather, now REP_TK_FWD_CFG=20). K_DB = true (REP_TK_FWD_CFG=11, B_CPASYNC only)
+// double-buffers K: one more st_bf<64, D>, each tile's K issued a tile earlier (see `step`).
+template <int D, int MINB, bool A_ONLY = false, bool HAND_SM = false, bool B_CPASYNC = false, bool K_DB = false>
 __global__ __launch_bounds__(128, MINB) void fwd_ker(const __grid_constant__ fwd_globals<D> g) {
+  static_assert(!K_DB || (B_CPASYNC && !A_ONLY), "K double-buffering is built on the cp.async tier-B path");
 #if REP_TK_HOPPER
   constexpr float SL2 = kLog2e * (D == 64 ? 0.125f : 0.08838834764f);
   constexpr int ND = D / 16;
@@ -441,11 +451,14 @@ __global__ __launch_bounds__(128, MINB) void fwd_ker(const __grid_constant__ fwd
   tile_t(&q_smem) = al.allocate<tile_t>();
   tile_t(&k_smem) = al.allocate<tile_t>();
   tile_t(&v_smem) = al.allocate<tile_t>();
-  __shared__ semaphore q_bar, k_bar, v_bar;
+  tile_t* k2_ptr = nullptr;  // K_DB: the second K buffer, allocated last so q/k/v keep their offsets
+  if constexpr (K_DB) k2_ptr = &al.allocate<tile_t>();
+  __shared__ semaphore q_bar, k_bar, v_bar, k_bar2;  // k_bar2: K_DB's second K buffer
   if (threadIdx.x == 0) {
     init_semaphore(q_bar, 0, 1);
     init_semaphore(k_bar, 0, 1);
     init_semaphore(v_bar, 0, 1);
+    if constexpr (K_DB) init_semaphore(k_bar2, 0, 1);
     tma::expect_bytes(q_bar, sizeof(tile_t));
     coord<tile_t> c = {b, h, qb, 0};
     tma::load_async(q_smem, g.q, c, q_bar);
@@ -454,7 +467,26 @@ __global__ __launch_bounds__(128, MINB) void fwd_ker(const __grid_constant__ fwd
   const uint32_t k_s = static_cast<uint32_t>(__cvta_generic_to_shared(&k_smem.data[0]));
   const uint32_t v_s = static_cast<uint32_t>(__cvta_generic_to_shared(&v_smem.data[0]));
   int slots[2] = {g.NB, g.NB};
-  if (B_CPASYNC && cur.x == kTierB) {  // every thread: K group, then V group
+  // K_DB: the tile after `cur` (its K already in flight into the second buffer) and its slot blocks, kept
+  // for its V issue; the tile after that and its slot blocks, set by the loops before each step
+  int2 nxt_k = make_int2(kTierNone, 0), nxt2_k = make_int2(kTierNone, 0);
+  int nsl_k[4] = {g.NB, g.NB, g.NB, g.NB}, nsl2_k[4] = {g.NB, g.NB, g.NB, g.NB};
+  uint32_t k2_s = 0;
+  if constexpr (K_DB) {
+    k2_s = static_cast<uint32_t>(__cvta_generic_to_shared(&k2_ptr->data[0]));
+    nxt_k = s.next();
+    int sl4[4];
+    if (cur.x == kTierB) slot_blocks_cta(s.b_idx, s.nb_list, cur.y, g.NB, g.RM, sl4);
+    if (nxt_k.x == kTierB) slot_blocks_cta(s.b_idx, s.nb_list, nxt_k.y, g.NB, g.RM, nsl_k);
+    // issue order K(cur), K(nxt), V(cur): the cp.async group counts in `step` rely on it
+    if (cur.x == kTierB) issue_tier_b_cta<D>(k_s, ksw, sl4, g.NB, g.RM);
+    else if (warp == 0) issue_tile<D>(cur, k_smem, g.k, g.kt, ksw, slots, b, h, g.NB, g.RM, k_bar);
+    if (nxt_k.x == kTierB) issue_tier_b_cta<D>(k2_s, ksw, nsl_k, g.NB, g.RM);
+    else if (nxt_k.x != kTierNone && warp == 0)
+      issue_tile<D>(nxt_k, *k2_ptr, g.k, g.kt, ksw, slots, b, h, g.NB, g.RM, k_bar2);
+    if (cur.x == kTierB) issue_tier_b_cta<D>(v_s, vsw, sl4, g.NB, g.RM);
+    else if (warp == 0) issue_tile<D>(cur, v_smem, g.v, g.vt, vsw, slots, b, h, g.NB, g.RM, v_bar);
+  } else if (B_CPASYNC && cur.x == kTierB) {  // every thread: K group, then V group
     int sl4[4];
     slot_blocks_cta(s.b_idx, s.nb_list, cur.y, g.NB, g.RM, sl4);
     issue_tier_b_cta<D>(k_s, ksw, sl4, g.NB, g.RM);
@@ -489,21 +521,44 @@ __global__ __launch_bounds__(128, MINB) void fwd_ker(const __grid_constant__ fwd
   // the K wait V may still be pending (wait_group 1), at the V wait the next tile's K may be (wait_group 1
   // if it is tier B, else 0). Each thread then fences its generic-proxy writes for the wgmma async proxy
   // and the CTA barrier (one warpgroup) orders all 128 threads' copies before any warp's wgmma.
+  //
+  // K_DB: tile j's K is in buffer j & 1 (k_smem, *k2_ptr), counting every tile; step j issues K(j + 2)
+  // into its own buffer as soon as its QK has read it, so K(j + 1) was issued during step j - 1, a tile
+  // earlier than with one buffer. V keeps one buffer and its issue point. Each K buffer has its own
+  // barrier (k_bar, k_bar2), and bit b of `kph` is the parity of buffer b's next TMA phase: it flips only
+  // when a TMA-delivered (A or C) tile is consumed from that buffer. Loads into a buffer and their
+  // consumption strictly alternate, so each barrier completes exactly one phase per TMA tile it receives
+  // and a tier-B tile, which goes through neither barrier, changes no parity, whatever the A/B/C order.
+  // V's parity is still `it`. cp.async groups are committed in the order K0, K1, V0, K2, V1, K3, V2, ...
+  // (prologue, then K(j + 2) and V(j + 1) in step j), so for a tier-B tile j the groups younger than K(j)
+  // are V(j - 1) (already complete), K(j + 1) if tile j + 1 is tier B, and V(j): wait_group 1 + [j + 1
+  // is B]. The only group younger than V(j) is K(j + 2): wait_group [j + 2 is B].
   int it = 0;
+  int kt = 0, kph = 0;  // K_DB: tile ordinal (buffer kt & 1), per-buffer K parity bits
   const int no_slots[2] = {g.NB, g.NB};  // B_CPASYNC: issue_tile only loads A/C tiles, which ignore slots
   auto step = [&]<bool BC>(int2 tile, int2 nxt, int kcA, const TileBias& cb, const auto& nsl) {
     const bool masked = BC && cb.masked && !(tile.x == kTierB && (g.diag & 1));
     const bool cp_cur = B_CPASYNC && tile.x == kTierB, cp_nxt = B_CPASYNC && nxt.x == kTierB;
+    const int kb = K_DB ? (kt & 1) : 0;
     if (cp_cur) {
-      cp_async_wait<1>();
+      if constexpr (K_DB) cp_async_wait_n(1 + (nxt.x == kTierB));
+      else cp_async_wait<1>();
       fence_async_smem();
       __syncthreads();
+    } else if constexpr (K_DB) {
+      wait(kb ? k_bar2 : k_bar, (kph >> kb) & 1);
     } else {
       wait(k_bar, it & 1);
     }
-    warpgroup::mm_ABt(att, q_smem, k_smem);
+    if constexpr (K_DB) warpgroup::mm_ABt(att, q_smem, kb ? *k2_ptr : k_smem);
+    else warpgroup::mm_ABt(att, q_smem, k_smem);
     warpgroup::mma_async_wait();
-    if constexpr (B_CPASYNC) {
+    if constexpr (K_DB) {  // K of the tile after next, into the buffer this QK has just read
+      if (nxt2_k.x == kTierB) issue_tier_b_cta<D>(kb ? k2_s : k_s, ksw, nsl2_k, g.NB, g.RM);
+      else if (nxt2_k.x != kTierNone && warp == 0)
+        issue_tile<D>(nxt2_k, kb ? *k2_ptr : k_smem, g.k, g.kt, ksw, no_slots, b, h, g.NB, g.RM,
+                      kb ? k_bar2 : k_bar);
+    } else if constexpr (B_CPASYNC) {
       if (cp_nxt) issue_tier_b_cta<D>(k_s, ksw, nsl, g.NB, g.RM);
       else if (nxt.x != kTierNone && warp == 0)
         issue_tile<D>(nxt, k_smem, g.k, g.kt, ksw, no_slots, b, h, g.NB, g.RM, k_bar);
@@ -583,7 +638,8 @@ __global__ __launch_bounds__(128, MINB) void fwd_ker(const __grid_constant__ fwd
     copy(att_mma, att);
 
     if (cp_cur) {
-      if (cp_nxt) cp_async_wait<1>();
+      if constexpr (K_DB) cp_async_wait_n(nxt2_k.x == kTierB);
+      else if (cp_nxt) cp_async_wait<1>();
       else cp_async_wait<0>();
       fence_async_smem();
       __syncthreads();
@@ -600,6 +656,10 @@ __global__ __launch_bounds__(128, MINB) void fwd_ker(const __grid_constant__ fwd
       issue_tile<D>(nxt, v_smem, g.v, g.vt, vsw, nsl, b, h, g.NB, g.RM, v_bar, g.diag & 2, g.diag & 4);
     }
     if (!cp_cur) ++it;
+    if constexpr (K_DB) {
+      if (!cp_cur) kph ^= 1 << kb;
+      ++kt;
+    }
   };
   // the next tile's slot blocks, one tile ahead: warp 0's two per lane, or (B_CPASYNC) four per thread
   auto next_slots = [&](int2 nxt, auto& nsl) {
@@ -611,25 +671,50 @@ __global__ __launch_bounds__(128, MINB) void fwd_ker(const __grid_constant__ fwd
   };
 
   // Tier A: no bias registers live at all, as in VSA2's own kernel.
+  // K_DB: the stream runs two tiles ahead; `nxt_k` and its slot blocks roll forward from `nxt2_k`.
+  auto ahead2 = [&]() {
+    nxt2_k = s.next();
+    if (nxt2_k.x == kTierB) slot_blocks_cta(s.b_idx, s.nb_list, nxt2_k.y, g.NB, g.RM, nsl2_k);
+  };
+  auto roll = [&]() {
+    cur = nxt_k;
+    nxt_k = nxt2_k;
+#pragma unroll
+    for (int u = 0; u < 4; ++u) nsl_k[u] = nsl2_k[u];
+  };
   while (cur.x == kTierA) {
-    const int2 nxt = s.next();
-    int nsl[B_CPASYNC ? 4 : 2] = {g.NB, g.NB};
-    next_slots(nxt, nsl);
-    step.template operator()<false>(cur, nxt, g.blk_cnt[cur.y], cb, nsl);
-    cur = nxt;
+    if constexpr (K_DB) {
+      ahead2();
+      step.template operator()<false>(cur, nxt_k, g.blk_cnt[cur.y], cb, nsl_k);
+      roll();
+    } else {
+      const int2 nxt = s.next();
+      int nsl[B_CPASYNC ? 4 : 2] = {g.NB, g.NB};
+      next_slots(nxt, nsl);
+      step.template operator()<false>(cur, nxt, g.blk_cnt[cur.y], cb, nsl);
+      cur = nxt;
+    }
   }
   if constexpr (A_ONLY) goto epilogue;  // diagnostic specialisation: no B/C state compiled in
   // Tiers B and C: biases and slot ids loaded one tile ahead, consumed one tile later, so their latency
   // hides behind a tile of MMAs instead of sitting on the critical path.
   if (cur.x != kTierNone) cb = tile_bias(cur, s, g.blk_cnt, lcb, lc_tail, g.RM);
   while (cur.x != kTierNone) {
-    const int2 nxt = s.next();
-    const TileBias nb_ = tile_bias(nxt, s, g.blk_cnt, lcb, lc_tail, g.RM);
-    int nsl[B_CPASYNC ? 4 : 2] = {g.NB, g.NB};
-    next_slots(nxt, nsl);
-    step.template operator()<true>(cur, nxt, kB, cb, nsl);
-    cur = nxt;
-    cb = nb_;
+    if constexpr (K_DB) {
+      ahead2();
+      const TileBias nb_ = tile_bias(nxt_k, s, g.blk_cnt, lcb, lc_tail, g.RM);
+      step.template operator()<true>(cur, nxt_k, kB, cb, nsl_k);
+      roll();
+      cb = nb_;
+    } else {
+      const int2 nxt = s.next();
+      const TileBias nb_ = tile_bias(nxt, s, g.blk_cnt, lcb, lc_tail, g.RM);
+      int nsl[B_CPASYNC ? 4 : 2] = {g.NB, g.NB};
+      next_slots(nxt, nsl);
+      step.template operator()<true>(cur, nxt, kB, cb, nsl);
+      cur = nxt;
+      cb = nb_;
+    }
   }
 
 epilogue:
@@ -1330,15 +1415,20 @@ static void fwd_impl(torch::Tensor q, torch::Tensor k, torch::Tensor v, const st
       b_idx.data_ptr<int>(), reinterpret_cast<const uint32_t*>(bits_ab.data_ptr<int>()), blk_cnt.data_ptr<int>(),
       (int)H, (int)L, NB, NBt, RM, words_of(NB), phases, diag};
   constexpr int mem = 3 * 64 * D * 2 + 1024;  // q, k, v tiles + alignment slack
-  static int cfg = -1;  // 0: MINB 4, else MINB 3 (default, measured best); 2-10 diagnostics
+  constexpr int mem_kdb = 4 * 64 * D * 2 + 1024;  // cfg 11: + the second K tile
+  static int cfg = -1;  // 1 (default, = 10): MINB 3, tier-B cp.async gather; others diagnostics / history
   if (cfg < 0) {
     const char* e = std::getenv("REP_TK_FWD_CFG");
     cfg = e ? std::atoi(e) : 1;
   }
-  auto launch = [&](auto kern) {
-    cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, mem);
-    kern<<<dim3(NB, H, B), 128, mem, stream()>>>(g);
+  auto launch = [&](auto kern, int bytes = mem) {
+    cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+    kern<<<dim3(NB, H, B), 128, bytes, stream()>>>(g);
   };
+  // The default (cfg 1, unset, any value not listed, and cfg 2 / 3 outside phases == A) is fwd_ker with
+  // the tier-B cp.async gather. cfg 0, 6, 8, 9 and 20 keep the bulk-copy gather they were measured with, so
+  // cfg 6 (hand softmax) is a softmax-only pair with cfg 20, no longer with cfg 1. diag bits 2 and 4 select
+  // bulk-copy variants and apply only to those bulk-gather kernels; bit 1 applies to every fwd_ker.
   // cfg 2 / 3: tier-A-only specialisation at MINB 4 / 3 (diagnostic; valid only for phases == A)
   // cfg 4 / 5 / 7: verbatim copy of VSA2's TK forward with its own / the previous hand-written /
   // online_softmax_tk softmax (diagnostic, tier A)
@@ -1353,10 +1443,12 @@ static void fwd_impl(torch::Tensor q, torch::Tensor k, torch::Tensor v, const st
   // cfg 8 / 9: cfg 1 / cfg 6 at MINB 2 (register-cap control; same grid, block, shared memory, tile work)
   else if (cfg == 8) launch(rep_tk::fwd_ker<D, 2>);
   else if (cfg == 9) launch(rep_tk::fwd_ker<D, 2, false, true>);
-  // cfg 10: cfg 1 with tier-B tiles loaded by CTA-wide cp.async (issue_tier_b_cta) instead of bulk copies;
-  // diag bits 2 and 4 (bulk-copy variants) do not apply to it
-  else if (cfg == 10) launch(rep_tk::fwd_ker<D, 3, false, false, true>);
-  else launch(rep_tk::fwd_ker<D, 3>);
+  // cfg 20: the pre-cp.async default, per-slot cp.async.bulk tier-B gather (history arm)
+  else if (cfg == 20) launch(rep_tk::fwd_ker<D, 3>);
+  // cfg 11: the default with K double-buffered (one more K tile in shared memory, same launch bounds)
+  else if (cfg == 11) launch(rep_tk::fwd_ker<D, 3, false, false, true, true>, mem_kdb);
+  // cfg 1 / 10: tier-B tiles loaded by CTA-wide cp.async (issue_tier_b_cta) instead of bulk copies
+  else launch(rep_tk::fwd_ker<D, 3, false, false, true>);
   check_launch("fwd");
 }
 
