@@ -63,6 +63,7 @@ tests/test_gpu.py           kernels vs the reference: routing, tables, forward, 
 bench.py / prof.py          end-to-end comparison / per-kernel breakdown with measured scopes
 bench_stages.py             measurement-only stages of the full operator's forward
 bench_bwd_stages.py         measurement-only stages of one backward() call
+bench_graph.py              measurement-only eager F+B vs a CUDA graph replay of it
 one_launch.py               one generic or TK kernel after warmup, for a profiler to select by name
 ```
 

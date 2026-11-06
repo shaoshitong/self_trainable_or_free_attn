@@ -28,8 +28,8 @@ so part of the distance between total and isolated kernels may come from how eac
 Stage times are not a performance claim and must not be added to bench_compare's kernel rows.
 
   REP_TK_FWD_CFG=1 <gpu-runner> python bench_bwd_stages.py --out bwd-stages-cfg1.json
-  REP_TK_FWD_CFG=36 <gpu-runner> python bench_bwd_stages.py --out bwd-stages-cfg36.json
-  python bench_bwd_stages.py --compare bwd-stages-cfg1.json bwd-stages-cfg36.json
+  REP_TK_FWD_CFG=37 <gpu-runner> python bench_bwd_stages.py --out bwd-stages-cfg37.json
+  python bench_bwd_stages.py --compare bwd-stages-cfg37.json bwd-stages-cfg1.json
 """
 import argparse
 import hashlib

@@ -9,6 +9,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bench_bwd_stages import ZEROS, attribute as attribute_backward, batches, fill_absent, intervals
+from bench_graph import GRAPH_ROWS, attribute as attribute_graph, compare_outputs, row as graph_row
 from bench_stages import attribute, compare_stages
 from bench_compare import (BACKWARD_READ_ROWS, launch_bound, FWD_CFGS, PROFILES, abba, active_fwd_cfg, arms_error, assemble,
                            backward_row_is_control, cfg_error, claims, forward_must_match, fwd_dispatch, fwd_kernel_name,
@@ -38,11 +39,11 @@ def test_configs_keep_their_semantics():
         {"REP_TK_FWD_CFG": "1", "REP_TK_BWDC_SPLITS": "8"}
     for cfg in "23457":
         assert rejected(f"REP_TK_FWD_CFG={cfg}", "representative"), "a diagnostic passed as production"
-    for cfg in ("0", "1", "2", "6", "8", "9", "10", "11", "13", "20", "21", "22", "23", "24", "32", "33", "34", "35", "36"):
+    for cfg in ("0", "1", "2", "6", "8", "9", "10", "11", "13", "20", "21", "22", "23", "24", "32", "33", "34", "35", "36", "37"):
         assert rejected(f"REP_TK_FWD_CFG={cfg}", "controlled-softmax"), "only CFG 4/5/7 are this diagnostic"
     for cfg in "457":
         assert parse_config(f"REP_TK_FWD_CFG={cfg}", "controlled-softmax")
-    for cfg in ("8", "9", "10", "11", "13", "20", "21", "22", "23", "24", "32", "33", "34", "35", "36"):
+    for cfg in ("8", "9", "10", "11", "13", "20", "21", "22", "23", "24", "32", "33", "34", "35", "36", "37"):
         assert parse_config(f"REP_TK_FWD_CFG={cfg}", "representative")
     assert rejected("REP_TK_FWD_CFG=25", "representative"), "the kernel would silently run its default path"
     assert parse_config("REP_TK_FWD_CFG=1,REP_TK_BWDC_SPLITS=wave", "representative"), "the kernel accepts wave"
@@ -84,11 +85,12 @@ def test_arm_meanings_hold_in_the_source():
     assert cfg_error("13", ROUND5) is None, "the heuristic is the default now"
     braced = kernel(BULK, "(cfg == 11) {\n    set(rep_tk::fwd_kdb_ker<D>, mem);\n    rep_tk::fwd_kdb_ker<D><<<g>>>(x);\n  }")
     assert fwd_dispatch(braced)["11"] == "rep_tk::fwd_kdb_ker<D>", "a braced branch must not read as the default"
-    for value in ("13", "21", "22", "23", "36"):
+    for value in ("13", "21", "22", "23", "36", "37"):
         change = kernel(BULK, f"(cfg == {value}) launch(rep_tk::fwd_ker<D, 4>);")
         assert cfg_error(value, change), f"forward change under backward arm CFG{value}"
         assert cfg_error(value, kernel(BULK, f"(cfg == {value}) {{\n    rep_tk::fwd_kdb_ker<D><<<g>>>(x);\n  }}"))
-    assert cfg_error("36", ROUND6 + "int s() { return rep_cfg() == 36 ? 16 : 0; }\n") is None
+    assert cfg_error("36", ROUND5) is None, "the single-writer store is the default now"
+    assert cfg_error("37", ROUND6 + "bool store() { return rep_cfg() != 37; }\n") is None
     for value in ("21", "22", "23"):
         assert cfg_error(value, ROUND6) is None
         assert cfg_error(value, ROUND5), "must not pass before the kernel has it"
@@ -170,9 +172,11 @@ def test_softmax_reductions_stay_on_the_default_path():
 def test_backward_arm_is_single_variable():
     cfg = lambda v, **kw: dict(REP_TK_FWD_CFG=v, **kw)
     pair = lambda a, b: {"baseline": a, "candidate": b}
-    assert cfg_error("36", ROUND6), "must not pass before the kernel has it"
-    assert arms_error(pair(cfg("23"), cfg("36"))), "launch bound and store path at once"
-    for value in ("21", "22", "23", "36"):
+    assert cfg_error("37", ROUND6), "must not pass before the kernel has it"
+    assert arms_error(pair(cfg("37"), cfg("23"))) is None, "CFG23 is the launch bound on CFG37's path"
+    assert arms_error(pair(cfg("1"), cfg("23"))), "launch bound and store path at once"
+    assert arms_error(pair(cfg("21"), cfg("37"))), "tier C and tier A at once"
+    for value in ("21", "22", "37"):
         assert arms_error(pair(cfg("1"), cfg(value))) is None
         assert arms_error(pair(cfg("11"), cfg(value))), "a forward change alongside a backward arm"
         assert arms_error(pair(cfg("1"), cfg(value, REP_TK_BWDC_SPLITS="4"))), "forced split on top of a backward arm"
@@ -185,8 +189,9 @@ def test_backward_arm_reaches_only_its_tier():
     env = lambda v, **kw: dict(REP_TK_FWD_CFG=v, **kw)
     for value in ("21", "22"):
         assert not backward_row_is_control("C", env(value)) and backward_row_is_control("A", env(value))
-    for value in ("23", "36"):
+    for value in ("23", "37"):
         assert not backward_row_is_control("A", env(value)) and backward_row_is_control("C", env(value))
+    assert backward_row_is_control("A", env("36")), "36 is an alias of the default"
     assert backward_row_is_control("B", env("23")) and backward_row_is_control("C", env("13")), "13 is an alias"
     assert not backward_row_is_control("C", env("1", REP_TK_BWDC_SPLITS="4"))
 
@@ -251,6 +256,34 @@ def test_stage_runs_compare_only_within_one_build():
     except ValueError:
         return
     raise AssertionError("runs from two builds compared")
+
+
+def test_graph_failure_still_gives_eager_rows():
+    eager = [graph_row("eager", [4.0, 4.1]), graph_row("eager.same_stream", [4.0, 4.0]), graph_row("eager.repeat", [4.0, 3.9])]
+    rows = eager + [graph_row(n, reason="RuntimeError: capture") for n in GRAPH_ROWS]
+    assert all(r["label"] == "measurement_only" for r in rows)
+    assert {r["id"]: r["available"] for r in rows}["graph.replay"] is False
+    t = attribute_graph(rows, "RuntimeError: capture")
+    assert t["graph_available"] is False and t["unavailable_reason"].endswith("capture") and "recoverable_ms" not in t
+    assert t["measured"] is False and abs(t["eager_ms"] - 4.0) < 1e-9
+    rows[1] = graph_row("eager.same_stream", reason="AttributeError: no such context")
+    assert "stream_and_threading_ms" not in attribute_graph(rows, "RuntimeError: capture"), "eager rows must survive this too"
+
+
+def test_graph_recovery_is_read_against_the_floor():
+    rows = [graph_row("eager", [4.00, 4.02]), graph_row("eager.same_stream", [4.0, 4.0]), graph_row("eager.repeat", [4.00, 4.01]),
+            graph_row("graph.replay", [3.99, 3.99]), graph_row("graph.event_pair", [3.9, 3.9]), graph_row("graph.host_call", [0.1, 0.1])]
+    t = attribute_graph(rows)
+    assert abs(t["recoverable_ms"] - 0.015) < 1e-9 and t["recoverable_above_floor"] is False, "inside the floor is no saving"
+    rows[3] = graph_row("graph.replay", [3.8, 3.8])
+    assert attribute_graph(rows)["recoverable_above_floor"] is True
+
+
+def test_graph_equivalence_fails_on_nan_and_large_error():
+    tol = dict(o=1e-2, dq=2e-2)
+    assert compare_outputs(dict(o=(0.0, 1.0), dq=(0.001, 1.0)), tol)[1] is True
+    assert compare_outputs(dict(o=(0.5, 1.0), dq=(0.0, 1.0)), tol)[1] is False
+    assert compare_outputs(dict(o=(float("nan"), 1.0), dq=(0.0, 1.0)), tol)[1] is False
 
 
 def test_stage_compare_keeps_rows_only_one_run_has():
@@ -345,6 +378,9 @@ if __name__ == "__main__":
     test_forward_change_under_backward_arm_is_invalid()
     test_stage_runs_compare_only_within_one_build()
     test_stage_compare_keeps_rows_only_one_run_has()
+    test_graph_failure_still_gives_eager_rows()
+    test_graph_recovery_is_read_against_the_floor()
+    test_graph_equivalence_fails_on_nan_and_large_error()
     test_backward_steps_are_named_and_counted_once()
     test_abba_is_balanced()
     test_estimate_is_labelled_and_stages_are_not_summed()

@@ -359,12 +359,12 @@ from a build containing CFG 20.
 
 | CFG | Kernel | Softmax | MINB | Tier-B gather | Registers | Stack bytes |
 |---:|---|---|---:|---|---:|---:|
-| 1 (default) | `fwd_ker`, all tiers; heuristic tier-C backward split | TK vector | 3 | `cp.async` | 166 | no spills |
-| 10, 13 | aliases of CFG 1, kept so old logs stay reproducible | as CFG 1 | 3 | as CFG 1 | as CFG 1 | as CFG 1 |
+| 1 (default) | `fwd_ker`, all tiers; heuristic tier-C backward split; tier-A dK/dV stored by each kv block's single owner CTA, no `kg`/`vg` memset | TK vector | 3 | `cp.async` | 166 | no spills |
+| 10, 13, 36 | aliases of CFG 1, kept so old logs stay reproducible | as CFG 1 | 3 | as CFG 1 | as CFG 1 | as CFG 1 |
 | 21 | CFG 1 forward; tier-C backward split by the old wave policy | as CFG 1 | 3 | as CFG 1 | as CFG 1 | as CFG 1 |
 | 22 | CFG 1 forward; tier-C backward split forced to 4 | as CFG 1 | 3 | as CFG 1 | as CFG 1 | as CFG 1 |
-| 23 | CFG 1 forward; tier-A backward `__launch_bounds__(128, 3)` probe | as CFG 1 | 3 | as CFG 1 | as CFG 1 | as CFG 1 |
-| 36 | CFG 1 forward; tier-A dK/dV stored by each kv block's owner CTA instead of reduce-added, without the `kg` and `vg` memsets | as CFG 1 | 3 | as CFG 1 | as CFG 1 | as CFG 1 |
+| 23 | CFG 1 forward; tier-A backward `__launch_bounds__(128, 3)` probe, on CFG 37's reduce-add path | as CFG 1 | 3 | as CFG 1 | as CFG 1 | as CFG 1 |
+| 37 | CFG 1 forward; the pre-round-11 tier-A backward: `zeros(kg)`, `zeros(vg)` and the reduce-add kernel | as CFG 1 | 3 | as CFG 1 | as CFG 1 | as CFG 1 |
 | 11 | measured negative arm: `fwd_kdb_ker`, CFG 1 plus a double-buffered K tile | TK vector | 3 | `cp.async` | not recorded here | not recorded here |
 | 24 | measured negative arm: `fwd_pipe_ker`, CFG 11's K double buffer plus a two-stage softmax, the next tile's QK issued before the current softmax finishes | TK vector | 2 | `cp.async` | not recorded here | not recorded here |
 | 32 | measured negative arm: `fwd_ring_ker`, two CTAs/SM, K and V both double-buffered | TK vector | 2 | `cp.async` | not recorded here | not recorded here |
@@ -507,7 +507,7 @@ ThunderKittens commit are recorded.
 | `control=true` | does not read the compared setting; a ratio away from 1 is run drift |
 
 Backward kernels and table builds read no forward setting, so their kernel rows are controls, with two exceptions:
-CFG 21, CFG 22 and a forced split reach `kernel.tk.bwd.C`, and CFG 23 and 36 reach `kernel.tk.bwd.A`. Between CFG 1, its
+CFG 21, CFG 22 and a forced split reach `kernel.tk.bwd.C`, and CFG 23 and 37 reach `kernel.tk.bwd.A`. Between CFG 1, its
 aliases and the backward arms, one forward kernel by definition, the forward-only rows are controls.
 
 The forward-identical check for those arms has three parts. The forward dispatch in `fwd_impl` must launch the
@@ -609,31 +609,52 @@ The two-CTA figures imply a CFG 1 of about 0.80 ms in their own run, so read the
 Round 9: CFG 34 and 35 were both neutral. CFG 34 was 0.995 on the forward kernel and 1.000 on F+B, and CFG 35 0.996 and
 0.999, against an A/A floor of 0.983-1.011.
 
-Next: split the backward with `bench_bwd_stages.py`, below. The reported figures are 2.98 ms of backward beside 4.08 ms
-F+B, with the three tier kernels at 2.36 ms (A 1.55, B 0.50, C 0.31), leaving about 0.62 ms. Those kernel figures are
-back-to-back loops and 2.98 ms has synchronize gaps around it, so some of that 0.62 ms may be measurement mode.
+Round 11: CFG 36, the single-writer dK/dV store without the `kg` and `vg` memsets, was accepted. Routed `b_direct` went from
+2.9389 to 2.8597 ms (0.9731) and F+B from 4.1363 to 4.0495 ms (0.9790), against an A/A floor of 1.0010-1.0017 on those
+rows, with all suites passing. `bench_bwd_stages.py` showed about 0.135 ms of memsets directly. The kernel writes zeros itself
+for a kv block with an empty list, and `qg` is still zeroed because dQ is still reduce-added.
 
-CFG 36 is a backward-only arm. The routed backward zeroes `qg`, `kg` and `vg`, 128 MiB each at this shape and 384 MiB in
-all, reported at about 0.13 ms. On the `row_ptr` path each kv block has one owner CTA, so `kStoreKV` stores tier-A dK/dV
-instead of reduce-adding them, and `ops.py` allocates `kg` and `vg` with `torch.empty`. `qg` is still zeroed, because dQ
-is still reduce-added. The default keeps the memset path, so CFG 1 vs CFG 36 is one variable, and CFG 36 is held to the
-same forward-identical check as CFG 21/22/23.
+That store is now the default. CFG 36 is its alias and CFG 37 is the old path, so CFG 37 vs CFG 1 reproduces the change, with
+the same forward-identical checks as CFG 21/22/23. In `bench_bwd_stages.py` the `kg` and `vg` rows are now `present=false` under
+CFG 1 and timed under CFG 37. CFG 23 runs on CFG 37's path, so it is comparable only with CFG 37.
 
-The kernel writes zeros itself for a kv block with an empty list, which used to rely on the memset. Results differ
-only in one sign of zero, by its comment. The output check and the TK suite under CFG 36 must pass before its timing is
-read.
+Next: measure launch cost with `bench_graph.py`, below. The reported figures are 0.118 ms between the start of `backward()` and
+its first kernel, then about 13 launch gaps of about 3 us each, roughly 0.16 ms or 5% of F+B.
 
 ```bash
-REP_TK_FWD_CFG=36 <gpu-runner> python tests/test_gpu_tk.py
-REP_TK_FWD_CFG=1 <gpu-runner> python bench_bwd_stages.py --out results/raw/bwd-stages-cfg1.json
-REP_TK_FWD_CFG=36 <gpu-runner> python bench_bwd_stages.py --out results/raw/bwd-stages-cfg36.json
-python bench_bwd_stages.py --compare results/raw/bwd-stages-cfg1.json results/raw/bwd-stages-cfg36.json
+REP_TK_FWD_CFG=1 <gpu-runner> python bench_graph.py --out results/raw/graph-cfg1.json
 <gpu-runner> python bench_compare.py --candidate REP_TK_FWD_CFG=1 --out results/raw/aa-16k.json
-<gpu-runner> python bench_compare.py --candidate REP_TK_FWD_CFG=36 --out results/raw/cfg1-cfg36-16k.json
+<gpu-runner> python bench_compare.py --baseline REP_TK_FWD_CFG=37 --candidate REP_TK_FWD_CFG=1 --out results/raw/cfg37-cfg1-16k.json
 ```
 
-Read `fine_op` and `full_op` `b_direct` and `f_plus_b`, and `kernel.tk.bwd.A`, which is not a control here and excludes
-the memsets. The result that matters is measured fine-op and full-op F+B against the A/A displacement.
+### CUDA graph measurement
+
+`bench_graph.py` is measurement only and does not make the graph path a supported API. It captures one full `rep_attention(...)`
+plus its `backward()` into a CUDA graph on a non-default stream, on static input tensors, then replays it. Every row is
+`measurement_only`: these times are not a performance claim and must not be added to the kernel rows.
+
+| Row | Contents |
+|---|---|
+| `eager`, `eager.repeat` | routed F+B on the default stream, first and last; their spread is the floor |
+| `eager.same_stream` | the same call on the capture stream with autograd multithreading off |
+| `graph.replay` | replays in a loop with no synchronize inside, the same boundaries as `eager` |
+| `graph.event_pair` | an event pair around one replay |
+| `graph.host_call` | host wall time of the `graph.replay()` call |
+
+An event pair sits on the GPU timeline, so `graph.event_pair` is the replay's execution time, not its launch cost.
+`graph.host_call` is the closest measure of the launch cost itself. `attribution.recoverable_ms` is `eager` minus `graph.replay`,
+derived and marked `measured=false`, and a value inside the floor is not a saving.
+
+Capture runs with autograd multithreading off, because the backward would otherwise launch from a worker thread on the default
+stream, outside the capture. A graph replays what was captured: the router and the tables re-run on the same tensors, the
+outputs live in the graph's memory, and any host decision is frozen at capture. Replaying with different inputs or shape is not
+something this measures.
+
+`outputs` reports max absolute differences on `o`, `dq`, `dk` and `dv` for replay against eager and for eager against eager. The
+second is the floor, since dQ, dK and dV include fp32 reductions in a nondeterministic order. `equivalent` uses the generic
+cross-check's tolerances. If capture or replay raises, the reason is recorded and printed, the graph rows are marked
+`available=false`, and the eager rows are still produced. A kernel launched outside the capture would not raise, and would show
+as a failed `equivalent`.
 
 ### Backward stages
 

@@ -24,7 +24,7 @@ need not sum to the complete call: stages overlap differently on the stream when
 
 Under every configuration each row keeps its meaning. reads_fwd_cfg says whether it can change with
 REP_TK_FWD_CFG. A row with false, such as pool or route, should match another configuration within the floor.
-CFG13 is an alias and CFG21/22/23 change only the backward, so all their rows are labelled as a repeat of the
+CFG13 and CFG36 are aliases and CFG21/22/23/37 change only the backward, so all their rows are labelled as a repeat of the
 CFG1 forward. Compare runs from
 one build only, with --compare; numbers from another build, or from CFG1 before its gather changed, do not qualify.
 

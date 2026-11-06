@@ -58,7 +58,8 @@ TUNABLES = ("REP_TK_FWD_CFG", "REP_TK_BWDC_SPLITS")
 FWD_CFGS = {
     "0": ("operator", "fwd_ker: TK-vector softmax, MINB 4, bulk tier-B gather"),
     "1": ("operator", "fwd_ker: TK-vector softmax, MINB 3, cp.async tier-B gather; tier-C backward split by "
-                      "num_splits_heuristic (the kernel's default)"),
+                      "num_splits_heuristic; tier-A dK/dV stored by each kv block's single owner CTA, no kg/vg memset "
+                      "(the kernel's default)"),
     "6": ("operator", "fwd_ker: hand-written softmax, MINB 3, bulk tier-B gather; a softmax pair with CFG20"),
     "8": ("operator", "fwd_ker: TK-vector softmax, MINB 2, bulk tier-B gather"),
     "9": ("operator", "fwd_ker: hand-written softmax, MINB 2, bulk tier-B gather"),
@@ -76,9 +77,10 @@ FWD_CFGS = {
     "20": ("operator", "the pre-round-4 forward: per-slot cp.async.bulk tier-B gather; CFG1's backward"),
     "21": ("operator", "CFG1 forward; tier-C backward split by the old wave policy"),
     "22": ("operator", "CFG1 forward; tier-C backward split forced to 4"),
-    "23": ("operator", "CFG1 forward; tier-A backward __launch_bounds__(128, 3) occupancy probe"),
-    "36": ("operator", "CFG1 forward; tier-A dK/dV stored by each kv block's owner CTA instead of reduce-added, without "
-                       "the kg and vg memsets; the default keeps them"),
+    "23": ("operator", "CFG1 forward; tier-A backward __launch_bounds__(128, 3) occupancy probe, on the reduce-add path "
+                       "of CFG37"),
+    "36": ("operator", "alias of CFG1 since the single-writer dK/dV store became the default"),
+    "37": ("operator", "CFG1 forward; the pre-round-11 tier-A backward: zeros(kg), zeros(vg) and the reduce-add kernel"),
     "2": ("tier_a_path", "tier-A-only specialisation at MINB 4; other phases run the default kernel"),
     "3": ("tier_a_path", "tier-A-only specialisation at MINB 3; other phases run the default kernel"),
     "4": ("timing_only", "copied native loop, native softmax"),
@@ -90,8 +92,8 @@ PROFILES = {
     "controlled-softmax": dict(warmup=10, iters=50, kind="timing_only", baseline="REP_TK_FWD_CFG=4",
                                candidate="REP_TK_FWD_CFG=5"),
 }
-BACKWARD_ARMS = {"21": "C", "22": "C", "23": "A", "36": "A"}  # the only backward tier each one's setting reaches
-ALIASES = ("1", "10", "13")  # no dispatch line of their own needed
+BACKWARD_ARMS = {"21": "C", "22": "C", "23": "A", "37": "A"}  # the only backward tier each one's setting reaches
+ALIASES = ("1", "10", "13", "36")  # no dispatch line of their own needed
 OWN_FORWARD = ("20", "24", "32", "33")  # meaningless if they launch the default kernel
 RUNTIME_ARMS = {"34", "35"}  # deliberately the default kernel; a host-set diag flag selects the behaviour
 DISTINCT_FROM = {"24": ("11",), "32": ("11", "24"), "33": ("11", "24", "32"), "35": ("34",)}  # nor if they repeat an arm
@@ -142,7 +144,7 @@ def cfg_error(value, source):
         return f"REP_TK_FWD_CFG={value} is not implemented by this kernel source"
     # A backward-only arm has no forward dispatch line: its evidence is the backward code that reads the
     # config. Checking that token keeps the guard honest instead of exempting the arm outright.
-    if value in BACKWARD_ARMS and not re.search(rf"rep_cfg\(\) == {value}\b", source):
+    if value in BACKWARD_ARMS and not re.search(rf"rep_cfg\(\) [=!]= {value}\b", source):
         return f"REP_TK_FWD_CFG={value} is not implemented by the backward path"
     # A runtime-flag arm launches the default kernel on purpose, so the dispatch text cannot distinguish it;
     # the evidence is the flag assignment next to the config number.
@@ -153,7 +155,7 @@ def cfg_error(value, source):
         if table and table.get(value, table.get("default")) != table.get("default"):
             return f"REP_TK_FWD_CFG={value} must launch the default kernel and select by flag"
         return None
-    if value in ("10", "13", *OWN_FORWARD, *BACKWARD_ARMS):
+    if value in ("10", "13", "36", *OWN_FORWARD, *BACKWARD_ARMS):
         table = fwd_dispatch(source)
         if not table:
             return f"cannot read the forward dispatch to check REP_TK_FWD_CFG={value}"
@@ -198,9 +200,11 @@ def arms_error(configs):
     backward = arms & BACKWARD_ARMS.keys()
     if backward and not arms <= FORWARD_EQUAL:
         return f"CFG{min(backward)} changes only the backward; compare it with CFG1, not {sorted(arms)}"
-    if len({BACKWARD_ARMS[a] for a in backward}) > 1 or {"23", "36"} <= backward:
+    if "23" in arms and arms != {"23"} and arms != {"23", "37"}:
+        return "CFG23 runs on CFG37's reduce-add path, so only CFG37 vs CFG23 changes one thing"
+    if len({BACKWARD_ARMS[a] for a in backward}) > 1:
         return f"{sorted(backward)} change different things in the backward; compare each with CFG1"
-    if any(c.get("REP_TK_FWD_CFG") in FORWARD_EQUAL - {"1", "10"} and "REP_TK_BWDC_SPLITS" in c for c in configs.values()):
+    if any(c.get("REP_TK_FWD_CFG") in BACKWARD_ARMS and "REP_TK_BWDC_SPLITS" in c for c in configs.values()):
         return "REP_TK_BWDC_SPLITS would override or add to what a backward arm measures"
     return None
 
