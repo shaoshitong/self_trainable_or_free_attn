@@ -5,13 +5,17 @@ synchronize at the end, nothing logged or synchronized per call. Two scopes are 
 that no row silently includes work another one omits:
 
   kernel   the attention kernel(s) alone, representative tables prebuilt
-  op       what one forward / backward of the autograd op costs (includes table build, zero-inits,
-           delta, unpool, finalize); the backward is (fwd + bwd) - fwd
+  op       what one call of the autograd op costs (includes table build, zero-inits, delta, unpool,
+           finalize). F+B is measured; "bwd est" is F+B - F, a subtraction of two loops and an estimate
+
+The "=>" backward lines add separately timed kernels. They are sums, not measured complete calls.
+bench_compare.py runs the same rows per configuration and writes a machine-readable result.
 
 The native TK rows are VSA2's own fine kernels on the tier-A lists -- the 10% budget VSA2 keeps, with
 the other 90% of the pairs dropped. They are the baseline every three-tier row is compared against.
 """
 import argparse
+import os
 import sys
 
 import torch
@@ -105,12 +109,12 @@ def main():
         print(f"  {n:52s} {t:8.3f}")
     tk_b = brows[0][1] + brows[1][1] + brows[2][1]
     ge_b = brows[3][1] + brows[4][1]
-    print(f"  {'=> TK three tiers (A native + B + C)':52s} {tk_b:8.3f}   {tk_b/brows[0][1]:.3f}x native TK")
-    print(f"  {'=> generic three tiers (variant 1)':52s} {ge_b:8.3f}   {ge_b/brows[0][1]:.3f}x native TK")
-    print(f"  {'   TK / generic':52s} {tk_b/ge_b:8.3f}x")
+    print(f"  {'=> sum of stages, not a call: TK A native + B + C':52s} {tk_b:8.3f}   {tk_b/brows[0][1]:.3f}x native TK")
+    print(f"  {'=> sum of stages, not a call: generic variant 1':52s} {ge_b:8.3f}   {ge_b/brows[0][1]:.3f}x native TK")
+    print(f"  {'   TK / generic, ratio of the two sums':52s} {tk_b/ge_b:8.3f}x")
 
     # ------------------------------------------------------------ op scope
-    print("\n--- op scope (rep_fine_attention autograd op, frozen selection)   fwd ms    bwd ms")
+    print("\n--- op scope (rep_fine_attention autograd op, frozen selection)   fwd ms  F+B ms  bwd est")
     qq, kk, vv = (t.detach().clone().requires_grad_(True) for t in (q, k, v))
     op = {}
     for be in ("generic", "tk"):
@@ -121,8 +125,9 @@ def main():
                 o, _ = rep_fine_attention(qq, kk, vv, blk_cnt, sel, mid_reps=rm, phases=ph, backend=be)
                 o.backward(dout)
                 qq.grad = kk.grad = vv.grad = None
-            op[(be, name)] = (f, T(fb) - f)
-            print(f"  {be:8s} {name:8s}{'':40s} {f:8.3f}  {op[(be, name)][1]:8.3f}")
+            fbt = T(fb)
+            op[(be, name)] = (f, fbt - f)
+            print(f"  {be:8s} {name:8s}{'':32s} {f:8.3f} {fbt:8.3f} {fbt - f:8.3f}")
 
     def native_op_fb():
         o, lse = C.tk_native_fwd(q, k, v, qp, qi, blk_cnt)
@@ -131,17 +136,20 @@ def main():
         C.tk_native_bwd(q, k, v, dout, lse, dd, kp, ki, blk_cnt, a1, a2, a3)
         return C.finalize(a1, None, blk_cnt, q), C.finalize(a2, None, blk_cnt, k), C.finalize(a3, None, blk_cnt, v)
     nf = T(lambda: C.tk_native_fwd(q, k, v, qp, qi, blk_cnt))
-    nb_ = T(native_op_fb) - nf
-    print(f"  {'native TK fine (tier A only, VSA2 kernels + zero-init/delta/finalize)':58s} {nf:8.3f}  {nb_:8.3f}")
+    nfb = T(native_op_fb)
+    nb_ = nfb - nf
+    print(f"  {'native TK fine (tier A only, VSA2 kernels + zero-init/delta/finalize)':50s} {nf:8.3f} {nfb:8.3f} {nb_:8.3f}")
     gf, gb = op[("generic", "A|B|C")]
     tf, tb = op[("tk", "A|B|C")]
-    print(f"\n  three tiers, TK vs generic:   forward {tf/gf:.3f}x   backward {tb/gb:.3f}x   "
-          f"fwd+bwd {(tf+tb)/(gf+gb):.3f}x")
-    print(f"  three tiers TK vs native TK (tier A only): forward {tf/nf:.3f}x   backward {tb/nb_:.3f}x   "
-          f"fwd+bwd {(tf+tb)/(nf+nb_):.3f}x")
+    print(f"\n  three tiers, TK vs generic:   forward {tf/gf:.3f}x   bwd est {tb/gb:.3f}x   "
+          f"F+B {(tf+tb)/(gf+gb):.3f}x")
+    print(f"  three tiers TK vs native TK (tier A only, not equal work): forward {tf/nf:.3f}x   bwd est {tb/nb_:.3f}x   "
+          f"F+B {(tf+tb)/(nf+nb_):.3f}x")
 
 
 if __name__ == "__main__":
     if not torch.cuda.is_available() or not ext().has_tk():
         sys.exit("needs a GPU and a VSA2_REP_TK=1 build")
+    if os.environ.get("REP_TK_FWD_CFG", "1") not in ("0", "1"):
+        sys.exit("REP_TK_FWD_CFG 2-5 do not run the tiers these rows are labelled with; see fwd_cfg.py")
     main()

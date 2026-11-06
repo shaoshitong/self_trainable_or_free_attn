@@ -319,6 +319,10 @@ The TK suite checks tables and swizzle, per-tier and all-tier forward/LSE agains
 native TK on tier A, TK-vs-generic backward dQ/dK/dV, and the routed autograd operator. Recorded
 successful coverage includes D=64/128, `mid_reps=2/4/8`, and an incomplete final block.
 
+`test_masked_and_empty` (generic and TK suites) adds zero-count blocks, all-masked first and intermediate
+tiles, empty selections and per-tier gradients. It has not been run yet, so the recorded passes above do
+not include it.
+
 First fair kernel/op benchmark:
 
 ```bash
@@ -357,7 +361,75 @@ REP_TK_FWD_CFG=5                 diagnostic native-loop/custom-softmax copy
 REP_TK_BWDC_SPLITS=<positive>    force tier-C query split count
 ```
 
-The diagnostic modes are measurement code, not production configurations.
+The diagnostic modes are measurement code, not production configurations. `REP_TK_FWD_CFG` is cached on
+first use, so one process measures one value. An unknown value silently runs the default path. CFG 4/5
+ignore `phases` and run tier A only, so the `A|B|C` values recorded for them in
+`results/tk-later-iterations.txt` are tier-A timings; `fwd_cfg.py` no longer prints those rows.
+
+### Same-build comparison
+
+`bench_compare.py` compares two configurations of one build. It runs one process per arm in ABBA order,
+with `q`, `k`, `v`, `dO`, gate and selection from one seed, and writes one JSON result. Each arm records
+hardware, source and extension hashes, shape, configuration, per-batch timings and `nvidia-smi` state. It
+marks the result invalid if the arms differ in any of the hashes, inputs, selection, shape or settings.
+
+```bash
+# controlled softmax pair: tier A, warmup 10, iters 50, TIMING ONLY
+CUDA_VISIBLE_DEVICES=0 /opt/venv/bin/python bench_compare.py \
+  --profile controlled-softmax --out results/raw/controlled-16k.json
+
+# representative semantics: warmup 10, iters 30. Equal arms give the A/A noise floor.
+CUDA_VISIBLE_DEVICES=0 /opt/venv/bin/python bench_compare.py \
+  --baseline REP_TK_FWD_CFG=1 --candidate REP_TK_FWD_CFG=1 --out results/raw/aa-16k.json
+
+# a candidate kernel added to the same build under a new value
+CUDA_VISIBLE_DEVICES=0 /opt/venv/bin/python bench_compare.py \
+  --new-cfg 6 --baseline REP_TK_FWD_CFG=1 --candidate REP_TK_FWD_CFG=6 --out results/raw/cand-16k.json
+```
+
+Export `VSA2_REP_SOURCE` and `VSA2_REP_TK_ROOT` as for the build, so the VSA2 source hashes and the
+ThunderKittens commit are recorded.
+
+| Row label | Meaning |
+|---|---|
+| `scope=kernel` | one kernel, tables prebuilt; `bwd_stage` rows are never summed into a call |
+| `scope=fine_op` | complete `rep_fine_attention` call on the frozen selection |
+| `scope=full_op` | complete `rep_attention` call: router, coarse branch, gate |
+| `stage=f` | forward on the same grad-tracking leaves as `f_plus_b`; the graph is dropped |
+| `stage=f_plus_b` | measured forward + backward + grad reset, no synchronize inside the loop |
+| `stage=b_direct` | measured backward: fresh graph per sample, forward finished before the interval, grads reset after it |
+| `stage=b_estimate` | `median(f_plus_b) - median(f)`, `measured=false`, an estimate |
+| `work=tier_a_only` | 10% of the pairs; not equivalent to the 64/4/1 operator |
+| `control=true` | independent of the configuration; a ratio away from 1 is run drift |
+
+`b_direct` cannot reuse one graph: backward releases the representative tables, so `retain_graph=True`
+would not make a second backward valid. Its synchronizes add idle gaps the `f_plus_b` loop does not have,
+so it need not equal the estimate. The older `bench_tk.py` forward rows use leaves without grad tracking;
+compare its numbers with its own runs only.
+
+`claims.may_claim_op_level_change` is true only for the representative profile, after the arm's forward,
+lse and dQ/dK/dV agree with the generic backend at the run's shape, with the test suite's tolerances. The
+CPU, generic and TK suites are still required on that build. The controlled profile can never set it:
+
+- CFG 4/5 output is not validated. Both leave the returned `lse` unwritten, and both leave `o` and `lse`
+  unwritten for query blocks with an empty tier-A list.
+- CFG 5 normalizes only the `.x` lanes of `o`, by the `l_r[0]` row sum, while CFG 4 runs a complete
+  `div_row`. The roughly 0.108 ms therefore compares two epilogues as well as two softmax loops.
+- Diagnostics that skip bias loads or change the load path (`diag != 0`, used only by `fwd_cfg.py`) locate
+  cost. They cannot establish numerical or end-to-end acceleration.
+
+No counters are collected: `ncu` returns `ERR_NVGPUCTRPERM`, and event timing does not yield MFU or stall
+figures.
+
+Smallest meaningful matrix, in order, all on `aster-debug-1105-worker-0` GPU 0 with one build:
+
+| # | Purpose | Shape | Arms | Gate before the next step |
+|---:|---|---|---|---|
+| 1 | test the build | suite sizes | CPU, generic and TK suites | all pass, or each failure is explained |
+| 2 | noise floor | 16K/H16/D128/RM4 | CFG 1 vs CFG 1 | controls and A/A ratios near 1; sets the smallest resolvable difference |
+| 3 | reproduce the softmax gap | same | controlled-softmax, CFG 4 vs CFG 5 | timing only |
+| 4 | candidate | same | CFG 1 vs candidate, after the suites pass with the candidate compiled in | `output_validated` true; difference above the A/A floor |
+| 5 | later length, only after step 4 | 64K/H16/D128/RM4 | CFG 1 vs candidate, preceded by A/A | same gates |
 
 ## 8. Measured evidence
 
@@ -436,9 +508,10 @@ Suggested controlled continuation:
 3. Apply only in a disposable checkout.
 4. Build with the exact TK command in section 5 and capture nvcc/ptxas output.
 5. Run CPU, generic GPU, and full TK GPU suites.
-6. Repeat the `fwd_cfg.py` controlled pair in one build, with the same inputs and warmup/iteration
-   settings.
-7. Run complete `bench_tk.py` op scope before claiming an op-level improvement.
+6. Repeat the controlled pair in one build with `bench_compare.py --profile controlled-softmax`, which
+   keeps the same inputs and warmup/iteration settings. That result is timing only.
+7. Run the representative profile of `bench_compare.py`, which includes complete-call scope, before
+   claiming an op-level improvement.
 
 To inspect the patch without applying it:
 

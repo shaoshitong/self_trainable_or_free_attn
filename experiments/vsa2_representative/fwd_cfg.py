@@ -1,4 +1,11 @@
-"""Forward-only timing of the TK kernel for one REP_TK_FWD_CFG (set in the environment) vs native TK."""
+"""Forward-only timing of the TK kernel for one REP_TK_FWD_CFG (set in the environment) vs native TK.
+
+Diagnostic text output, not a comparison: bench_compare.py runs the controlled pair with a recorded result.
+CFG 4/5 run tier A whatever `phases` says and their output is not validated, so only their tier-A row is
+printed, as timing only. The diag= rows change the work (no bias loads, a different load path); they
+locate cost and cannot establish numerical or end-to-end acceleration.
+"""
+import os
 import torch
 from vsa2_rep.ops import PHASE_A, PHASE_ALL, RepTiers, ext, route_tiers, tk_tables
 C = ext(); dev = "cuda"
@@ -16,9 +23,13 @@ def T(fn, n=50):
     b.record(); torch.cuda.synchronize(); return a.elapsed_time(b) / n
 nat = T(lambda: C.tk_native_fwd(q, k, v, sel.q2k_ptr, sel.q2k_idx, cnt))
 fa = T(lambda: C.rep_tk_fwd(q, k, v, tab, sel.q2k_ptr, sel.q2k_idx, sel.b_ptr, sel.b_idx, sel.bits_ab, cnt, rm, PHASE_A, 0))
+cfg_name = os.environ.get("REP_TK_FWD_CFG", "1")
+if cfg_name in ("4", "5"):
+    print(f"cfg={cfg_name}  native {nat:.3f}  A-only {fa:.3f} ({fa/nat:.3f}x)  TIMING ONLY: diagnostic tier-A copy, "
+          "output not validated")
+    raise SystemExit
 fall = T(lambda: C.rep_tk_fwd(q, k, v, tab, sel.q2k_ptr, sel.q2k_idx, sel.b_ptr, sel.b_idx, sel.bits_ab, cnt, rm, PHASE_ALL, 0))
-import os
-print(f"cfg={os.environ.get('REP_TK_FWD_CFG','0')}  native {nat:.3f}  A-only {fa:.3f} ({fa/nat:.3f}x)  A|B|C {fall:.3f} ({fall/nat:.3f}x)")
+print(f"cfg={cfg_name}  native {nat:.3f}  A-only {fa:.3f} ({fa/nat:.3f}x)  A|B|C {fall:.3f} ({fall/nat:.3f}x)")
 from vsa2_rep.ops import PHASE_B, PHASE_C
 fb = T(lambda: C.rep_tk_fwd(q, k, v, tab, sel.q2k_ptr, sel.q2k_idx, sel.b_ptr, sel.b_idx, sel.bits_ab, cnt, rm, PHASE_B, 0))
 fc = T(lambda: C.rep_tk_fwd(q, k, v, tab, sel.q2k_ptr, sel.q2k_idx, sel.b_ptr, sel.b_idx, sel.bits_ab, cnt, rm, PHASE_C, 0))
@@ -27,6 +38,6 @@ print(f"  B only {fb:.3f} ms ({nbt:.2f} tiles/qblock -> {fb/nbt*1e3:.1f} us per 
       f"   C only {fc:.3f} ms (4 tiles -> {fc/4*1e3:.1f})   A tile {fa/25.6*1e3:.1f}")
 for dg, what in ((1, "B: no bias loads"), (2, "B: one tensor-TMA tile, no bulk"), (3, "B: neither")):
     t = T(lambda: C.rep_tk_fwd(q, k, v, tab, sel.q2k_ptr, sel.q2k_idx, sel.b_ptr, sel.b_idx, sel.bits_ab, cnt, rm, PHASE_B, dg))
-    print(f"  diag={dg} {what:34s} B only {t:.3f} ms  (full {fb:.3f}: this component {fb - t:+.3f} ms)")
+    print(f"  diag={dg} DIAGNOSTIC, changes work: {what:34s} B only {t:.3f} ms  (full {fb:.3f}: this component {fb - t:+.3f} ms)")
 t4 = T(lambda: C.rep_tk_fwd(q, k, v, tab, sel.q2k_ptr, sel.q2k_idx, sel.b_ptr, sel.b_idx, sel.bits_ab, cnt, rm, PHASE_B, 4))
-print(f"  diag=4 B: copies one per lane           B only {t4:.3f} ms  (vs slot-per-lane {fb:.3f})")
+print(f"  diag=4 DIAGNOSTIC: B copies one per lane           B only {t4:.3f} ms  (vs slot-per-lane {fb:.3f})")
