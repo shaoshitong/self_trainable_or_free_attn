@@ -230,8 +230,9 @@ std::vector<torch::Tensor> route_tiers(torch::Tensor qr, torch::Tensor kr, torch
   // kernels, so run the A|B chain on a second stream to fill the other's launch gaps. That needs its own
   // workspace and its own kv->q scratch (both chains otherwise share `k2q_buf`), plus events to order it
   // against the score pass and to join before the next iteration rewrites `scores`.
-  const bool parallel = std::getenv("REP_TK_FWD_CFG") != nullptr &&
-                        std::strcmp(std::getenv("REP_TK_FWD_CFG"), "44") == 0 && (keff_ab != keff_a);
+  // Default since it measured -2% on F+B; CFG44 is the accepted alias and CFG45 restores the sequential order.
+  const char* cfg_env = std::getenv("REP_TK_FWD_CFG");
+  const bool parallel = (keff_ab != keff_a) && !(cfg_env != nullptr && std::strcmp(cfg_env, "45") == 0);
   torch::Tensor ws2, ab_k2q_buf2;
   vsa2::TopkWorkspace w2{};
   // Created once per process: creating and destroying a stream plus two events on every routing call cost more
