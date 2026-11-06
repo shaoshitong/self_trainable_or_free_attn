@@ -701,6 +701,8 @@ epilogue:
 // and tier-B gather. Tile j's K lives in buffer j & 1, counting every tile; step j issues K(j + 2) into
 // its own buffer as soon as its QK has read it, so each K is issued a tile earlier than with one buffer.
 // A separate kernel with a plain template step, so fwd_ker and its instantiations are untouched.
+// Measured negative (H100, 16K H16 D128): A|B|C kernel 0.997x, full F+B 1.000x of cfg 1, within A/A; K
+// latency is already hidden by three resident CTAs. Kept as a documented negative arm, not a default.
 //
 // Barriers: one per K buffer; bit b of kph is the parity of buffer b's next TMA phase and flips only when
 // a TMA-delivered (A or C) tile is consumed from that buffer. Loads into a buffer and its consumptions
@@ -1643,7 +1645,8 @@ static void fwd_impl(torch::Tensor q, torch::Tensor k, torch::Tensor v, const st
   else if (cfg == 9) launch(rep_tk::fwd_ker<D, 2, false, true>);
   // cfg 20: the pre-cp.async default, per-slot cp.async.bulk tier-B gather (history arm)
   else if (cfg == 20) launch(rep_tk::fwd_ker<D, 3>);
-  // cfg 11: fwd_kdb_ker, the default with K double-buffered (one more K tile, same launch bounds and grid)
+  // cfg 11: fwd_kdb_ker, the default with K double-buffered (one more K tile, same launch bounds and grid);
+  // a measured negative arm (no gain over cfg 1)
   else if (cfg == 11) {
     constexpr int mem_kdb = 4 * 64 * D * 2 + 1024;  // q, two K, v tiles + alignment slack
     cudaFuncSetAttribute(rep_tk::fwd_kdb_ker<D>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_kdb);
