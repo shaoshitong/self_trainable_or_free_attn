@@ -2247,26 +2247,44 @@ static void fwd_impl(torch::Tensor q, torch::Tensor k, torch::Tensor v, const st
     cudaFuncSetAttribute(rep_tk::fwd_pipe_ker<D>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_pipe);
     rep_tk::fwd_pipe_ker<D><<<dim3(NB, H, B), 128, mem_pipe, stream()>>>(g);
   }
-  // cfg 32 / 33: fwd_ring_ker, the default with 2- / 3-slot K and V rings at 2 CTAs per SM. Refuses to run
-  // (rather than silently dropping to 1 CTA per SM) unless the device fits two resident CTAs.
-  else if (cfg == 32 || cfg == 33) {
-    auto kern = cfg == 32 ? rep_tk::fwd_ring_ker<D, 2> : rep_tk::fwd_ring_ker<D, 3>;
-    const int bytes = cfg == 32 ? rep_tk::ring_cfg<D, 2>::smem_bytes : rep_tk::ring_cfg<D, 3>::smem_bytes;
-    static int checked[2] = {0, 0};  // per arm, once per process
-    if (!checked[cfg - 32]) {
-      cudaError_t err = cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+  // cfg 32 / 33: fwd_ring_ker, the default with 2- / 3-slot K and V rings at 2 CTAs per SM. Each arm is
+  // spelled out as its own branch so the harness can read which kernel a config launches; both refuse to
+  // run (rather than silently dropping to 1 CTA per SM) unless the device fits two resident CTAs.
+  else if (cfg == 32) {
+    constexpr int bytes = rep_tk::ring_cfg<D, 2>::smem_bytes;
+    static int checked32 = 0;
+    if (!checked32) {
+      cudaError_t err = cudaFuncSetAttribute(rep_tk::fwd_ring_ker<D, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
       if (err == cudaSuccess)
-        err = cudaFuncSetAttribute(kern, cudaFuncAttributePreferredSharedMemoryCarveout,
+        err = cudaFuncSetAttribute(rep_tk::fwd_ring_ker<D, 2>, cudaFuncAttributePreferredSharedMemoryCarveout,
                                    (int)cudaSharedmemCarveoutMaxShared);
-      TORCH_CHECK(err == cudaSuccess, "REP_TK_FWD_CFG=", cfg, ": cannot request ", bytes,
+      TORCH_CHECK(err == cudaSuccess, "REP_TK_FWD_CFG=32: cannot request ", bytes,
                   " B of dynamic shared memory: ", cudaGetErrorString(err));
       int resident = 0;
-      err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&resident, kern, 128, bytes);
-      TORCH_CHECK(err == cudaSuccess && resident >= 2, "REP_TK_FWD_CFG=", cfg, ": ", resident,
+      err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&resident, rep_tk::fwd_ring_ker<D, 2>, 128, bytes);
+      TORCH_CHECK(err == cudaSuccess && resident >= 2, "REP_TK_FWD_CFG=32: ", resident,
                   " resident CTA(s) per SM at ", bytes, " B of dynamic shared memory; this arm requires 2");
-      checked[cfg - 32] = 1;
+      checked32 = 1;
     }
-    kern<<<dim3(NB, H, B), 128, bytes, stream()>>>(g);
+    rep_tk::fwd_ring_ker<D, 2><<<dim3(NB, H, B), 128, bytes, stream()>>>(g);
+  }
+  else if (cfg == 33) {
+    constexpr int bytes = rep_tk::ring_cfg<D, 3>::smem_bytes;
+    static int checked33 = 0;
+    if (!checked33) {
+      cudaError_t err = cudaFuncSetAttribute(rep_tk::fwd_ring_ker<D, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+      if (err == cudaSuccess)
+        err = cudaFuncSetAttribute(rep_tk::fwd_ring_ker<D, 3>, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                   (int)cudaSharedmemCarveoutMaxShared);
+      TORCH_CHECK(err == cudaSuccess, "REP_TK_FWD_CFG=33: cannot request ", bytes,
+                  " B of dynamic shared memory: ", cudaGetErrorString(err));
+      int resident = 0;
+      err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&resident, rep_tk::fwd_ring_ker<D, 3>, 128, bytes);
+      TORCH_CHECK(err == cudaSuccess && resident >= 2, "REP_TK_FWD_CFG=33: ", resident,
+                  " resident CTA(s) per SM at ", bytes, " B of dynamic shared memory; this arm requires 2");
+      checked33 = 1;
+    }
+    rep_tk::fwd_ring_ker<D, 3><<<dim3(NB, H, B), 128, bytes, stream()>>>(g);
   }
   // cfg 1 / 10: tier-B tiles loaded by CTA-wide cp.async (issue_tier_b_cta) instead of bulk copies
   else launch(rep_tk::fwd_ker<D, 3, false, false, true>);
