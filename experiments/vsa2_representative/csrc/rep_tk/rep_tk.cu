@@ -72,6 +72,12 @@ __device__ __forceinline__ void bulk_commit() { asm volatile("cp.async.bulk.comm
 __device__ __forceinline__ void bulk_wait_read0() { asm volatile("cp.async.bulk.wait_group.read 0;\n" ::: "memory"); }
 __device__ __forceinline__ void bulk_wait0() { asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory"); }
 __device__ __forceinline__ void fence_async_smem() { asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory"); }
+__device__ __forceinline__ void cp_async_16(uint32_t dst_smem, const void* src) {
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst_smem), "l"(src) : "memory");
+}
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
+template <int N>
+__device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory"); }
 
 // Number of distinct swizzle phases a tier-B slot can start on: slot s begins at tile row RM*s, and the
 // 128-byte swizzle repeats every 8 rows.
@@ -279,6 +285,37 @@ __device__ __forceinline__ void issue_tier_b(uint32_t dst, const bf16* sw_bh, co
   }
 }
 
+// REP_TK_FWD_CFG=10: the same tier-B bytes, records and shared-memory layout as issue_tier_b, moved by all
+// 128 threads with 16-byte cp.async instead of per-slot bulk copies on an mbarrier. Thread t copies
+// 16-byte chunk t % 8 of tile rows t / 8 + 16u (u = 0..3) in every panel: 4 * D/64 copies per thread, a
+// warp covering 4 consecutive rows (a slot's contiguous run when RM >= 4). blk[u] is the block of row
+// t / 8 + 16u's slot (slot_blocks_cta). One commit group per call; the consumer waits with
+// cp_async_wait, fence_async_smem and a CTA barrier (see fwd_ker's step).
+__device__ __forceinline__ void slot_blocks_cta(const int* b_idx, int nb_list, int tb, int NB, int RM, int (&blk)[4]) {
+  const int G = kB / RM, lr = __ffs(RM) - 1;
+#pragma unroll
+  for (int u = 0; u < 4; ++u) {
+    const int sl = ((threadIdx.x >> 3) + 16 * u) >> lr, pos = tb * G + sl;
+    blk[u] = pos < nb_list ? b_idx[pos] : NB;  // empty slot: the zero record
+  }
+}
+template <int D>
+__device__ __forceinline__ void issue_tier_b_cta(uint32_t dst, const bf16* sw_bh, const int (&blk)[4], int NB, int RM) {
+  constexpr int NPAN = D / 64;
+  const int NP = num_phases(RM), lr = __ffs(RM) - 1, w = threadIdx.x & 7;
+  const size_t rec = (size_t)NPAN * RM * 64;
+#pragma unroll
+  for (int u = 0; u < 4; ++u) {
+    const int row = (threadIdx.x >> 3) + 16 * u, sl = row >> lr, gg = row & (RM - 1);
+    const int pi = sl & (NP - 1);  // NP is 1 or 8 / RM
+    const bf16* src = sw_bh + ((size_t)pi * (NB + 1) + blk[u]) * rec + (size_t)gg * 64 + w * 8;
+#pragma unroll
+    for (int p = 0; p < NPAN; ++p)
+      cp_async_16(dst + p * (kB * 128) + (uint32_t)row * 128u + w * 16u, src + (size_t)p * RM * 64);
+  }
+  cp_async_commit();
+}
+
 // ---------------------------------------------------------------- forward
 template <int D>
 struct fwd_globals {
@@ -356,8 +393,9 @@ __device__ __forceinline__ void online_softmax_tk(rt_fl<16, 64>& att, col_vec<rt
 // selects 4 for comparison. HAND_SM = true keeps the previous hand-written softmax (log2 domain, deferred
 // row sums) as a same-build control, REP_TK_FWD_CFG=6. At MINB 3 the D=128 A|B|C path sits on the
 // 168-register cap and spills; REP_TK_FWD_CFG=8 / 9 are the same two kernels at MINB 2 (cap 255), to
-// measure that cap against the occupancy it buys.
-template <int D, int MINB, bool A_ONLY = false, bool HAND_SM = false>
+// measure that cap against the occupancy it buys. B_CPASYNC = true (REP_TK_FWD_CFG=10) loads tier-B tiles
+// with issue_tier_b_cta instead of the bulk-copy gather; every other tile and all arithmetic are unchanged.
+template <int D, int MINB, bool A_ONLY = false, bool HAND_SM = false, bool B_CPASYNC = false>
 __global__ __launch_bounds__(128, MINB) void fwd_ker(const __grid_constant__ fwd_globals<D> g) {
 #if REP_TK_HOPPER
   constexpr float SL2 = kLog2e * (D == 64 ? 0.125f : 0.08838834764f);
@@ -413,8 +451,15 @@ __global__ __launch_bounds__(128, MINB) void fwd_ker(const __grid_constant__ fwd
     tma::load_async(q_smem, g.q, c, q_bar);
   }
   __syncthreads();  // barriers initialized before warp 0's other lanes use them
+  const uint32_t k_s = static_cast<uint32_t>(__cvta_generic_to_shared(&k_smem.data[0]));
+  const uint32_t v_s = static_cast<uint32_t>(__cvta_generic_to_shared(&v_smem.data[0]));
   int slots[2] = {g.NB, g.NB};
-  if (warp == 0) {
+  if (B_CPASYNC && cur.x == kTierB) {  // every thread: K group, then V group
+    int sl4[4];
+    slot_blocks_cta(s.b_idx, s.nb_list, cur.y, g.NB, g.RM, sl4);
+    issue_tier_b_cta<D>(k_s, ksw, sl4, g.NB, g.RM);
+    issue_tier_b_cta<D>(v_s, vsw, sl4, g.NB, g.RM);
+  } else if (warp == 0) {
     if (cur.x == kTierB) slot_blocks(s.b_idx, s.nb_list, cur.y, g.NB, g.RM, slots);
     issue_tile<D>(cur, k_smem, g.k, g.kt, ksw, slots, b, h, g.NB, g.RM, k_bar, g.diag & 2, g.diag & 4);
     issue_tile<D>(cur, v_smem, g.v, g.vt, vsw, slots, b, h, g.NB, g.RM, v_bar, g.diag & 2, g.diag & 4);
@@ -437,14 +482,34 @@ __global__ __launch_bounds__(128, MINB) void fwd_ker(const __grid_constant__ fwd
   // soon as their buffers free up (VSA2's TK order). BC = false is a tier-A tile: no bias state, the
   // mask formed from its token count only when the block is partial (like VSA2's right_fill). BC = true
   // is a tier-B/C tile with its biases `cb` computed one tile earlier.
+  //
+  // B_CPASYNC: a tier-B tile completes no k_bar/v_bar phase, so `it` counts only the tiles those barriers
+  // deliver (A and C; every tile otherwise) and their parity stays in step across A -> B -> C. Its K and
+  // V arrive as two cp.async groups, K committed first (prologue, or the K issue of the step before); at
+  // the K wait V may still be pending (wait_group 1), at the V wait the next tile's K may be (wait_group 1
+  // if it is tier B, else 0). Each thread then fences its generic-proxy writes for the wgmma async proxy
+  // and the CTA barrier (one warpgroup) orders all 128 threads' copies before any warp's wgmma.
   int it = 0;
-  auto step = [&]<bool BC>(int2 tile, int2 nxt, int kcA, const TileBias& cb, const int (&nsl)[2]) {
+  const int no_slots[2] = {g.NB, g.NB};  // B_CPASYNC: issue_tile only loads A/C tiles, which ignore slots
+  auto step = [&]<bool BC>(int2 tile, int2 nxt, int kcA, const TileBias& cb, const auto& nsl) {
     const bool masked = BC && cb.masked && !(tile.x == kTierB && (g.diag & 1));
-    wait(k_bar, it & 1);
+    const bool cp_cur = B_CPASYNC && tile.x == kTierB, cp_nxt = B_CPASYNC && nxt.x == kTierB;
+    if (cp_cur) {
+      cp_async_wait<1>();
+      fence_async_smem();
+      __syncthreads();
+    } else {
+      wait(k_bar, it & 1);
+    }
     warpgroup::mm_ABt(att, q_smem, k_smem);
     warpgroup::mma_async_wait();
-    if (nxt.x != kTierNone && warp == 0)
+    if constexpr (B_CPASYNC) {
+      if (cp_nxt) issue_tier_b_cta<D>(k_s, ksw, nsl, g.NB, g.RM);
+      else if (nxt.x != kTierNone && warp == 0)
+        issue_tile<D>(nxt, k_smem, g.k, g.kt, ksw, no_slots, b, h, g.NB, g.RM, k_bar);
+    } else if (nxt.x != kTierNone && warp == 0) {
       issue_tile<D>(nxt, k_smem, g.k, g.kt, ksw, nsl, b, h, g.NB, g.RM, k_bar, g.diag & 2, g.diag & 4);
+    }
 
     if constexpr (!HAND_SM) {
       // log2 domain, then each column's + log2(c) bias (or -inf mask) before the row max
@@ -517,19 +582,39 @@ __global__ __launch_bounds__(128, MINB) void fwd_ker(const __grid_constant__ fwd
     }
     copy(att_mma, att);
 
-    wait(v_bar, it & 1);
+    if (cp_cur) {
+      if (cp_nxt) cp_async_wait<1>();
+      else cp_async_wait<0>();
+      fence_async_smem();
+      __syncthreads();
+    } else {
+      wait(v_bar, it & 1);
+    }
     warpgroup::mma_AB(o_reg, att_mma, v_smem);
     warpgroup::mma_async_wait();
-    if (nxt.x != kTierNone && warp == 0)
+    if constexpr (B_CPASYNC) {
+      if (cp_nxt) issue_tier_b_cta<D>(v_s, vsw, nsl, g.NB, g.RM);
+      else if (nxt.x != kTierNone && warp == 0)
+        issue_tile<D>(nxt, v_smem, g.v, g.vt, vsw, no_slots, b, h, g.NB, g.RM, v_bar);
+    } else if (nxt.x != kTierNone && warp == 0) {
       issue_tile<D>(nxt, v_smem, g.v, g.vt, vsw, nsl, b, h, g.NB, g.RM, v_bar, g.diag & 2, g.diag & 4);
-    ++it;
+    }
+    if (!cp_cur) ++it;
+  };
+  // the next tile's slot blocks, one tile ahead: warp 0's two per lane, or (B_CPASYNC) four per thread
+  auto next_slots = [&](int2 nxt, auto& nsl) {
+    if constexpr (B_CPASYNC) {
+      if (nxt.x == kTierB) slot_blocks_cta(s.b_idx, s.nb_list, nxt.y, g.NB, g.RM, nsl);
+    } else if (warp == 0 && nxt.x == kTierB) {
+      slot_blocks(s.b_idx, s.nb_list, nxt.y, g.NB, g.RM, nsl);
+    }
   };
 
   // Tier A: no bias registers live at all, as in VSA2's own kernel.
   while (cur.x == kTierA) {
     const int2 nxt = s.next();
-    int nsl[2] = {g.NB, g.NB};
-    if (warp == 0 && nxt.x == kTierB) slot_blocks(s.b_idx, s.nb_list, nxt.y, g.NB, g.RM, nsl);
+    int nsl[B_CPASYNC ? 4 : 2] = {g.NB, g.NB};
+    next_slots(nxt, nsl);
     step.template operator()<false>(cur, nxt, g.blk_cnt[cur.y], cb, nsl);
     cur = nxt;
   }
@@ -540,8 +625,8 @@ __global__ __launch_bounds__(128, MINB) void fwd_ker(const __grid_constant__ fwd
   while (cur.x != kTierNone) {
     const int2 nxt = s.next();
     const TileBias nb_ = tile_bias(nxt, s, g.blk_cnt, lcb, lc_tail, g.RM);
-    int nsl[2] = {g.NB, g.NB};
-    if (warp == 0 && nxt.x == kTierB) slot_blocks(s.b_idx, s.nb_list, nxt.y, g.NB, g.RM, nsl);
+    int nsl[B_CPASYNC ? 4 : 2] = {g.NB, g.NB};
+    next_slots(nxt, nsl);
     step.template operator()<true>(cur, nxt, kB, cb, nsl);
     cur = nxt;
     cb = nb_;
@@ -1245,7 +1330,7 @@ static void fwd_impl(torch::Tensor q, torch::Tensor k, torch::Tensor v, const st
       b_idx.data_ptr<int>(), reinterpret_cast<const uint32_t*>(bits_ab.data_ptr<int>()), blk_cnt.data_ptr<int>(),
       (int)H, (int)L, NB, NBt, RM, words_of(NB), phases, diag};
   constexpr int mem = 3 * 64 * D * 2 + 1024;  // q, k, v tiles + alignment slack
-  static int cfg = -1;  // 0: MINB 4, else MINB 3 (default, measured best); 2-9 diagnostics
+  static int cfg = -1;  // 0: MINB 4, else MINB 3 (default, measured best); 2-10 diagnostics
   if (cfg < 0) {
     const char* e = std::getenv("REP_TK_FWD_CFG");
     cfg = e ? std::atoi(e) : 1;
@@ -1268,6 +1353,9 @@ static void fwd_impl(torch::Tensor q, torch::Tensor k, torch::Tensor v, const st
   // cfg 8 / 9: cfg 1 / cfg 6 at MINB 2 (register-cap control; same grid, block, shared memory, tile work)
   else if (cfg == 8) launch(rep_tk::fwd_ker<D, 2>);
   else if (cfg == 9) launch(rep_tk::fwd_ker<D, 2, false, true>);
+  // cfg 10: cfg 1 with tier-B tiles loaded by CTA-wide cp.async (issue_tier_b_cta) instead of bulk copies;
+  // diag bits 2 and 4 (bulk-copy variants) do not apply to it
+  else if (cfg == 10) launch(rep_tk::fwd_ker<D, 3, false, false, true>);
   else launch(rep_tk::fwd_ker<D, 3>);
   check_launch("fwd");
 }
