@@ -288,8 +288,9 @@ __global__ void build_kernel_pooled(const bf16* __restrict__ kr, const bf16* __r
     return;
   }
   const int cnt = blk_cnt[blk];
-  const bf16* gk = kr + ((size_t)bh * Lr + (size_t)blk * GS) * D + d;
-  const bf16* gv = vr + ((size_t)bh * Lr + (size_t)blk * GS) * D + d;
+  // The pool writes G = 64/R groups per block, and G == RM when 64/mid_reps == R, so a block owns RM rows.
+  const bf16* gk = kr + ((size_t)bh * Lr + (size_t)blk * RM) * D + d;
+  const bf16* gv = vr + ((size_t)bh * Lr + (size_t)blk * RM) * D + d;
   for (int g = 0; g < RM; ++g) {
     const int n = min(max(cnt - g * GS, 0), GS);
     const float mk = n > 0 ? __bfloat162float(gk[(size_t)g * D]) : 0.f;
@@ -2285,7 +2286,7 @@ std::vector<torch::Tensor> rep_tk_build_pooled(torch::Tensor kr, torch::Tensor v
   const int B = kr.size(0), H = kr.size(1), Lr = kr.size(2), D = kr.size(3);
   const int NBc = kc.size(2), NB = blk_cnt.numel();
   TORCH_CHECK(D == 64 || D == 128, "rep_tk: D must be 64 or 128");
-  TORCH_CHECK((int64_t)Lr == (int64_t)NB * (64 / RM), "kr rows must be NB * (64 / mid_reps)");
+  TORCH_CHECK((int64_t)Lr == (int64_t)NB * RM, "kr rows must be NB * mid_reps (one per pooled group)");
   TORCH_CHECK(NBc >= NB && NBc % 64 == 0, "kc rows must be a 64-aligned count covering NB");
   const int NBt = (NB + 63) / 64 * 64, NP = rep_tk::num_phases((int)RM);
   auto opt = kr.options();
