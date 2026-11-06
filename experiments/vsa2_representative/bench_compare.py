@@ -94,7 +94,6 @@ OWN_FORWARD = ("20", "24", "32", "33")  # meaningless if they launch the default
 RUNTIME_ARMS = {"34", "35"}  # deliberately the default kernel; a host-set diag flag selects the behaviour
 DISTINCT_FROM = {"24": ("11",), "32": ("11", "24"), "33": ("11", "24", "32"), "35": ("34",)}  # nor if they repeat an arm
 TWO_CTA = ("32", "33")  # their tiles leave no room for a third CTA; see launch_bound
-DEFAULT_PATH = ("34", "35")  # fwd_ker at bound 3: the premise is no more than 168 registers
 BYTE_EQUAL_PREMISE = ("35",)  # skipping a rescale by exactly 1.0f must not change a byte
 FORWARD_EQUAL = {*ALIASES, *BACKWARD_ARMS}  # one forward kernel by definition; see forward_must_match
 BACKWARD_READ_ROWS = ("kernel.tk.bwd.A", "kernel.tk.bwd.C", "fine_op.tk.A|B|C.b_direct", "full_op.tk.routed.b_direct",
@@ -166,8 +165,6 @@ def cfg_error(value, source):
     if value in TWO_CTA and launch_bound(table.get(value), source) != "2":
         return f"REP_TK_FWD_CFG={value} is a two-CTA arm; {table.get(value)} has launch bound " \
                f"{launch_bound(table.get(value), source)}"
-    if value in DEFAULT_PATH and (fwd_kernel_name(value, source) != "fwd_ker" or launch_bound(table.get(value), source) != "3"):
-        return f"REP_TK_FWD_CFG={value} must stay on fwd_ker at launch bound 3 (168-register cap); it launches {table.get(value)}"
     return None
 
 

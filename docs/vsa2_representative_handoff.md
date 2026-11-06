@@ -384,8 +384,9 @@ from a build containing CFG 20.
 CFG 2/3 use their `A_ONLY` kernel only for `phases=A`; other phases run the default kernel. CFG 0/6/8/9/20 keep the
 bulk gather, so CFG 6 is a softmax-only pair with CFG 20, not with CFG 1. `settings.fwd_kernels_in_source` records
 the launched template. CFG 24, 32 and 33 must launch something other than the default or an earlier arm's kernel.
-CFG 32 and 33 are also refused if the launched kernel's `__launch_bounds__` does not say 2. CFG 34 and 35 are refused
-until the kernel source dispatches on them, and unless they launch `fwd_ker` at a bound of 3. CFG 21/22/23 are measured negative or neutral arms; see H100 status.
+CFG 32 and 33 are also refused if the launched kernel's `__launch_bounds__` does not say 2. CFG 34 and 35 launch the default
+kernel on purpose, with a host-set `diag` flag; they are refused without that flag assignment or if they launch anything
+else. CFG 21/22/23 are measured negative or neutral arms; see H100 status.
 
 Occupancy of the forward arms, D=128. Fill the `not built yet` cells from the build's `ptxas` output:
 
@@ -419,8 +420,7 @@ These KB are 1,024 B. The kernel's own limit counts 1 KB reserved per CTA: `CTAs
 kernels' layout would exceed the limit by 112 B. CFG 32 allocates 82,984 B. `fwd_impl` refuses to launch either arm
 unless the occupancy query reports 2 resident CTAs/SM.
 
-CFG 34 and 35 are premised on staying within 168 registers. The guard reads the launch bound from source, and a bound
-of 3 makes the compiler respect that cap, so too much pressure shows up as spills with the count still at or below
+CFG 34 and 35 are premised on staying within 168 registers. Both launch the default kernel at a bound of 3, which makes the compiler respect that cap, so too much pressure shows up as spills with the count still at or below
 168: CFG 20 is the example. Record both figures in the occupancy table from the build's `ptxas` output. If either arm
 reports more than 168 registers, or any spills that CFG 1 does not have, its premise failed: record that here and do
 not read its timing as a pure instruction-stream change.
@@ -605,26 +605,48 @@ Depth is not the missing lever, so do not re-run this sweep. `A|B|C` kernel time
 
 The two-CTA figures imply a CFG 1 of about 0.80 ms in their own run, so read the ratios above for that comparison.
 
-Next matrix, 16K/H16/D128/RM4, on one build containing CFG 34 and 35:
+Round 9: CFG 34 and 35 were both neutral. CFG 34 was 0.995 on the forward kernel and 1.000 on F+B, and CFG 35 0.996 and
+0.999, against an A/A floor of 0.983-1.011.
 
-| # | Purpose | Run |
-|---:|---|---|
-| 1 | correctness | CPU and generic suites; TK suite with CFG 1, CFG 34 and CFG 35 |
-| 2 | noise floor; also whether forward digests are deterministic | CFG 1 vs CFG 1 |
-| 3 | fold the multiply and bias add | CFG 1 vs CFG 34 |
-| 4 | skip the O rescale | CFG 1 vs CFG 35 |
+Next: split the backward with `bench_bwd_stages.py`, below. The reported figures are 2.98 ms of backward beside 4.08 ms
+F+B, with the three tier kernels at 2.36 ms (A 1.55, B 0.50, C 0.31), leaving about 0.62 ms. Those kernel figures are
+back-to-back loops and 2.98 ms has synchronize gaps around it, so some of that 0.62 ms may be measurement mode.
 
 ```bash
-REP_TK_FWD_CFG=34 <gpu-runner> python tests/test_gpu_tk.py
-REP_TK_FWD_CFG=35 <gpu-runner> python tests/test_gpu_tk.py
-<gpu-runner> python bench_compare.py --candidate REP_TK_FWD_CFG=1 --out results/raw/aa-16k.json
-<gpu-runner> python bench_compare.py --candidate REP_TK_FWD_CFG=34 --out results/raw/cfg1-cfg34-16k.json
-<gpu-runner> python bench_compare.py --candidate REP_TK_FWD_CFG=35 --out results/raw/cfg1-cfg35-16k.json
+REP_TK_FWD_CFG=1 <gpu-runner> python bench_bwd_stages.py --out results/raw/bwd-stages-cfg1.json
 ```
 
-Read `kernel.tk.fwd.A|B|C` and its partial rows, then the fine and routed forward rows. Tier-A tiles have no bias add, so
-CFG 34 can only act on `kernel.tk.fwd.B` and `C`. Check the `ptxas` figures first. The result that matters is measured
-fine-op and full-op F+B against the A/A displacement.
+### Backward stages
+
+`bench_bwd_stages.py` splits one real `backward()` on one configuration, for `fine` (`rep_fine_attention`) and `full`
+(routed `rep_attention`). Every row is `measurement_only`: these times are not a performance claim and must not be added
+to the kernel rows. For that call only, the module's handle on the extension is a proxy that records a CUDA event before
+and after each native call, with no synchronize inside the timed region. No kernel, argument or call order changes.
+
+| Row | In the sum | Contents |
+|---|---:|---|
+| `call.row_dot` | yes | delta, `fine` only; `fuse_bwd` produces it in `full` |
+| `call.tk_native_bwd`, `call.rep_tk_bwd_b`, `call.rep_tk_bwd_c` | yes | the tier kernels in place |
+| `call.finalize`, `call.rep_unpool` | yes | dQ finalize, and the unpool with its allocations |
+| `call.fuse_bwd`, `call.attn_bwd` | yes | `full` only: fusion, and the coarse backward |
+| `gap.*` | yes | Python between two native calls; each row's `note` says what runs there |
+| `total`, `total.repeat` | no | `backward()` with only two events, first and last; `bench_compare.py`'s `b_direct` boundaries |
+| `isolated.*` | no | the tier kernels back to back with fixed intermediates |
+| `context.*` | no | `f` and `f_plus_b` loops, for the F+B - F estimate |
+| `event_pair` | no | two consecutive events on an idle stream |
+
+Three things cannot be separated without changing how the backward is called, so these are the closest honest groupings:
+
+- Table zeroing is the zeroing gaps: `torch.zeros` cannot be split from its allocator, or one call from the next in a gap.
+  `table_zeroing_and_allocator_ms` adds those gaps.
+- Launch overhead and allocation inside a native call stay in its `call.*` row.
+- Host work appears only when the stream has drained while it runs, so host cost behind a long kernel reads as zero.
+
+Each row has per-batch medians and a spread. `attribution` is derived and marked `measured=false`, per scope. It gives the
+residual of `total` against the steps, a floor from the spread of the `total` batches, the time outside the tier kernels,
+and the F+B - F estimate. A residual outside the floor is reported, since the events themselves can perturb the call:
+compare `event_pair`. If `b_estimate_ms` is well below `total`, part of the gap comes from the idle time around a direct
+backward, and will not be found in any step.
 
 ### Full-operator forward stages
 

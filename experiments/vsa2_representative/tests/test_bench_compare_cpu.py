@@ -8,6 +8,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from bench_bwd_stages import ZEROING_GAPS, attribute as attribute_backward, batches, intervals
 from bench_stages import attribute, compare_stages
 from bench_compare import (BACKWARD_READ_ROWS, launch_bound, FWD_CFGS, PROFILES, abba, active_fwd_cfg, arms_error, assemble,
                            backward_row_is_control, cfg_error, claims, forward_must_match, fwd_dispatch, fwd_kernel_name,
@@ -153,6 +154,17 @@ def test_softmax_reductions_stay_on_the_default_path():
     assert cfg_error("34", kernel(BULK, "(cfg == 34) launch(rep_tk::fwd_kdb_ker<D, 9>);") + bound), \
         "a separate kernel is not the default path"
     assert cfg_error("34", kernel(BULK, "(cfg == 34) ;") + bound), "a branch with no flag assignment is no evidence"
+    pair = lambda cfg: {"baseline": {"REP_TK_FWD_CFG": "1"}, "candidate": {"REP_TK_FWD_CFG": cfg}}
+    a, b = child("baseline", 1), child("candidate", 1)
+    a["forward_output"], b["forward_output"] = {"B": dict(o="x")}, {"B": dict(o="y")}
+    res = assemble({}, "representative", pair("35"), [], [a, b])
+    assert res["status"] == "ok" and res["claims"]["may_claim_op_level_change"] is False, "alpha premise falsified"
+    assert assemble({}, "representative", pair("34"), [], [a, b])["claims"]["may_claim_op_level_change"] is True
+    b["forward_output"] = {"B": dict(o="x")}
+    res = assemble({}, "representative", pair("35"), [], [a, b])
+    assert res["claims"]["may_claim_op_level_change"] is True
+    assert any("does not show alpha is exactly" in x for x in res["claims"]["limits"])
+
 
 def test_backward_arm_is_single_variable():
     cfg = lambda v, **kw: dict(REP_TK_FWD_CFG=v, **kw)
@@ -198,6 +210,27 @@ def test_forward_change_under_backward_arm_is_invalid():
     assert assemble({}, "representative", {**configs, "candidate": {"REP_TK_FWD_CFG": "13"}}, [], [a, b])["status"] == "ok"
     other = {"baseline": {"REP_TK_FWD_CFG": "1"}, "candidate": {"REP_TK_FWD_CFG": "11"}}
     assert assemble({}, "representative", other, [], [a, b])["status"] == "ok", "CFG11 may change bytes; only reported"
+
+
+def test_backward_steps_are_named_and_counted_once():
+    labels = ["start", "begin:row_dot", "end:row_dot", "begin:tk_native_bwd", "end:tk_native_bwd", "begin:rep_tk_bwd_b",
+              "end:rep_tk_bwd_b", "begin:rep_tk_bwd_c", "end:rep_tk_bwd_c", "end"]
+    names = intervals(labels)
+    assert names[:3] == ["gap.start->row_dot", "call.row_dot", "gap.row_dot->tk_native_bwd"]
+    assert names[-1] == "gap.rep_tk_bwd_c->end" and len(names) == len(labels) - 1
+    assert intervals(["begin:x", "end:x", "begin:x", "end:x"]) == ["call.x", "gap.x->x", "call.x#2"]
+    assert "gap.row_dot->tk_native_bwd" in ZEROING_GAPS
+    assert batches([1.0, 2.0, 3.0, 9.0, 9.0, 9.0], 3) == [2.0, 9.0]
+    row = lambda n, ms: dict(id=f"fine.{n}", ms=[ms] * 3, batch_medians_ms=[ms])
+    rows = [dict(id="fine.total", ms=[3.0] * 3, batch_medians_ms=[3.0, 3.1]), row("call.row_dot", 0.1),
+            row("gap.row_dot->tk_native_bwd", 0.2), row("call.tk_native_bwd", 1.5), row("call.rep_tk_bwd_b", 0.5),
+            row("call.rep_tk_bwd_c", 0.3), dict(id="fine.total.repeat", ms=[3.0] * 3, batch_medians_ms=[3.0, 2.9]),
+            dict(id="full.total", ms=[99.0], batch_medians_ms=[99.0]), dict(id="context.fine.f", ms=[9.0], batch_medians_ms=[9.0])]
+    t = attribute_backward(rows, "fine")
+    assert t["measured"] is False and "measurement_only" in t["note"]
+    assert abs(t["sum_of_steps_ms"] - 2.6) < 1e-9 and abs(t["residual_ms"] - 0.4) < 1e-9, "total or context was summed"
+    assert t["sum_within_floor"] is False, "a residual above the floor must show"
+    assert abs(t["outside_tier_kernels_ms"] - 0.7) < 1e-9 and abs(t["table_zeroing_and_allocator_ms"] - 0.2) < 1e-9
 
 
 def test_stage_runs_compare_only_within_one_build():
@@ -294,6 +327,7 @@ if __name__ == "__main__":
     test_backward_arm_reaches_only_its_tier()
     test_forward_change_under_backward_arm_is_invalid()
     test_stage_runs_compare_only_within_one_build()
+    test_backward_steps_are_named_and_counted_once()
     test_abba_is_balanced()
     test_estimate_is_labelled_and_stages_are_not_summed()
     test_row_is_a_control_only_if_it_is_in_every_arm()
