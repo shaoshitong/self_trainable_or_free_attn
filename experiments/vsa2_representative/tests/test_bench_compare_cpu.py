@@ -8,7 +8,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bench_compare import abba, assemble, claims, parse_config, summarize
+from bench_compare import FWD_CFGS, PROFILES, abba, active_fwd_cfg, assemble, claims, implemented, parse_config, summarize
 
 
 def child(arm, scale, check=True):
@@ -21,9 +21,9 @@ def child(arm, scale, check=True):
                       dict(id="k.b", ms=[0.5] * 3, meta=dict(meta, scope="kernel", stage="bwd_stage", complete_call=False))])
 
 
-def rejected(text, profile, new=()):
+def rejected(text, profile):
     try:
-        parse_config(text, profile, new)
+        parse_config(text, profile)
     except ValueError:
         return True
     return False
@@ -32,13 +32,33 @@ def rejected(text, profile, new=()):
 def test_configs_keep_their_semantics():
     assert parse_config("REP_TK_FWD_CFG=1,REP_TK_BWDC_SPLITS=8", "representative") == \
         {"REP_TK_FWD_CFG": "1", "REP_TK_BWDC_SPLITS": "8"}
-    for cfg in "2345":
+    for cfg in "23457":
         assert rejected(f"REP_TK_FWD_CFG={cfg}", "representative"), "a diagnostic passed as production"
-    assert rejected("REP_TK_FWD_CFG=1", "controlled-softmax")
-    assert rejected("REP_TK_FWD_CFG=6", "representative"), "the kernel would silently run its default path"
-    assert parse_config("REP_TK_FWD_CFG=6", "representative", ["6"])["REP_TK_FWD_CFG"] == "6"
+    for cfg in "0126":
+        assert rejected(f"REP_TK_FWD_CFG={cfg}", "controlled-softmax"), "only CFG 4/5/7 are this diagnostic"
+    for cfg in "457":
+        assert parse_config(f"REP_TK_FWD_CFG={cfg}", "controlled-softmax")
+    assert rejected("REP_TK_FWD_CFG=8", "representative"), "the kernel would silently run its default path"
+    assert PROFILES["representative"]["baseline"].endswith("=6") and PROFILES["representative"]["candidate"].endswith("=1")
     assert rejected("", "representative") and rejected("OTHER=1,REP_TK_FWD_CFG=1", "representative")
     assert rejected("REP_TK_FWD_CFG=1,REP_TK_BWDC_SPLITS=0", "representative")
+
+
+def test_standalone_scripts_see_what_runs():
+    new = "if (cfg == 4) a; else if (cfg == 5) b; else if (cfg == 7) c; else if (cfg == 0) d; " \
+          "else if (cfg == 2 && phases == 1) e; else if (cfg == 3 && phases == 1) f; else if (cfg == 6) g;"
+    assert all(implemented(v, new) for v in FWD_CFGS)
+    old = "if (cfg == 4) a; else if (cfg == 5) b; else if (cfg == 0) d;"
+    assert active_fwd_cfg({}, old)[:2] == ("1", "operator")
+    assert active_fwd_cfg({"REP_TK_FWD_CFG": "6"}, new)[1] == "operator"
+    assert active_fwd_cfg({"REP_TK_FWD_CFG": "7"}, new)[1] == "timing_only", "CFG7 must never print operator rows"
+    for value, source in (("6", old), ("7", old), ("9", new)):  # would silently run the default kernel
+        assert not (value in FWD_CFGS and implemented(value, source))
+        try:
+            active_fwd_cfg({"REP_TK_FWD_CFG": value}, source)
+        except SystemExit:
+            continue
+        raise AssertionError(f"CFG{value} accepted")
 
 
 def test_abba_is_balanced():
@@ -72,11 +92,14 @@ def test_claims():
     assert claims("representative", [good[0], child("candidate", 1, check=False)])["output_validated"] is False
     # timing-only, even if an output check were present and passing
     c = claims("controlled-softmax", good)
-    assert c["output_validated"] is False and c["may_claim_op_level_change"] is False and c["limits"]
+    assert c["output_validated"] is False and c["may_claim_op_level_change"] is False
+    text = " ".join(c["limits"])
+    assert "0.108" in text and "rerun" in text and "H200" in text
 
 
 if __name__ == "__main__":
     test_configs_keep_their_semantics()
+    test_standalone_scripts_see_what_runs()
     test_abba_is_balanced()
     test_estimate_is_labelled_and_stages_are_not_summed()
     test_differing_arms_are_invalid()

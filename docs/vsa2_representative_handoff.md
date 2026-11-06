@@ -352,19 +352,27 @@ CUDA_VISIBLE_DEVICES=0 /opt/venv/bin/python fwd_cfg.py
 CUDA_VISIBLE_DEVICES=0 /opt/venv/bin/python bwdc_split.py
 ```
 
-Optional diagnostic controls:
+Forward configurations:
 
 ```text
-REP_TK_FWD_CFG=1                 tuned forward path
-REP_TK_FWD_CFG=4                 diagnostic native-loop/native-softmax copy
-REP_TK_FWD_CFG=5                 diagnostic native-loop/custom-softmax copy
+REP_TK_FWD_CFG=1                 production kernel, TK-vector softmax (candidate; the kernel's default)
+REP_TK_FWD_CFG=6                 same template, grid, SMEM and tier stream, previous hand-written softmax (control)
+REP_TK_FWD_CFG=0                 production kernel at MINB 4
+REP_TK_FWD_CFG=2, 3              tier-A-only specialisation at MINB 4, 3; other phases run the default kernel
+REP_TK_FWD_CFG=4                 diagnostic copied native loop, native softmax
+REP_TK_FWD_CFG=5                 diagnostic copied native loop, previous hand-written softmax
+REP_TK_FWD_CFG=7                 diagnostic copied native loop, TK-vector softmax
 REP_TK_BWDC_SPLITS=<positive>    force tier-C query split count
 ```
 
-The diagnostic modes are measurement code, not production configurations. `REP_TK_FWD_CFG` is cached on
-first use, so one process measures one value. An unknown value silently runs the default path. CFG 4/5
-ignore `phases` and run tier A only, so the `A|B|C` values recorded for them in
-`results/tk-later-iterations.txt` are tier-A timings; `fwd_cfg.py` no longer prints those rows.
+`REP_TK_FWD_CFG` is cached on first use, so one process measures one value. A value the kernel does not
+dispatch on silently runs the default kernel, so `bench_compare.py`, `bench_tk.py` and `fwd_cfg.py` refuse a
+value missing from the kernel source on disk, for example CFG 6 or 7 on a build from before they existed.
+
+CFG 4/5/7 are measurement code. They ignore `phases` and run tier A only, write no `lse` and do not mask
+padded output, so they are timing diagnostics and never a numerical reference. `fwd_cfg.py` prints only
+their tier-A row, and `bench_tk.py` refuses them. For the same reason, the `A|B|C` values recorded for the
+older CFG 4/5 in `results/tk-later-iterations.txt` are tier-A timings.
 
 ### Same-build comparison
 
@@ -372,19 +380,24 @@ ignore `phases` and run tier A only, so the `A|B|C` values recorded for them in
 with `q`, `k`, `v`, `dO`, gate and selection from one seed, and writes one JSON result. Each arm records
 hardware, source and extension hashes, shape, configuration, per-batch timings and `nvidia-smi` state. It
 marks the result invalid if the arms differ in any of the hashes, inputs, selection, shape or settings.
+Results record no node name, address or raw device id. Arms are matched on a hash of the GPU id.
+
+`<gpu-runner>` below stands for however the coordinator launches a command on one GPU with the provisioned
+Python. The harness requires exactly one visible GPU.
 
 ```bash
-# controlled softmax pair: tier A, warmup 10, iters 50, TIMING ONLY
-CUDA_VISIBLE_DEVICES=0 /opt/venv/bin/python bench_compare.py \
-  --profile controlled-softmax --out results/raw/controlled-16k.json
+# main comparison, representative semantics: CFG6 baseline vs CFG1 candidate, warmup 10, iters 30
+<gpu-runner> python bench_compare.py --out results/raw/cfg6-cfg1-16k.json
 
-# representative semantics: warmup 10, iters 30. Equal arms give the A/A noise floor.
-CUDA_VISIBLE_DEVICES=0 /opt/venv/bin/python bench_compare.py \
+# equal arms give the A/A noise floor
+<gpu-runner> python bench_compare.py \
   --baseline REP_TK_FWD_CFG=1 --candidate REP_TK_FWD_CFG=1 --out results/raw/aa-16k.json
 
-# a candidate kernel added to the same build under a new value
-CUDA_VISIBLE_DEVICES=0 /opt/venv/bin/python bench_compare.py \
-  --new-cfg 6 --baseline REP_TK_FWD_CFG=1 --candidate REP_TK_FWD_CFG=6 --out results/raw/cand-16k.json
+# diagnostic triple as two pairs against CFG4: tier A, warmup 10, iters 50, TIMING ONLY
+<gpu-runner> python bench_compare.py --profile controlled-softmax \
+  --baseline REP_TK_FWD_CFG=4 --candidate REP_TK_FWD_CFG=5 --out results/raw/cfg4-cfg5-16k.json
+<gpu-runner> python bench_compare.py --profile controlled-softmax \
+  --baseline REP_TK_FWD_CFG=4 --candidate REP_TK_FWD_CFG=7 --out results/raw/cfg4-cfg7-16k.json
 ```
 
 Export `VSA2_REP_SOURCE` and `VSA2_REP_TK_ROOT` as for the build, so the VSA2 source hashes and the
@@ -400,41 +413,49 @@ ThunderKittens commit are recorded.
 | `stage=b_direct` | measured backward: fresh graph per sample, forward finished before the interval, grads reset after it |
 | `stage=b_estimate` | `median(f_plus_b) - median(f)`, `measured=false`, an estimate |
 | `work=tier_a_only` | 10% of the pairs; not equivalent to the 64/4/1 operator |
-| `control=true` | independent of the configuration; a ratio away from 1 is run drift |
+| `control=true` | does not read the compared setting; a ratio away from 1 is run drift |
+
+Backward kernels and table builds do not read `REP_TK_FWD_CFG`, so their kernel rows are controls in a
+forward comparison. A CFG6 vs CFG1 difference at op scope should come from the forward.
 
 `b_direct` cannot reuse one graph: backward releases the representative tables, so `retain_graph=True`
 would not make a second backward valid. Its synchronizes add idle gaps the `f_plus_b` loop does not have,
 so it need not equal the estimate. The older `bench_tk.py` forward rows use leaves without grad tracking;
-compare its numbers with its own runs only.
+compare its numbers with its own runs only. `bench_tk.py` has no directly timed backward.
 
 `claims.may_claim_op_level_change` is true only for the representative profile, after the arm's forward,
 lse and dQ/dK/dV agree with the generic backend at the run's shape, with the test suite's tolerances. The
-CPU, generic and TK suites are still required on that build. The controlled profile can never set it:
+CPU, generic and TK suites are still required on that build. The controlled profile can never set it.
+Diagnostics that skip bias loads or change the load path (`diag != 0`, used only by `fwd_cfg.py`) locate
+cost. They cannot establish numerical or end-to-end acceleration.
 
-- CFG 4/5 output is not validated. Both leave the returned `lse` unwritten, and both leave `o` and `lse`
-  unwritten for query blocks with an empty tier-A list.
-- CFG 5 normalizes only the `.x` lanes of `o`, by the `l_r[0]` row sum, while CFG 4 runs a complete
-  `div_row`. The roughly 0.108 ms therefore compares two epilogues as well as two softmax loops.
-- Diagnostics that skip bias loads or change the load path (`diag != 0`, used only by `fwd_cfg.py`) locate
-  cost. They cannot establish numerical or end-to-end acceleration.
+No counters are collected, and event timing does not yield MFU or stall figures.
 
-No counters are collected: `ncu` returns `ERR_NVGPUCTRPERM`, and event timing does not yield MFU or stall
-figures.
+Helper checks, no GPU, build or `torch`:
 
-Smallest meaningful matrix, in order, all on `aster-debug-1105-worker-0` GPU 0 with one build:
+```bash
+python3 tests/test_bench_compare_cpu.py
+```
 
-| # | Purpose | Shape | Arms | Gate before the next step |
+Minimal H100 (sm_90) matrix, in order, at 16K/H16/D128/RM4 unless stated. No H100 results exist yet.
+
+| # | Purpose | Build | Run | Gate before the next step |
 |---:|---|---|---|---|
-| 1 | test the build | suite sizes | CPU, generic and TK suites | all pass, or each failure is explained |
-| 2 | noise floor | 16K/H16/D128/RM4 | CFG 1 vs CFG 1 | controls and A/A ratios near 1; sets the smallest resolvable difference |
-| 3 | reproduce the softmax gap | same | controlled-softmax, CFG 4 vs CFG 5 | timing only |
-| 4 | candidate | same | CFG 1 vs candidate, after the suites pass with the candidate compiled in | `output_validated` true; difference above the A/A floor |
-| 5 | later length, only after step 4 | 64K/H16/D128/RM4 | CFG 1 vs candidate, preceded by A/A | same gates |
+| 1 | baseline correctness | exact baseline kernel | CPU, generic and TK suites | all pass, or each failure is explained |
+| 2 | candidate correctness | candidate kernel | same suites | all pass, or each failure is explained |
+| 3 | noise floor | candidate | CFG 1 vs CFG 1 | controls and A/A ratios near 1; sets the smallest resolvable difference |
+| 4 | complete operator | candidate | CFG 6 vs CFG 1 | `output_validated` true; difference above the A/A floor |
+| 5 | locate the softmax cost | candidate | CFG 4 vs 5, CFG 4 vs 7 | timing only |
+| 6 | one longer length, only if step 4 is above the floor | candidate | 64K: CFG 1 vs CFG 1, then CFG 6 vs CFG 1 | same gates |
+
+The comparisons need the candidate build: the exact baseline kernel has no CFG 6 or 7.
 
 ## 8. Measured evidence
 
 All principal measurements are NVIDIA H200, B=1, D=128, BF16, full blocks, tiers 10/20/70, mid_reps=4.
 No call logs or synchronizes inside the timed loop.
+
+These H200 figures are historical. They must not be compared as if from the same run as any H100 result.
 
 ### Same-run first fair round, 16K/H16, warmup 10, iters 30
 
@@ -493,6 +514,10 @@ The remaining performance question was isolated with a controlled same-build tes
 
 The controlled pair attributes about 0.108 ms to the hand-written softmax under that test. It does not
 identify TMA setup or the harness as the cause.
+
+This figure is confounded and must be rerun. The CFG 5 of that run divided only the `.x` lanes of `o`, by
+one row's sum, while CFG 4 ran a complete `div_row`, so the pair also compared two epilogues. The current
+CFG 5 normalizes both rows and all elements, and CFG 7 adds the TK-vector softmax to the same copied loop.
 
 The intended follow-up was to replace the hand-written row max/sum/rescale loop with ThunderKittens
 vector operations. The local patch attempts that change, plus LSE staging through a TK column vector

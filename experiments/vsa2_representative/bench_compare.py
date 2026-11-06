@@ -7,10 +7,11 @@ whose extension, sources, inputs, selection, shape or timing settings differ.
 
 Profiles (see docs/vsa2_representative_handoff.md, section 7):
 
-  representative      production semantics: REP_TK_FWD_CFG 0/1, diag=0, warmup 10, iters 30. Kernel,
+  representative      production semantics, diag=0, warmup 10, iters 30. Default arms: CFG6 (the production
+                      kernel with the previous hand-written softmax) vs CFG1 (TK-vector softmax). Kernel,
                       fine-op and full-operator scope. Output cross-checked against the generic backend.
-  controlled-softmax  REP_TK_FWD_CFG 4/5, warmup 10, iters 50, kernel forward only. TIMING ONLY: these
-                      kernels run tier A whatever `phases` says and their output is not valid.
+  controlled-softmax  CFG 4/5/7, warmup 10, iters 50, kernel forward only. TIMING ONLY: these kernels run
+                      tier A whatever `phases` says, write no lse and do not mask padded output.
 
 What each number is:
 
@@ -26,17 +27,20 @@ What each number is:
 
 Rows with work="tier_a_only" compute 10% of the pairs and are not equivalent to the 64/4/1 operator.
 Control rows do not depend on the configuration; a control ratio away from 1 is run drift, not a result.
-No hardware counters are collected (ERR_NVGPUCTRPERM): this file reports no MFU or stall figures.
+No hardware counters are collected: this file reports no MFU or stall figures. Results record no node
+name, address or raw device id; arms are matched on a hash of the GPU id.
 
-  CUDA_VISIBLE_DEVICES=0 /opt/venv/bin/python bench_compare.py --profile controlled-softmax --out a.json
-  CUDA_VISIBLE_DEVICES=0 /opt/venv/bin/python bench_compare.py --profile representative \
-      --baseline REP_TK_FWD_CFG=1 --candidate REP_TK_FWD_CFG=1 --out aa.json
+  <gpu-runner> python bench_compare.py --out main.json                    # CFG6 vs CFG1
+  <gpu-runner> python bench_compare.py --baseline REP_TK_FWD_CFG=1 --candidate REP_TK_FWD_CFG=1 --out aa.json
+  <gpu-runner> python bench_compare.py --profile controlled-softmax --out cfg45.json \
+      --baseline REP_TK_FWD_CFG=4 --candidate REP_TK_FWD_CFG=5
 """
 import argparse
 import hashlib
 import json
 import os
 import platform
+import re
 import statistics
 import subprocess
 import sys
@@ -47,19 +51,32 @@ from pathlib import Path
 SCHEMA = "vsa2-rep-compare/1"
 HERE = Path(__file__).resolve().parent
 TUNABLES = ("REP_TK_FWD_CFG", "REP_TK_BWDC_SPLITS")
-HANDOFF_BASELINE_SHA256 = "6224637ff9a96404e170aa7de568a070c449ae83707564c37cbfae3cffdc784e"
+# What each REP_TK_FWD_CFG value runs. Only "operator" values compute the 64/4/1 operator.
+FWD_CFGS = {
+    "0": ("operator", "production kernel at MINB 4, TK-vector softmax"),
+    "1": ("operator", "production kernel, TK-vector softmax (candidate; the kernel's default)"),
+    "6": ("operator", "production template, grid, SMEM and tier stream, previous hand-written softmax (control)"),
+    "2": ("tier_a_path", "tier-A-only specialisation at MINB 4; other phases run the default kernel"),
+    "3": ("tier_a_path", "tier-A-only specialisation at MINB 3; other phases run the default kernel"),
+    "4": ("timing_only", "copied native loop, native softmax"),
+    "5": ("timing_only", "copied native loop, previous hand-written softmax"),
+    "7": ("timing_only", "copied native loop, TK-vector softmax"),
+}
 PROFILES = {
-    "representative": dict(warmup=10, iters=30, fwd_cfgs=("0", "1"), baseline="REP_TK_FWD_CFG=1", candidate=None),
-    "controlled-softmax": dict(warmup=10, iters=50, fwd_cfgs=("4", "5"), baseline="REP_TK_FWD_CFG=4",
+    "representative": dict(warmup=10, iters=30, kind="operator", baseline="REP_TK_FWD_CFG=6",
+                           candidate="REP_TK_FWD_CFG=1"),
+    "controlled-softmax": dict(warmup=10, iters=50, kind="timing_only", baseline="REP_TK_FWD_CFG=4",
                                candidate="REP_TK_FWD_CFG=5"),
 }
+HISTORICAL_LIMIT = "historical H200 measurements are from other hardware and must not be compared with this run"
 CONTROLLED_LIMITS = [
-    "timing only: CFG4/5 output has not been validated and the output check is not run",
-    "CFG4/5 ignore `phases` and run tier A only; this is not the 64/4/1 operator",
-    "CFG4/5 do not write the returned lse; query blocks with an empty tier-A list leave o and lse unwritten",
-    "CFG5 normalizes only part of o (the .x lanes, by the l_r[0] row sum), so its epilogue does less work "
-    "than CFG4's; the pair isolates the softmax only up to that difference",
+    "timing only: CFG4/5/7 are not a numerical reference and the output check is not run",
+    "CFG4/5/7 ignore `phases` and run tier A only; this is not the 64/4/1 operator",
+    "CFG4/5/7 write no lse and do not mask padded output; query blocks with an empty tier-A list leave o unwritten",
     "cannot establish numerical or end-to-end acceleration",
+    "the older roughly 0.108 ms CFG4/CFG5 figure came from a CFG5 that normalized only part of o; "
+    "it is confounded and superseded only by a rerun",
+    HISTORICAL_LIMIT,
 ]
 # Checked at the run's shape, with the tolerances of tests/test_gpu_tk.py (test_native_and_generic,
 # test_backward). A cross-check of this configuration, not a substitute for the three test suites.
@@ -67,22 +84,32 @@ TOL_O, TOL_LSE, TOL_GRAD = 1e-2, 1e-4, 2e-2
 
 
 # ------------------------------------------------------------ driver: no torch, never touches the GPU
-def parse_config(text, profile, new_cfgs=()):
-    """'K=V,K=V' -> dict, restricted to the tunables and to values the profile's semantics allow.
+def implemented(value, source):
+    """Does this rep_tk.cu dispatch on `value`? It silently runs its default kernel (CFG1) otherwise, so
+    a build without CFG 6 or 7 would report the default kernel under that label."""
+    return value == "1" or re.search(rf"\bcfg == {value}\b", source) is not None
 
-    The kernel silently runs its default path for an unknown REP_TK_FWD_CFG, so a candidate value has to
-    be declared with --new-cfg; otherwise a typo would be reported as a comparison of two equal kernels.
-    """
+
+def active_fwd_cfg(env=os.environ, source=None):
+    """(value, kind, meaning) of this process's REP_TK_FWD_CFG, for the standalone scripts."""
+    value = env.get("REP_TK_FWD_CFG", "1")
+    source = (HERE / "csrc/rep_tk/rep_tk.cu").read_text() if source is None else source
+    if value not in FWD_CFGS or not implemented(value, source):
+        raise SystemExit(f"REP_TK_FWD_CFG={value} is not implemented by this kernel source")
+    return (value,) + FWD_CFGS[value]
+
+
+def parse_config(text, profile):
+    """'K=V,K=V' -> dict, restricted to the tunables and to the values the profile's semantics allow."""
     cfg = {}
     for item in filter(None, (text or "").split(",")):
         key, sep, val = item.partition("=")
         if not sep or key not in TUNABLES:
             raise ValueError(f"bad setting {item!r}: expected KEY=VALUE with KEY in {TUNABLES}")
         cfg[key] = val
-    allowed = PROFILES[profile]["fwd_cfgs"] + (tuple(new_cfgs) if profile == "representative" else ())
+    allowed = [v for v, (kind, _) in FWD_CFGS.items() if kind == PROFILES[profile]["kind"]]
     if cfg.get("REP_TK_FWD_CFG") not in allowed:
-        raise ValueError(f"profile {profile} needs REP_TK_FWD_CFG in {allowed}, got {cfg.get('REP_TK_FWD_CFG')!r}"
-                         " (CFG 2-5 do not run the representative operator; a new value needs --new-cfg)")
+        raise ValueError(f"profile {profile} needs REP_TK_FWD_CFG in {allowed}, got {cfg.get('REP_TK_FWD_CFG')!r}")
     splits = cfg.get("REP_TK_BWDC_SPLITS")
     if splits is not None and not (splits.isdigit() and int(splits) > 0):
         raise ValueError(f"REP_TK_BWDC_SPLITS must be positive, got {splits!r}")
@@ -142,7 +169,8 @@ def claims(profile, children):
     ok = all(c.get("output_check") and all(x["ok"] for x in c["output_check"]) for c in children)
     return dict(output_validated=ok, may_claim_op_level_change=ok,
                 limits=["needs the CPU, generic and TK test suites on this build as well",
-                        "tier_a_only rows are not the 64/4/1 operator; their ratios are not efficiency claims"])
+                        "tier_a_only rows are not the 64/4/1 operator; their ratios are not efficiency claims",
+                HISTORICAL_LIMIT])
 
 
 def assemble(args_dict, profile, configs, order, children):
@@ -154,7 +182,7 @@ def assemble(args_dict, profile, configs, order, children):
                 settings=args_dict, configs=configs, run_order=order,
                 status="invalid: arms differ in " + ", ".join(bad) if bad else "ok",
                 identity_differences=bad, claims=claim,
-                counters=dict(collected=False, reason="ERR_NVGPUCTRPERM; no permission workaround is authorized"),
+                counters=dict(collected=False, reason="not collected by this harness; no counter workaround is authorized"),
                 summary=summarize(children) if not bad else [], children=children)
 
 
@@ -172,6 +200,7 @@ def run_child(a, arm, config, round_idx):
 
 
 def report(res):
+    print("f_plus_b: measured F+B | b_direct: measured backward alone | ESTIMATE: F+B - F, not a timed interval")
     print(f"\n{res['profile']}: {res['status']}  run order {' '.join(res['run_order'])}")
     print(f"{'row':44s} {'work':12s} {'baseline':>9s} {'candidate':>9s}  ratio")
     for s in res["summary"]:
@@ -193,7 +222,6 @@ def main():
     ap.add_argument("--profile", choices=PROFILES, default="representative")
     ap.add_argument("--baseline")
     ap.add_argument("--candidate")
-    ap.add_argument("--new-cfg", action="append", default=[], help="declare a REP_TK_FWD_CFG value the kernel implements")
     ap.add_argument("--len", type=int, default=16384)
     ap.add_argument("--heads", type=int, default=16)
     ap.add_argument("--dim", type=int, default=128, choices=(64, 128))
@@ -217,18 +245,19 @@ def main():
     out = Path(a.out)
     if out.exists():
         ap.error(f"{out} exists; results are not overwritten")
-    candidate = a.candidate or p["candidate"]
-    if candidate is None:
-        ap.error("--candidate is required for this profile (equal to --baseline for an A/A noise run)")
     try:
-        configs = dict(baseline=parse_config(a.baseline or p["baseline"], a.profile, a.new_cfg),
-                       candidate=parse_config(candidate, a.profile, a.new_cfg))
+        configs = dict(baseline=parse_config(a.baseline or p["baseline"], a.profile),
+                       candidate=parse_config(a.candidate or p["candidate"], a.profile))
     except ValueError as e:
         ap.error(str(e))
+    source = (HERE / "csrc/rep_tk/rep_tk.cu").read_text()
+    for arm, config in configs.items():
+        if not implemented(config["REP_TK_FWD_CFG"], source):
+            ap.error(f"{arm}: REP_TK_FWD_CFG={config['REP_TK_FWD_CFG']} is not implemented by this kernel source")
     order = abba(a.rounds)
     children = [run_child(a, arm, configs[arm], i) for i, arm in enumerate(order)]
     settings = {k: getattr(a, k) for k in ("len", "heads", "dim", "mid_reps", "seed", "warmup", "iters", "batches", "rounds")}
-    settings["declared_new_cfgs"] = a.new_cfg
+    settings["fwd_cfg_meanings"] = {arm: FWD_CFGS[c["REP_TK_FWD_CFG"]][1] for arm, c in configs.items()}
     res = assemble(settings, a.profile, configs, order, children)
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(out.suffix + ".tmp")
@@ -266,12 +295,15 @@ def capture(*cmd):
     return r.stdout.strip() if r.returncode == 0 else None
 
 
+def smi_target():
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    return ["-i", cvd] if cvd and "," not in cvd else []
+
+
 def telemetry():
     """Plain nvidia-smi state of the visible GPU (not performance counters), around each child."""
     fields = "pstate,clocks.current.graphics,clocks.current.memory,temperature.gpu,power.draw,utilization.gpu,memory.used"
-    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-    target = ["-i", cvd] if cvd.isdigit() else []
-    line = capture("nvidia-smi", *target, f"--query-gpu={fields}", "--format=csv,noheader")
+    line = capture("nvidia-smi", *smi_target(), f"--query-gpu={fields}", "--format=csv,noheader")
     return dict(fields=fields, values=line)
 
 
@@ -305,9 +337,8 @@ def child_main(spec):
 
     if not torch.cuda.is_available() or not ext().has_tk():
         sys.exit("needs a GPU and a VSA2_REP_TK=1 build")
-    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-    if not cvd.isdigit() or torch.cuda.device_count() != 1:
-        sys.exit(f"needs exactly one GPU selected by CUDA_VISIBLE_DEVICES, got {cvd!r}")
+    if torch.cuda.device_count() != 1:
+        sys.exit(f"needs exactly one visible GPU, got {torch.cuda.device_count()}")
 
     dev, dt = "cuda", torch.bfloat16
     B, H, L, D, rm, nb = 1, spec["heads"], spec["len"], spec["dim"], spec["mid_reps"], spec["len"] // 64
@@ -345,7 +376,7 @@ def child_main(spec):
         gtab = C.rep_build(k, v, cnt, rm)
         add("kernel.generic.fwd.A|B|C", "kernel", "fwd", "generic", "64/4/1", True,
             loop(lambda: C.rep_attn_fwd(q, k, v, *gtab, qp, qi, sel.bits_a, sel.bits_ab, cnt, rm, PHASE_ALL, 0), W, I, N))
-        add("kernel.tk.tables", "kernel", "tables", "tk", "64/4/1", False,
+        add("kernel.tk.tables", "kernel", "tables", "tk", "64/4/1", True,
             loop(lambda: tk_tables(C, k, v, cnt, sel, rm), W, I, N))
 
         # Backward kernels, one stage each. Results accumulate into buffers that are never read and not
@@ -364,7 +395,9 @@ def child_main(spec):
             ("C", "tier_subset", lambda: C.rep_tk_bwd_c(q, tab[3], tab[4], tab[5], dout, lse_t, d_t, sel.bits_ab, qg, kgt,
                                                         vgt)),
         ):
-            add(f"kernel.tk.bwd.{name}", "kernel", "bwd_stage", "tk", work, False, loop(fn, W, I, N),
+            # Backward kernels do not read REP_TK_FWD_CFG; only tier C reads REP_TK_BWDC_SPLITS.
+            control = name != "C" or "REP_TK_BWDC_SPLITS" not in os.environ
+            add(f"kernel.tk.bwd.{name}", "kernel", "bwd_stage", "tk", work, control, loop(fn, W, I, N),
                 note="one stage; do not add stages and call the sum a complete call")
         del o_t, lse_t, d_t, o_n, lse_n, d_n, qg, kg, vg, dkm, dvm, kgt, vgt
 
@@ -433,10 +466,9 @@ def child_main(spec):
     source = os.environ.get("VSA2_REP_SOURCE")
     tk_root = os.environ.get("VSA2_REP_TK_ROOT")
     identity = dict(
-        host=dict(hostname=platform.node(), cuda_visible_devices=cvd),
         hardware=dict(name=torch.cuda.get_device_name(0), capability=list(torch.cuda.get_device_capability(0)),
-                      uuid=str(getattr(props, "uuid", "")), total_memory=props.total_memory,
-                      driver=capture("nvidia-smi", "-i", cvd, "--query-gpu=driver_version", "--format=csv,noheader")),
+                      uuid_sha256=hashlib.sha256(str(getattr(props, "uuid", "")).encode()).hexdigest(), total_memory=props.total_memory,
+                      driver=capture("nvidia-smi", *smi_target(), "--query-gpu=driver_version", "--format=csv,noheader")),
         software=dict(python=platform.python_version(), torch=torch.__version__, cuda=torch.version.cuda,
                       nvcc=(capture("nvcc", "--version") or "").splitlines()[1:2]),
         # The extension's hash is the build identity. The source hashes say what was on disk at run time:
@@ -444,7 +476,7 @@ def child_main(spec):
         build=dict(extension_sha256=sha256_file(C.__file__), extension=os.path.basename(C.__file__),
                    build_log_sha256=sha256_file(HERE / "build.log") if (HERE / "build.log").exists() else None),
         source=dict(package=tree_sha256(HERE, ("csrc/**/*", "vsa2_rep/*.py", "setup.py", "bench_compare.py")),
-                    rep_tk_is_handoff_baseline=sha256_file(HERE / "csrc/rep_tk/rep_tk.cu") == HANDOFF_BASELINE_SHA256,
+                    rep_tk_sha256=sha256_file(HERE / "csrc/rep_tk/rep_tk.cu"),
                     vsa2=tree_sha256(source, ("csrc/vsa/**/*",)) if source else None,
                     git_head=capture("git", "-C", str(HERE), "rev-parse", "HEAD"),
                     git_status=capture("git", "-C", str(HERE), "status", "--porcelain", "."),  # None: not a checkout

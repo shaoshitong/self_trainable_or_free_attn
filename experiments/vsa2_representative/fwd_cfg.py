@@ -1,13 +1,15 @@
 """Forward-only timing of the TK kernel for one REP_TK_FWD_CFG (set in the environment) vs native TK.
 
-Diagnostic text output, not a comparison: bench_compare.py runs the controlled pair with a recorded result.
-CFG 4/5 run tier A whatever `phases` says and their output is not validated, so only their tier-A row is
-printed, as timing only. The diag= rows change the work (no bias loads, a different load path); they
-locate cost and cannot establish numerical or end-to-end acceleration.
+Diagnostic text output, not a comparison: bench_compare.py runs the same-build pairs with a recorded result.
+CFG 4/5/7 run tier A whatever `phases` says, write no lse and do not mask padded output; CFG 2/3 run their
+tier-A path only for phases=A. Only the tier-A row is printed for them, never a B or A|B|C row. The diag=
+rows change the work (no bias loads, a different load path); they locate cost and cannot establish numerical
+or end-to-end acceleration.
 """
-import os
 import torch
+from bench_compare import active_fwd_cfg
 from vsa2_rep.ops import PHASE_A, PHASE_ALL, RepTiers, ext, route_tiers, tk_tables
+cfg_name, cfg_kind, cfg_meaning = active_fwd_cfg()  # before any launch reads and caches it
 C = ext(); dev = "cuda"
 B, H, L, D, rm = 1, 16, 16384, 128, 4
 nb = L // 64
@@ -23,10 +25,8 @@ def T(fn, n=50):
     b.record(); torch.cuda.synchronize(); return a.elapsed_time(b) / n
 nat = T(lambda: C.tk_native_fwd(q, k, v, sel.q2k_ptr, sel.q2k_idx, cnt))
 fa = T(lambda: C.rep_tk_fwd(q, k, v, tab, sel.q2k_ptr, sel.q2k_idx, sel.b_ptr, sel.b_idx, sel.bits_ab, cnt, rm, PHASE_A, 0))
-cfg_name = os.environ.get("REP_TK_FWD_CFG", "1")
-if cfg_name in ("4", "5"):
-    print(f"cfg={cfg_name}  native {nat:.3f}  A-only {fa:.3f} ({fa/nat:.3f}x)  TIMING ONLY: diagnostic tier-A copy, "
-          "output not validated")
+if cfg_kind != "operator":
+    print(f"cfg={cfg_name}  native {nat:.3f}  A-only {fa:.3f} ({fa/nat:.3f}x)  {cfg_kind.upper()}, tier A: {cfg_meaning}")
     raise SystemExit
 fall = T(lambda: C.rep_tk_fwd(q, k, v, tab, sel.q2k_ptr, sel.q2k_idx, sel.b_ptr, sel.b_idx, sel.bits_ab, cnt, rm, PHASE_ALL, 0))
 print(f"cfg={cfg_name}  native {nat:.3f}  A-only {fa:.3f} ({fa/nat:.3f}x)  A|B|C {fall:.3f} ({fall/nat:.3f}x)")

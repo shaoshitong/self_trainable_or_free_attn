@@ -6,20 +6,23 @@ that no row silently includes work another one omits:
 
   kernel   the attention kernel(s) alone, representative tables prebuilt
   op       what one call of the autograd op costs (includes table build, zero-inits, delta, unpool,
-           finalize). F+B is measured; "bwd est" is F+B - F, a subtraction of two loops and an estimate
+           finalize). F+B is measured; "bwd est" is F+B - F, a subtraction of two loops and an estimate.
+           This script has no directly timed backward; bench_compare.py's b_direct rows do.
 
 The "=>" backward lines add separately timed kernels. They are sums, not measured complete calls.
-bench_compare.py runs the same rows per configuration and writes a machine-readable result.
+One run measures one REP_TK_FWD_CFG: 1 (TK-vector softmax, the default), 6 (the production kernel with the
+previous hand-written softmax) or 0 (MINB 4). bench_compare.py compares two of them in one build and writes
+a machine-readable result; do not compare separate runs of this script as a same-build result.
 
 The native TK rows are VSA2's own fine kernels on the tier-A lists -- the 10% budget VSA2 keeps, with
 the other 90% of the pairs dropped. They are the baseline every three-tier row is compared against.
 """
 import argparse
-import os
 import sys
 
 import torch
 
+from bench_compare import active_fwd_cfg
 from vsa2_rep.ops import tk_tables, PHASE_A, PHASE_ALL, PHASE_B, PHASE_C, RepTiers, ext, rep_fine_attention, route_tiers
 
 
@@ -56,7 +59,8 @@ def main():
     qp, qi, kp, ki = sel.q2k_ptr, sel.q2k_idx, sel.k2q_ptr, sel.k2q_idx
     f32 = dict(device=dev, dtype=torch.float32)
     print(f"{torch.cuda.get_device_name(0)}  B={B} H={H} L={L} D={D} NB={nb} RM={rm} bf16  "
-          f"tiers 10%/20%/70%  iters={a.iters} warmup={a.warmup}\n")
+          f"tiers 10%/20%/70%  iters={a.iters} warmup={a.warmup}\n"
+          f"REP_TK_FWD_CFG={cfg_name}: {cfg_meaning}\n")
 
     # ------------------------------------------------------------ kernel scope, forward
     gtab = C.rep_build(k, v, blk_cnt, rm)
@@ -150,6 +154,7 @@ def main():
 if __name__ == "__main__":
     if not torch.cuda.is_available() or not ext().has_tk():
         sys.exit("needs a GPU and a VSA2_REP_TK=1 build")
-    if os.environ.get("REP_TK_FWD_CFG", "1") not in ("0", "1"):
-        sys.exit("REP_TK_FWD_CFG 2-5 do not run the tiers these rows are labelled with; see fwd_cfg.py")
+    cfg_name, cfg_kind, cfg_meaning = active_fwd_cfg()
+    if cfg_kind != "operator":
+        sys.exit(f"REP_TK_FWD_CFG={cfg_name} does not run the tiers these rows are labelled with; see fwd_cfg.py")
     main()
