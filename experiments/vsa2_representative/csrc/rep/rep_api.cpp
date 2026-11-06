@@ -233,9 +233,10 @@ std::vector<torch::Tensor> route_tiers(torch::Tensor qr, torch::Tensor kr, torch
   // Default since it measured -2% on F+B; CFG44 is the accepted alias and CFG45 restores the sequential order.
   const char* cfg_env = std::getenv("REP_TK_FWD_CFG");
   const bool parallel = (keff_ab != keff_a) && !(cfg_env != nullptr && std::strcmp(cfg_env, "45") == 0);
-  // REP_TK_FWD_CFG=46: each chain builds its kv->q CSR with one kernel instead of cols / colscan / cols (same
-  // integers, two launches fewer per chain); the bitmaps come from earlier kernels and are untouched.
-  const bool fused_cols = cfg_env != nullptr && std::strcmp(cfg_env, "46") == 0;
+  // Each chain builds its kv->q CSR with one kernel instead of cols / colscan / cols (same integers, two
+  // launches fewer per chain); the bitmaps come from earlier kernels and are untouched. Default since it
+  // measured -1.3% on the full forward; CFG46 is the accepted alias and CFG47 restores the three-kernel form.
+  const bool fused_cols = !(cfg_env != nullptr && std::strcmp(cfg_env, "47") == 0);
   torch::Tensor ws2, ab_k2q_buf2;
   vsa2::TopkWorkspace w2{};
   // Created once per process: creating and destroying a stream plus two events on every routing call cost more

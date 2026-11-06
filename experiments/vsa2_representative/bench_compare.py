@@ -90,8 +90,9 @@ FWD_CFGS = {
     "43": ("operator", "history arm: the representative tables are rebuilt from K and V; tolerance-equivalent to CFG1"),
     "44": ("operator", "alias of CFG1 since the two top-k budget chains on two streams became the default"),
     "45": ("operator", "history arm: the two top-k budget chains run one after the other"),
-    "46": ("operator", "CFG1 with some of the router's mask/cut/emit or cols/colscan/cols kernels merged; bitmaps held "
+    "46": ("operator", "alias of CFG1 since the fused kv->q column stage became the default; some of the router's mask/cut/emit or cols/colscan/cols kernels merged; bitmaps held "
                        "bit-identical"),
+    "47": ("operator", "history arm: each chain builds its kv->q CSR with cols / colscan / cols"),
     "2": ("tier_a_path", "tier-A-only specialisation at MINB 4; other phases run the default kernel"),
     "3": ("tier_a_path", "tier-A-only specialisation at MINB 3; other phases run the default kernel"),
     "4": ("timing_only", "copied native loop, native softmax"),
@@ -104,16 +105,17 @@ PROFILES = {
                                candidate="REP_TK_FWD_CFG=5"),
 }
 BACKWARD_ARMS = {"21": "C", "22": "C", "23": "A", "37": "A"}  # the only backward tier each one's setting reaches
-ALIASES = ("1", "10", "13", "36", "39", "42", "44")  # the default path under an old name; no dispatch line needed
+ALIASES = ("1", "10", "13", "36", "39", "42", "44", "46")  # the default path under an old name; no dispatch line needed
 # Each accepted change to the default path and the config that restores what it replaced.
 HISTORY_ARMS = {"20": "the pre-round-4 tier-B gather (32 x 512 B bulk copies)",
                 "37": "the pre-round-11 tier-A backward (zeros(kg), zeros(vg), reduce-add kernel)",
                 "40": "coarse CSR metadata rebuilt on every call",
                 "43": "representative tables rebuilt from K and V",
-                "45": "the two top-k budget chains run one after the other"}
+                "45": "the two top-k budget chains run one after the other",
+                "47": "each chain builds its kv->q CSR with cols / colscan / cols"}
 # These reach only the routed operator: fwd_impl launches the default kernel, and their evidence is host code that
 # reads the config. Their full-op forward may move, so it is not a control. All but CFG43 keep every output byte.
-ROUTED_ARMS = {"38", "40", "41", "43", "45", "46"}
+ROUTED_ARMS = {"38", "40", "41", "43", "45", "47"}
 TOLERANCE_EQUAL = {"43"}  # the group means are rounded to bf16 before the block mean is formed
 ROUTED_READ_ROWS = ("full_op.tk.routed.f", "full_op.tk.routed.f_plus_b")
 OWN_FORWARD = ("20", "24", "32", "33")  # meaningless if they launch the default kernel
@@ -233,8 +235,8 @@ def arms_error(configs):
     backward = arms & BACKWARD_ARMS.keys()
     if backward and not arms <= FORWARD_EQUAL:
         return f"CFG{min(backward)} changes only the backward; compare it with CFG1, not {sorted(arms)}"
-    if "46" in arms and not arms <= {"46", *ALIASES}:
-        return f"CFG46 merges router kernels; compare it with CFG1 so that nothing else changes, not {sorted(arms)}"
+    if "47" in arms and not arms <= {"47", *ALIASES}:
+        return f"CFG47 merges router kernels; compare it with CFG1 so that nothing else changes, not {sorted(arms)}"
     if "23" in arms and arms != {"23"} and arms != {"23", "37"}:
         return "CFG23 runs on CFG37's reduce-add path, so only CFG37 vs CFG23 changes one thing"
     if len({BACKWARD_ARMS[a] for a in backward}) > 1:

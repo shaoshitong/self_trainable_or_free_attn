@@ -170,27 +170,28 @@ def test_softmax_reductions_stay_on_the_default_path():
 
 
 def test_history_and_alias_arms_are_registered():
-    assert set(HISTORY_ARMS) == {"20", "37", "40", "43", "45"} and all(v in FWD_CFGS for v in HISTORY_ARMS)
+    assert set(HISTORY_ARMS) == {"20", "37", "40", "43", "45", "47"} and all(v in FWD_CFGS for v in HISTORY_ARMS)
     assert {"42", "44"} <= set(ALIASES) and not set(HISTORY_ARMS) & set(ALIASES), "a history arm is not an alias"
     pair = lambda x, y: {"baseline": {"REP_TK_FWD_CFG": x}, "candidate": {"REP_TK_FWD_CFG": y}}
     for value in ("20", "43"):
         assert not forward_must_match(pair("1", value)), "their outputs may differ"
-    for value in ("37", "40", "45", "42", "44", "46"):
+    for value in ("37", "40", "45", "47", "42", "44", "46"):
         assert forward_must_match(pair("1", value)), f"CFG{value} is held to byte equality"
     assert not forward_must_match(pair("42", "43")), "a pair containing CFG43 is tolerance-equivalent"
 
 
 def test_routed_arms_read_host_code_and_keep_full_op_timing_visible():
+    # CFG46 became the default path in round 30, so the experimental arm exercised here is its history arm, 47.
     host = 'os.environ.get("REP_TK_FWD_CFG") != "40"'
     assert cfg_error("40", ROUND5, host) is None
-    assert cfg_error("46", ROUND5, host), "must not pass before something reads it"
-    assert cfg_error("46", ROUND5, 'strcmp(cfg_env, "46")') is None
-    assert cfg_error("46", ROUND5 + "bool m() { return rep_cfg() == 46; }\n", host) is None
-    moved = kernel(BULK, "(cfg == 46) launch(rep_tk::fwd_ker<D, 4>);")
-    assert cfg_error("46", moved, 'strcmp(cfg_env, "46")'), "a forward kernel change under a router arm"
-    pair = {"baseline": {"REP_TK_FWD_CFG": "1"}, "candidate": {"REP_TK_FWD_CFG": "46"}}
+    assert cfg_error("47", ROUND5, host), "must not pass before something reads it"
+    assert cfg_error("47", ROUND5, 'strcmp(cfg_env, "47")') is None
+    assert cfg_error("47", ROUND5 + "bool m() { return rep_cfg() == 47; }\n", host) is None
+    moved = kernel(BULK, "(cfg == 47) launch(rep_tk::fwd_ker<D, 4>);")
+    assert cfg_error("47", moved, 'strcmp(cfg_env, "47")'), "a forward kernel change under a router arm"
+    pair = {"baseline": {"REP_TK_FWD_CFG": "1"}, "candidate": {"REP_TK_FWD_CFG": "47"}}
     assert arms_error(pair) is None
-    assert arms_error({"baseline": {"REP_TK_FWD_CFG": "45"}, "candidate": {"REP_TK_FWD_CFG": "46"}}), "two variables"
+    assert arms_error({"baseline": {"REP_TK_FWD_CFG": "45"}, "candidate": {"REP_TK_FWD_CFG": "47"}}), "two variables"
     meta = dict(scope="full_op", stage="f", implementation="tk", work="64/4/1", control=False, measured=True, complete_call=True)
     def run(arm, digest="x", sel="s"):
         rows = [dict(id="full_op.tk.routed.f", ms=[1.0], meta=meta),
