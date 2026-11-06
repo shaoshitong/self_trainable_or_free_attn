@@ -1,0 +1,80 @@
+{
+  "schema": "sanitized-build-test-perf-feedback-v1",
+  "source_commit": "efe5503bfa74dd23dcb96cd9173e72f963be76c2",
+  "source_file": "experiments/vsa2_representative/csrc/rep_tk/rep_tk.cu",
+  "source_sha256": "6224637ff9a96404e170aa7de568a070c449ae83707564c37cbfae3cffdc784e",
+  "hardware": {
+    "name": "NVIDIA H100 80GB HBM3",
+    "capability": [
+      9,
+      0
+    ]
+  },
+  "software": {
+    "torch": "2.11.0+cu130",
+    "cuda_runtime": "13.0",
+    "nvcc": "13.2.78",
+    "compiler": "GCC12.5.0"
+  },
+  "fresh_build": {
+    "passed": true,
+    "seconds": 99
+  },
+  "tests": {
+    "cpu": {
+      "suite": "cpu",
+      "passed": true,
+      "check_lines": 6,
+      "test_families": 0,
+      "allskip": false,
+      "terminal_marker": "all CPU reference tests passed"
+    },
+    "generic": {
+      "suite": "generic",
+      "passed": true,
+      "check_lines": 60,
+      "test_families": 7,
+      "allskip": false,
+      "terminal_marker": "all GPU tests passed"
+    },
+    "tk": {
+      "suite": "tk",
+      "passed": true,
+      "check_lines": 72,
+      "test_families": 5,
+      "allskip": false,
+      "terminal_marker": "all TK GPU tests passed"
+    }
+  },
+  "baseline_bench": {
+    "shape": {
+      "B": 1,
+      "H": 16,
+      "L": 16384,
+      "D": 128,
+      "RM": 4
+    },
+    "tiers": [
+      0.1,
+      0.2,
+      0.7
+    ],
+    "scope": "rep_fine_attention ABC, frozen selection; excludes routing, coarse branch and gate",
+    "measurement": "one warmed CUDA-event loop average, not independent samples",
+    "abc": {
+      "generic": {
+        "fwd": 1.2983754475911458,
+        "fwd_bwd": 6.794419352213541,
+        "bwd_estimate": 5.496043904622396
+      },
+      "tk": {
+        "fwd": 0.9061365127563477,
+        "fwd_bwd": 3.8180864969889323,
+        "bwd_estimate": 2.9119499842325847
+      }
+    },
+    "backward_scope": "estimate F+B minus separately timed F",
+    "native_A_only_is_semantic_baseline": false
+  },
+  "status": "baseline accepted; candidate not measured"
+}

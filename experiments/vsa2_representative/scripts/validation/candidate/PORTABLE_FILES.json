@@ -1,0 +1,35 @@
+{
+  "schema": "portable-candidate-control-v1",
+  "files": [
+    {
+      "path": "SOURCE_MANIFEST.yaml",
+      "bytes": 11864,
+      "sha256": "5e36004063e452739833645242ee07ca47d8910ba644abb863451ff1e9b28e85"
+    },
+    {
+      "path": "check_compare.py",
+      "bytes": 4132,
+      "sha256": "2c4d5b9376178e2eba371f2f53223c67ed90124da29e455d8487c7b5484c8004"
+    },
+    {
+      "path": "TK_SOURCE_MANIFEST.yaml",
+      "bytes": 23932,
+      "sha256": "8bff31ad17918f9b6ccb61277bc6d2b3edf614e8aa4d14ca6ff0adac21bce31e"
+    },
+    {
+      "path": "probe.py",
+      "bytes": 2168,
+      "sha256": "abafb84ef08c2c5ac5736742346a6626b6146decb35d94f42024ce83c4986752"
+    },
+    {
+      "path": "job.sh",
+      "bytes": 4883,
+      "sha256": "db8f22aa1aeb642216fa5f3527ee6961d69f7dac9dd74db3b904595f6841dd04"
+    },
+    {
+      "path": "check_suites.py",
+      "bytes": 919,
+      "sha256": "adfc3df34dfcb708763a3742b10d5812365b134e150084e9e2a8de2ef577389e"
+    }
+  ]
+}
