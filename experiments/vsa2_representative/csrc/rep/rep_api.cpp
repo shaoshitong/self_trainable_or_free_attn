@@ -72,6 +72,14 @@ inline void check_launch() {
   TORCH_CHECK(e == cudaSuccess, "vsa2_rep CUDA launch failed: ", cudaGetErrorString(e));
 }
 inline int ceil_to(long long x, int m) { return (int)((x + m - 1) / m * m); }
+// REP_TK_FWD_CFG=48: the pool pass with two column pairs per thread (64-bit loads / stores), byte-identical.
+inline int pool_vec() {
+  static const int v = [] {
+    const char* e = std::getenv("REP_TK_FWD_CFG");
+    return (e != nullptr && std::strcmp(e, "48") == 0) ? 2 : 1;
+  }();
+  return v;
+}
 
 void check_rm(int64_t RM) {
   TORCH_CHECK(RM == 1 || RM == 2 || RM == 4 || RM == 8 || RM == 16,
@@ -520,7 +528,7 @@ std::vector<torch::Tensor> pool_fwd(torch::Tensor q, torch::Tensor k, torch::Ten
                      qc.data_ptr(), kc.data_ptr(), vc.data_ptr(), nullptr,       blk_cnt.data_ptr<int>(),
                      B * H,         L,             NB,            (int)R,        G,
                      Lr_pad,        NBc_pad};
-  vsa2::launch_pool(p, D, dtype_of(q), cur_stream());
+  vsa2::launch_pool(p, D, dtype_of(q), cur_stream(), pool_vec());
   check_launch();
   return {qr, kr, qc, kc, vc};
 }
@@ -550,7 +558,7 @@ std::vector<torch::Tensor> pool_fwd_vr(torch::Tensor q, torch::Tensor k, torch::
                      qc.data_ptr(), kc.data_ptr(), vc.data_ptr(), vrl.data_ptr(), blk_cnt.data_ptr<int>(),
                      B * H,         L,             NB,            (int)R,         G,
                      Lr_pad,        NBc_pad};
-  vsa2::launch_pool(p, D, dtype_of(q), cur_stream());
+  vsa2::launch_pool(p, D, dtype_of(q), cur_stream(), pool_vec());
   check_launch();
   return {qr, kr, vrl, qc, kc, vc};
 }

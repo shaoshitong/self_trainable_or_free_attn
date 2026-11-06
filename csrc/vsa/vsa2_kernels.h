@@ -189,7 +189,8 @@ struct PoolParams {
   const int* blk_cnt;
   int BH, L, NB, R, G, Lr_pad, NBc_pad;
 };
-void launch_pool(const PoolParams& p, int D, DType dt, cudaStream_t s);
+// vec: column pairs per thread, 1 (default) or 2 (64-bit accesses, rep CFG 48); outputs byte-identical
+void launch_pool(const PoolParams& p, int D, DType dt, cudaStream_t s, int vec = 1);
 
 // ---------------------------------------------------------------- router
 struct RouterParams {
