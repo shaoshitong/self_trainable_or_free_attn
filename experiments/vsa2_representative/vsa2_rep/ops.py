@@ -178,6 +178,28 @@ def _coarse_meta(B: int, H: int, nb: int, nbc_pad: int, device):
     return cnt.contiguous(), ptr, idx
 
 
+_COARSE_META_CACHE = {}
+
+
+def _cached_coarse_meta_enabled() -> bool:
+    """REP_TK_FWD_CFG=39: reuse the coarse CSR metadata across calls.
+
+    It is shape-only (B, H, nb, nbc_pad), so the same three tensors serve every call of a given shape;
+    rebuilding them per call costs a handful of tiny kernel launches inside the forward.
+    """
+    import os
+    return os.environ.get("REP_TK_FWD_CFG") == "39"
+
+
+def _coarse_meta_cached(B: int, H: int, nb: int, nbc_pad: int, device):
+    key = (B, H, nb, nbc_pad, str(device))
+    hit = _COARSE_META_CACHE.get(key)
+    if hit is None:
+        hit = _coarse_meta(B, H, nb, nbc_pad, device)
+        _COARSE_META_CACHE[key] = hit
+    return hit
+
+
 def _rep_fwd(C, q, k, v, blk_cnt, sel: TierSelection, mid_reps: int, phases: int):
     tab = C.rep_build(k, v, blk_cnt, mid_reps)
     o, lse = C.rep_attn_fwd(q, k, v, *tab, sel.q2k_ptr, sel.q2k_idx, sel.bits_a, sel.bits_ab, blk_cnt,
@@ -386,7 +408,10 @@ class _RepAttentionFunction(torch.autograd.Function):
         B, H, L, D = q.shape
         nb = L // 64
         qr, kr, qc, kc, vc = C.pool_fwd(q, k, v, blk_cnt, R)
-        c_cnt, c_ptr, c_idx = _coarse_meta(B, H, nb, qc.shape[2], q.device)
+        if _cached_coarse_meta_enabled():
+            c_cnt, c_ptr, c_idx = _coarse_meta_cached(B, H, nb, qc.shape[2], q.device)
+        else:
+            c_cnt, c_ptr, c_idx = _coarse_meta(B, H, nb, qc.shape[2], q.device)
         oc, lse_c = C.attn_fwd(qc, kc, vc, c_ptr, c_idx, c_cnt)
         overlap = use_tk and sel_in is None and _overlap_tables()
         tab0 = None
