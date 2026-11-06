@@ -58,7 +58,9 @@ def kernel(*lines):
 BULK = "(cfg == 20) launch(rep_tk::fwd_ker<D, 3>);"
 DOUBLE = "(cfg == 11) launch(rep_tk::fwd_ker<D, 3, false, false, true, true>);"
 ROUND5 = kernel(BULK, DOUBLE)
-ROUND6 = ROUND5 + "int bwd(int bwd_cfg) { return bwd_cfg == 21 ? 1 : bwd_cfg == 22 ? 4 : bwd_cfg == 23 ? 3 : 0; }\n"
+ROUND6 = ROUND5 + ("int bwd(int bwd_cfg) { return bwd_cfg == 21 ? 1 : bwd_cfg == 22 ? 4 : bwd_cfg == 23 ? 3 : 0; }\n"
+                   "const char* split() { return rep_cfg() == 21 ? \"wave\" : rep_cfg() == 22 ? \"4\" : 0; }\n"
+                   "int minb() { return rep_cfg() == 23 ? 8 : 0; }\n")
 
 
 def test_standalone_scripts_see_what_runs():
