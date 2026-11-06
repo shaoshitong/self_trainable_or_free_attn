@@ -10,7 +10,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bench_stages import attribute, compare_stages
 from bench_compare import (BACKWARD_READ_ROWS, FWD_CFGS, PROFILES, abba, active_fwd_cfg, arms_error, assemble,
-                           backward_row_is_control, cfg_error, claims, fwd_dispatch, parse_config, summarize)
+                           backward_row_is_control, cfg_error, claims, forward_must_match, fwd_dispatch, fwd_kernel_name,
+                           parse_config, summarize)
 
 
 def child(arm, scale, check=True):
@@ -36,13 +37,13 @@ def test_configs_keep_their_semantics():
         {"REP_TK_FWD_CFG": "1", "REP_TK_BWDC_SPLITS": "8"}
     for cfg in "23457":
         assert rejected(f"REP_TK_FWD_CFG={cfg}", "representative"), "a diagnostic passed as production"
-    for cfg in ("0", "1", "2", "6", "8", "9", "10", "11", "13", "20", "21", "22", "23"):
+    for cfg in ("0", "1", "2", "6", "8", "9", "10", "11", "13", "20", "21", "22", "23", "24"):
         assert rejected(f"REP_TK_FWD_CFG={cfg}", "controlled-softmax"), "only CFG 4/5/7 are this diagnostic"
     for cfg in "457":
         assert parse_config(f"REP_TK_FWD_CFG={cfg}", "controlled-softmax")
-    for cfg in ("8", "9", "10", "11", "13", "20", "21", "22", "23"):
+    for cfg in ("8", "9", "10", "11", "13", "20", "21", "22", "23", "24"):
         assert parse_config(f"REP_TK_FWD_CFG={cfg}", "representative")
-    assert rejected("REP_TK_FWD_CFG=24", "representative"), "the kernel would silently run its default path"
+    assert rejected("REP_TK_FWD_CFG=25", "representative"), "the kernel would silently run its default path"
     assert parse_config("REP_TK_FWD_CFG=1,REP_TK_BWDC_SPLITS=wave", "representative"), "the kernel accepts wave"
     assert rejected("REP_TK_FWD_CFG=1,REP_TK_BWDC_SPLITS=other", "representative")
     assert PROFILES["representative"]["baseline"].endswith("=1") and PROFILES["representative"]["candidate"] is None
@@ -67,7 +68,7 @@ def test_standalone_scripts_see_what_runs():
     assert active_fwd_cfg({}, ROUND5)[:2] == ("1", "operator")
     assert active_fwd_cfg({"REP_TK_FWD_CFG": "7"}, ROUND5 + "cfg == 7")[1] == "timing_only"
     assert fwd_dispatch(ROUND5)["20"] == "rep_tk::fwd_ker<D, 3>"
-    for value, source in (("1", kernel()), ("11", kernel(BULK)), ("6", ROUND5), ("21", ROUND5), ("24", ROUND6)):
+    for value, source in (("1", kernel()), ("11", kernel(BULK)), ("6", ROUND5), ("21", ROUND5), ("24", ROUND6), ("25", ROUND6)):
         try:
             active_fwd_cfg({"REP_TK_FWD_CFG": value}, source)
         except SystemExit:
@@ -93,6 +94,28 @@ def test_arm_meanings_hold_in_the_source():
     same = "(cfg == 20) launch(rep_tk::fwd_ker<D, 3, false, false, true>);"
     assert cfg_error("20", kernel(same)), "a history arm that is the default"
     assert cfg_error("13", ROUND5.replace("static void fwd_impl", "void renamed")), "must fail closed"
+
+
+def test_two_stage_arm_is_its_own_forward():
+    kdb = "(cfg == 11) {\n    set(rep_tk::fwd_kdb_ker<D>, m);\n    rep_tk::fwd_kdb_ker<D><<<g>>>(x);\n  }"
+    two = "(cfg == 24) {\n    constexpr int m = 2;\n    set(rep_tk::fwd_kdb_ker<D, true>, m);\n    rep_tk::fwd_kdb_ker<D, true><<<g>>>(x);\n  }"
+    assert cfg_error("24", kernel(BULK, kdb, two)) is None
+    assert fwd_kernel_name("24", kernel(BULK, kdb, two)) == "fwd_kdb_ker", "a profiler selecting fwd_ker would miss it"
+    assert fwd_kernel_name("1", kernel(BULK, kdb, two)) == "fwd_ker"
+    assert cfg_error("24", kernel(BULK, kdb, "(cfg == 24) {\n    rep_tk::fwd_kdb_ker<D><<<g>>>(x);\n  }")), "CFG11 again"
+    assert cfg_error("24", kernel(BULK, "(cfg == 24) launch(rep_tk::fwd_ker<D, 3, false, false, true>);")), "the default"
+    pair = {"baseline": {"REP_TK_FWD_CFG": "1"}, "candidate": {"REP_TK_FWD_CFG": "24"}}
+    assert not forward_must_match(pair)
+    a, b = child("baseline", 1), child("candidate", 1)
+    a["forward_output"], b["forward_output"] = {"B": dict(o="x")}, {"B": dict(o="y")}
+    res = assemble({}, "representative", pair, [], [a, b])
+    assert res["status"] == "ok" and res["forward_outputs_byte_identical"] is False, "its forward may differ"
+    assert {s["id"]: s["control"] for s in res["summary"]}["op.f"] is False
+    assert res["claims"]["may_claim_op_level_change"] is True
+    b["output_check"] = [dict(name="o", ok=False)]
+    assert assemble({}, "representative", pair, [], [a, b])["claims"]["output_validated"] is False, "the generic check still gates it"
+    assert arms_error({"baseline": {"REP_TK_FWD_CFG": "24"}, "candidate": {"REP_TK_FWD_CFG": "21"}}), "two variables"
+    assert arms_error({"baseline": {"REP_TK_FWD_CFG": "11"}, "candidate": {"REP_TK_FWD_CFG": "24"}}) is None
 
 
 def test_backward_arm_is_single_variable():
@@ -228,6 +251,7 @@ if __name__ == "__main__":
     test_configs_keep_their_semantics()
     test_standalone_scripts_see_what_runs()
     test_arm_meanings_hold_in_the_source()
+    test_two_stage_arm_is_its_own_forward()
     test_backward_arm_is_single_variable()
     test_backward_arm_reaches_only_its_tier()
     test_forward_change_under_backward_arm_is_invalid()

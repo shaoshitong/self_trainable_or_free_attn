@@ -364,7 +364,8 @@ from a build containing CFG 20.
 | 21 | CFG 1 forward; tier-C backward split by the old wave policy | as CFG 1 | 3 | as CFG 1 | as CFG 1 | as CFG 1 |
 | 22 | CFG 1 forward; tier-C backward split forced to 4 | as CFG 1 | 3 | as CFG 1 | as CFG 1 | as CFG 1 |
 | 23 | CFG 1 forward; tier-A backward `__launch_bounds__(128, 3)` probe | as CFG 1 | 3 | as CFG 1 | as CFG 1 | as CFG 1 |
-| 11 | negative arm: `fwd_kdb_ker`, CFG 1 plus a double-buffered K tile | TK vector | 3 | `cp.async` | not recorded here | not recorded here |
+| 11 | measured negative arm: `fwd_kdb_ker`, CFG 1 plus a double-buffered K tile | TK vector | 3 | `cp.async` | not recorded here | not recorded here |
+| 24 | CFG 11's kernel plus a two-stage softmax: the next tile's QK is issued before the current softmax finishes | TK vector | not built yet | `cp.async` | not built yet | not built yet |
 | 20 | the pre-round-4 forward, with CFG 1's backward | TK vector | 3 | bulk | 168 | 24 |
 | 6 | `fwd_ker`, all tiers; a softmax pair with CFG 20 | hand-written | 3 | bulk | 168 | 16 |
 | 8 | `fwd_ker`, all tiers | TK vector | 2 | bulk | not recorded here | not recorded here |
@@ -378,8 +379,22 @@ from a build containing CFG 20.
 
 CFG 2/3 use their `A_ONLY` kernel only for `phases=A`; other phases run the default kernel. CFG 0/6/8/9/20 keep the
 bulk gather, so CFG 6 is a softmax-only pair with CFG 20, not with CFG 1. `settings.fwd_kernels_in_source` records
-the launched template. CFG 21/22/23 are not in the newest kernel source read here, `f634020`, so they are refused
-until they land.
+the launched template. CFG 24 is refused until the kernel source dispatches on it, and it must launch something
+other than the default or CFG 11's kernel. CFG 21/22/23 are measured negative or neutral arms; see H100 status.
+
+Occupancy of the forward arms, D=128. Fill the `not built yet` cells from the build's `ptxas` output:
+
+| CFG | Registers | Spills | Dynamic shared memory | Register limit | Shared-memory limit | Implied CTAs/SM |
+|---:|---:|---|---:|---:|---:|---:|
+| 1 | 166 | no | 50,176 B | 3 | 4 | 3 |
+| 11 | not recorded here | not recorded here | 66,560 B | 3, while `__launch_bounds__(128, 3)` | 3 | 3 |
+| 24 | not built yet | not built yet | not built yet | not built yet | not built yet | not built yet |
+
+These limits are derived, not measured, and the implied figure is the smaller of the two. The register limit is 4
+CTAs/SM up to 128 registers, 3 up to 168 and 2 up to 255, the caps stated in the kernel's comments. The shared-memory
+limit takes about 227 KB per SM, which agrees with round 6: 113,000 B allows 2. `__launch_bounds__(128, 3)` makes the
+compiler stay within 168 registers, so pressure there shows as spills, as in CFG 20. A kernel only reaches 2 CTAs/SM
+through registers if it is launched with a bound of 2, which is why CFG 24 needs its bound read alongside its count.
 
 `REP_TK_BWDC_SPLITS=<positive>` forces the tier-C split and `REP_TK_BWDC_SPLITS=wave` selects the old policy. At
 D=128, B=1, H=16 and 132 SMs, read from the kernel's formulas, many pairs of policies coincide, so a comparison
@@ -395,8 +410,8 @@ at a shape where they do is an A/A run:
 `REP_TK_FWD_CFG` is cached on first use, so one process measures one value. A value the kernel does not
 dispatch on silently runs the default kernel, so `bench_compare.py`, `bench_tk.py`, `fwd_cfg.py`, `one_launch.py`
 and `bench_stages.py` check `rep_tk.cu` on disk. They refuse a source without `cfg == 20`, a value not written as
-`cfg == <value>` (a backward arm may use a name such as `bwd_cfg`; the aliases may have no line), an alias or
-backward arm whose forward dispatch differs from the default, and a CFG 20 that launches the default. The check
+`cfg == <value>` (a backward arm is written `rep_cfg() == <value>`; the aliases may have no line), an alias or
+backward arm whose forward dispatch differs from the default, and a CFG 20 or 24 that launches the default. The check
 reads source, not the compiled extension, and does not look at the VSA2 sources compiled alongside it.
 
 CFG 4/5/7 are measurement code. They ignore `phases` and run tier A only, write no `lse` and do not mask
@@ -526,26 +541,32 @@ ordering, thermal or allocator effects; the per-batch `ms` and `telemetry_*` fie
 Backward stages: full-op `b_direct` is about 2.98 ms beside 4.08 ms F+B. They are separate measurements, and
 `b_direct` includes idle gaps from its synchronizes, so `b_estimate` is the one that subtracts from F+B.
 
-Next matrix, D=128/RM4/H16, on one build containing CFG 21, 22 and 23, with the suites passing on it. Each arm needs
-its own A/A floor at its shape:
+Round 6: the backward line is closed for now. CFG 21 F+B was 1.0002 and CFG 22 1.0013, neutral at 16K, where all
+three split policies choose 4 at 132 SMs, so this says nothing about 32K or 48K. CFG 23 was a measured negative: F+B
+1.350 and `kernel.tk.bwd.A` 1.874, because that kernel's 113,000 B of dynamic shared memory already limits it to 2
+CTAs/SM whatever the register count.
 
-| # | Variable | Run | Shape |
-|---:|---|---|---|
-| 1 | none | CFG 1 vs CFG 1 | each length below |
-| 2 | tier-A backward occupancy | CFG 1 vs CFG 23 | 16K |
-| 3 | tier-C split forced to 4 | CFG 1 vs CFG 22 | 32K; 16K is an A/A run at 132 SMs |
-| 4 | tier-C wave policy | CFG 1 vs CFG 21 | 48K; 16K and 32K are A/A runs at 132 SMs |
+Next matrix, 16K/H16/D128/RM4, on one build containing CFG 24. CFG 24 is a forward change, so its forward rows may
+differ from CFG 1 and `forward_outputs_byte_identical` is only reported. It still needs the generic cross-check
+that `bench_compare.py` runs, and the TK suite under it.
+
+| # | Purpose | Run |
+|---:|---|---|
+| 1 | correctness | CPU and generic suites; TK suite with CFG 1 and with CFG 24 |
+| 2 | noise floor | CFG 1 vs CFG 1 |
+| 3 | K buffer plus two-stage softmax, against production | CFG 1 vs CFG 24 |
+| 4 | two-stage softmax alone, same K buffer | CFG 11 vs CFG 24 |
 
 ```bash
+REP_TK_FWD_CFG=24 <gpu-runner> python tests/test_gpu_tk.py
 <gpu-runner> python bench_compare.py --candidate REP_TK_FWD_CFG=1 --out results/raw/aa-16k.json
-<gpu-runner> python bench_compare.py --candidate REP_TK_FWD_CFG=23 --out results/raw/cfg1-cfg23-16k.json
-<gpu-runner> python bench_compare.py --len 32768 --candidate REP_TK_FWD_CFG=22 --out results/raw/cfg1-cfg22-32k.json
-<gpu-runner> python bench_compare.py --len 49152 --candidate REP_TK_FWD_CFG=21 --out results/raw/cfg1-cfg21-48k.json
+<gpu-runner> python bench_compare.py --candidate REP_TK_FWD_CFG=24 --out results/raw/cfg1-cfg24-16k.json
+<gpu-runner> python bench_compare.py --baseline REP_TK_FWD_CFG=11 --candidate REP_TK_FWD_CFG=24 --out results/raw/cfg11-cfg24-16k.json
 ```
 
-Read `kernel.tk.bwd.C` for CFG 21/22, `kernel.tk.bwd.A` for CFG 23, and `fine_op` and `full_op` `b_direct` and F+B for
-all three. Check `multi_processor_count`: the split table assumes 132 SMs. The result that matters is measured
-fine-op and full-op F+B against the A/A displacement. Adding isolated stage times does not produce a measured total.
+Read `kernel.tk.fwd.A|B|C` and the fine and routed forward rows for the effect, with the occupancy table above for
+the trade. `one_launch.py` prints the kernel a profiler should select, since CFG 11 and 24 do not run `fwd_ker`. The
+result that matters is measured fine-op and full-op F+B against the A/A displacement.
 
 ### Full-operator forward stages
 

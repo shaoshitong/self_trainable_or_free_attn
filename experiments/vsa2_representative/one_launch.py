@@ -12,7 +12,7 @@ import json
 import os
 import sys
 import torch
-from bench_compare import active_fwd_cfg
+from bench_compare import HERE, active_fwd_cfg, fwd_kernel_name
 from vsa2_rep.ops import PHASE_A, PHASE_ALL, PHASE_B, PHASE_C, RepTiers, ext, route_tiers, tk_tables
 
 STAGES = ("fwd_native", "fwd_a", "fwd_abc", "bwd_kv", "bq_a", "bq_bc", "bq_abc",
@@ -59,7 +59,8 @@ if which.startswith("tk_"):
         fn = lambda: C.rep_tk_bwd_c(q, tab[3], tab[4], tab[5], dout, lse, delta, sel.bits_ab, qg, kgt, vgt)
     else:
         fn = fwd({"tk_fwd_abc": PHASE_ALL, "tk_fwd_b": PHASE_B, "tk_fwd_c": PHASE_C}[which])
-    kernel = {"tk_bwd_a": "bwd_attend_ker", "tk_bwd_b": "bwd_b_ker", "tk_bwd_c": "bwd_c_ker"}.get(which, "fwd_ker")
+    kernel = {"tk_bwd_a": "bwd_attend_ker", "tk_bwd_b": "bwd_b_ker", "tk_bwd_c": "bwd_c_ker"}.get(which) or \
+        fwd_kernel_name(cfg, (HERE / "csrc/rep_tk/rep_tk.cu").read_text())
 else:
     cfg, kernel = None, None
     tab = C.rep_build(k, v, blk_cnt, rm)

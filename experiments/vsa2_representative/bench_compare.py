@@ -63,7 +63,9 @@ FWD_CFGS = {
     "8": ("operator", "fwd_ker: TK-vector softmax, MINB 2, bulk tier-B gather"),
     "9": ("operator", "fwd_ker: hand-written softmax, MINB 2, bulk tier-B gather"),
     "10": ("operator", "alias of CFG1, kept so old logs stay reproducible"),
-    "11": ("operator", "negative arm, not a candidate: fwd_kdb_ker, CFG1 plus a double-buffered K tile; V unchanged"),
+    "11": ("operator", "measured negative arm, not a candidate: fwd_kdb_ker, CFG1 plus a double-buffered K tile; V unchanged"),
+    "24": ("operator", "CFG11's K-double-buffered kernel plus a two-stage softmax: the next tile's QK is issued "
+                       "before the current softmax finishes"),
     "13": ("operator", "alias of CFG1 since the num_splits_heuristic split became the default"),
     "20": ("operator", "the pre-round-4 forward: per-slot cp.async.bulk tier-B gather; CFG1's backward"),
     "21": ("operator", "CFG1 forward; tier-C backward split by the old wave policy"),
@@ -82,6 +84,7 @@ PROFILES = {
 }
 BACKWARD_ARMS = {"21": "C", "22": "C", "23": "A"}  # the only backward tier each one's setting reaches
 ALIASES = ("1", "10", "13")  # no dispatch line of their own needed
+OWN_FORWARD = ("20", "24")  # meaningless if they launch the default kernel
 FORWARD_EQUAL = {*ALIASES, *BACKWARD_ARMS}  # one forward kernel by definition; see forward_must_match
 BACKWARD_READ_ROWS = ("kernel.tk.bwd.A", "kernel.tk.bwd.C", "fine_op.tk.A|B|C.b_direct", "full_op.tk.routed.b_direct",
                       "fine_op.tk.A|B|C.f_plus_b", "full_op.tk.routed.f_plus_b")
@@ -108,7 +111,7 @@ def fwd_dispatch(source):
         return {}
     kernel = r"launch\((rep_tk::\w+<[^;]*?>)\)"
     table = dict(re.findall(rf"cfg == (\d+)[^\n]*?\)\s*{kernel}", body.group(0)))
-    table.update(re.findall(r"cfg == (\d+)\)\s*\{[^}]*?(rep_tk::\w+<[^;,]*?>)", body.group(0)))  # a braced branch
+    table.update(re.findall(r"cfg == (\d+)\)\s*\{[^}]*?(rep_tk::\w+<[^;()]*?>)", body.group(0)))  # a braced branch
     default = re.search(rf"else {kernel};", body.group(0))
     return dict(table, default=default.group(1)) if default else {}
 
@@ -129,14 +132,22 @@ def cfg_error(value, source):
     # config. Checking that token keeps the guard honest instead of exempting the arm outright.
     if value in BACKWARD_ARMS and not re.search(rf"rep_cfg\(\) == {value}\b", source):
         return f"REP_TK_FWD_CFG={value} is not implemented by the backward path"
-    if value in ("10", "13", "20", *BACKWARD_ARMS):
+    if value in ("10", "13", *OWN_FORWARD, *BACKWARD_ARMS):
         table = fwd_dispatch(source)
         if not table:
             return f"cannot read the forward dispatch to check REP_TK_FWD_CFG={value}"
         same = table.get(value, table["default"]) == table["default"]
-        if same != (value != "20"):
+        if same != (value not in OWN_FORWARD):
             return f"REP_TK_FWD_CFG={value} launches {table.get(value, table['default'])}, default {table['default']}"
+    if value == "24" and fwd_dispatch(source).get("24") == fwd_dispatch(source).get("11"):
+        return "REP_TK_FWD_CFG=24 launches the same kernel as CFG11, without the two-stage softmax"
     return None
+
+
+def fwd_kernel_name(value, source):
+    """The kernel a profiler should select for this value's forward, without its template arguments."""
+    table = fwd_dispatch(source)
+    return re.match(r"rep_tk::(\w+)", table.get(value, table["default"])).group(1)
 
 
 def forward_must_match(configs):
