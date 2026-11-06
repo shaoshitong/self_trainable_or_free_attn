@@ -36,9 +36,6 @@ fc = T(lambda: C.rep_tk_fwd(q, k, v, tab, sel.q2k_ptr, sel.q2k_idx, sel.b_ptr, s
 nbt = ((sel.b_ptr[..., 1:] - sel.b_ptr[..., :-1]).float() / (64 // rm)).ceil().mean().item()
 print(f"  B only {fb:.3f} ms ({nbt:.2f} tiles/qblock -> {fb/nbt*1e3:.1f} us per tile-per-qblock)"
       f"   C only {fc:.3f} ms (4 tiles -> {fc/4*1e3:.1f})   A tile {fa/25.6*1e3:.1f}")
-if cfg_name in ("11", "24"):
-    print("  diag rows skipped: the K-double-buffered kernel does not read diag")
-    raise SystemExit
 BULK_GATHER = ("0", "6", "8", "9", "20")  # diag 2 and 4 select bulk-copy variants, which apply only to these
 dg_rows = ((1, "B: no bias loads"),)
 if cfg_name in BULK_GATHER:

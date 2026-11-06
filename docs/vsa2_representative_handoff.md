@@ -365,7 +365,9 @@ from a build containing CFG 20.
 | 22 | CFG 1 forward; tier-C backward split forced to 4 | as CFG 1 | 3 | as CFG 1 | as CFG 1 | as CFG 1 |
 | 23 | CFG 1 forward; tier-A backward `__launch_bounds__(128, 3)` probe | as CFG 1 | 3 | as CFG 1 | as CFG 1 | as CFG 1 |
 | 11 | measured negative arm: `fwd_kdb_ker`, CFG 1 plus a double-buffered K tile | TK vector | 3 | `cp.async` | not recorded here | not recorded here |
-| 24 | CFG 11's kernel plus a two-stage softmax: the next tile's QK is issued before the current softmax finishes | TK vector | not built yet | `cp.async` | not built yet | not built yet |
+| 24 | measured negative arm: `fwd_pipe_ker`, CFG 11's K double buffer plus a two-stage softmax, the next tile's QK issued before the current softmax finishes | TK vector | 2 | `cp.async` | not recorded here | not recorded here |
+| 32 | two-CTA arm: K and V both double-buffered | TK vector | not built yet | not built yet | not built yet | not built yet |
+| 33 | two-CTA arm: K and V both triple-buffered | TK vector | not built yet | not built yet | not built yet | not built yet |
 | 20 | the pre-round-4 forward, with CFG 1's backward | TK vector | 3 | bulk | 168 | 24 |
 | 6 | `fwd_ker`, all tiers; a softmax pair with CFG 20 | hand-written | 3 | bulk | 168 | 16 |
 | 8 | `fwd_ker`, all tiers | TK vector | 2 | bulk | not recorded here | not recorded here |
@@ -379,8 +381,9 @@ from a build containing CFG 20.
 
 CFG 2/3 use their `A_ONLY` kernel only for `phases=A`; other phases run the default kernel. CFG 0/6/8/9/20 keep the
 bulk gather, so CFG 6 is a softmax-only pair with CFG 20, not with CFG 1. `settings.fwd_kernels_in_source` records
-the launched template. CFG 24 is refused until the kernel source dispatches on it, and it must launch something
-other than the default or CFG 11's kernel. CFG 21/22/23 are measured negative or neutral arms; see H100 status.
+the launched template. CFG 24, 32 and 33 must launch something other than the default or an earlier arm's kernel.
+CFG 32 and 33 are refused until the kernel source dispatches on them, and also if the launched kernel's
+`__launch_bounds__` does not say 2. CFG 21/22/23 are measured negative or neutral arms; see H100 status.
 
 Occupancy of the forward arms, D=128. Fill the `not built yet` cells from the build's `ptxas` output:
 
@@ -388,13 +391,29 @@ Occupancy of the forward arms, D=128. Fill the `not built yet` cells from the bu
 |---:|---:|---|---:|---:|---:|---:|
 | 1 | 166 | no | 50,176 B | 3 | 4 | 3 |
 | 11 | not recorded here | not recorded here | 66,560 B | 3, while `__launch_bounds__(128, 3)` | 3 | 3 |
-| 24 | not built yet | not built yet | not built yet | not built yet | not built yet | not built yet |
+| 24 | not recorded here | not recorded here | 66,560 B | not recorded here | 3 | 3, as reported in round 7 |
+| 32 | not built yet | not built yet | at least 81,920 B | not built yet | 2 | 2 |
+| 33 | not built yet | not built yet | at least 114,688 B | not built yet | 2 | 2 |
 
 These limits are derived, not measured, and the implied figure is the smaller of the two. The register limit is 4
 CTAs/SM up to 128 registers, 3 up to 168 and 2 up to 255, the caps stated in the kernel's comments. The shared-memory
-limit takes about 227 KB per SM, which agrees with round 6: 113,000 B allows 2. `__launch_bounds__(128, 3)` makes the
-compiler stay within 168 registers, so pressure there shows as spills, as in CFG 20. A kernel only reaches 2 CTAs/SM
-through registers if it is launched with a bound of 2, which is why CFG 24 needs its bound read alongside its count.
+limit divides 232,448 B per SM by the kernel's allocation, which agrees with round 6: 113,000 B allows 2.
+`__launch_bounds__(128, 3)` makes the compiler stay within 168 registers, so pressure there shows as spills, as in
+CFG 20. A bound of 2 allows up to 255 registers without forcing 2 CTAs/SM, and resident occupancy then follows the
+register count: CFG 24 is written with a bound of 2 and its source comment says 2 CTAs/SM, yet it was reported at 3.
+It stays at 3 only if its `ptxas` count is at most 168, which is not recorded here.
+
+CFG 32 and 33 are two-CTA kernels, not three-CTA arms. Their shared memory, with a 16 KB tile of 64 x 128 bf16:
+
+| CFG | Q + K + V tiles per CTA | Per CTA | At 2 CTAs/SM | Limit |
+|---:|---|---:|---:|---:|
+| 32 | 16 + 32 + 32 | 80 KB | 160 KB | 232,448 B |
+| 33 | 16 + 48 + 48 | 112 KB | 224 KB (229,376 B) | 232,448 B |
+
+These KB are 1,024 B. CFG 33 leaves 3,072 B per SM, or 1,536 B per CTA, for alignment slack and static shared memory.
+The other kernels use 1,024 B of slack and report 32 B of static shared memory, which would fit. An allocation of more
+than 116,224 B per CTA would leave room for only one CTA/SM, and the run would measure that instead of the third stage,
+so check CFG 33's allocation before reading its timing.
 
 `REP_TK_BWDC_SPLITS=<positive>` forces the tier-C split and `REP_TK_BWDC_SPLITS=wave` selects the old policy. At
 D=128, B=1, H=16 and 132 SMs, read from the kernel's formulas, many pairs of policies coincide, so a comparison
@@ -546,27 +565,34 @@ three split policies choose 4 at 132 SMs, so this says nothing about 32K or 48K.
 1.350 and `kernel.tk.bwd.A` 1.874, because that kernel's 113,000 B of dynamic shared memory already limits it to 2
 CTAs/SM whatever the register count.
 
-Next matrix, 16K/H16/D128/RM4, on one build containing CFG 24. CFG 24 is a forward change, so its forward rows may
-differ from CFG 1 and `forward_outputs_byte_identical` is only reported. It still needs the generic cross-check
-that `bench_compare.py` runs, and the TK suite under it.
+Round 7: CFG 24 was reported to keep 3 CTAs/SM and was 29% slower on the forward kernel, a measured negative. Reading
+that as free of any occupancy effect depends on its register count; see the occupancy note above.
+
+Next matrix, 16K/H16/D128/RM4, on one build containing CFG 32 and 33. Both are forward changes, so their forward rows
+may differ from CFG 1 and `forward_outputs_byte_identical` is only reported. Both still need the generic cross-check
+that `bench_compare.py` runs, and the TK suite under each. CFG 1 vs either one changes occupancy and buffering
+together, which is the net trade being asked about; only CFG 32 vs CFG 33 compares two-CTA kernels.
 
 | # | Purpose | Run |
 |---:|---|---|
-| 1 | correctness | CPU and generic suites; TK suite with CFG 1 and with CFG 24 |
+| 1 | correctness | CPU and generic suites; TK suite with CFG 1, CFG 32 and CFG 33 |
 | 2 | noise floor | CFG 1 vs CFG 1 |
-| 3 | K buffer plus two-stage softmax, against production | CFG 1 vs CFG 24 |
-| 4 | two-stage softmax alone, same K buffer | CFG 11 vs CFG 24 |
+| 3 | two stages at 2 CTAs/SM, against production | CFG 1 vs CFG 32 |
+| 4 | three stages at 2 CTAs/SM, against production | CFG 1 vs CFG 33 |
+| 5 | the third stage alone | CFG 32 vs CFG 33 |
 
 ```bash
-REP_TK_FWD_CFG=24 <gpu-runner> python tests/test_gpu_tk.py
+REP_TK_FWD_CFG=32 <gpu-runner> python tests/test_gpu_tk.py
+REP_TK_FWD_CFG=33 <gpu-runner> python tests/test_gpu_tk.py
 <gpu-runner> python bench_compare.py --candidate REP_TK_FWD_CFG=1 --out results/raw/aa-16k.json
-<gpu-runner> python bench_compare.py --candidate REP_TK_FWD_CFG=24 --out results/raw/cfg1-cfg24-16k.json
-<gpu-runner> python bench_compare.py --baseline REP_TK_FWD_CFG=11 --candidate REP_TK_FWD_CFG=24 --out results/raw/cfg11-cfg24-16k.json
+<gpu-runner> python bench_compare.py --candidate REP_TK_FWD_CFG=32 --out results/raw/cfg1-cfg32-16k.json
+<gpu-runner> python bench_compare.py --candidate REP_TK_FWD_CFG=33 --out results/raw/cfg1-cfg33-16k.json
+<gpu-runner> python bench_compare.py --baseline REP_TK_FWD_CFG=32 --candidate REP_TK_FWD_CFG=33 --out results/raw/cfg32-cfg33-16k.json
 ```
 
-Read `kernel.tk.fwd.A|B|C` and the fine and routed forward rows for the effect, with the occupancy table above for
-the trade. `one_launch.py` prints the kernel a profiler should select, since CFG 11 and 24 do not run `fwd_ker`. The
-result that matters is measured fine-op and full-op F+B against the A/A displacement.
+Read `kernel.tk.fwd.A|B|C` and the fine and routed forward rows for the effect, with the occupancy tables above for
+the trade. `one_launch.py` prints the kernel a profiler should select. The result that matters is measured fine-op
+and full-op F+B against the A/A displacement.
 
 ### Full-operator forward stages
 

@@ -64,8 +64,10 @@ FWD_CFGS = {
     "9": ("operator", "fwd_ker: hand-written softmax, MINB 2, bulk tier-B gather"),
     "10": ("operator", "alias of CFG1, kept so old logs stay reproducible"),
     "11": ("operator", "measured negative arm, not a candidate: fwd_kdb_ker, CFG1 plus a double-buffered K tile; V unchanged"),
-    "24": ("operator", "CFG11's K-double-buffered kernel plus a two-stage softmax: the next tile's QK is issued "
-                       "before the current softmax finishes"),
+    "24": ("operator", "measured negative arm: fwd_pipe_ker, CFG11's K double buffer plus a two-stage softmax, the "
+                       "next tile's QK issued before the current softmax finishes"),
+    "32": ("operator", "two CTAs per SM: K and V both double-buffered, 80 KB of tiles per CTA"),
+    "33": ("operator", "two CTAs per SM: K and V both triple-buffered, 112 KB of tiles per CTA, 224 KB per SM"),
     "13": ("operator", "alias of CFG1 since the num_splits_heuristic split became the default"),
     "20": ("operator", "the pre-round-4 forward: per-slot cp.async.bulk tier-B gather; CFG1's backward"),
     "21": ("operator", "CFG1 forward; tier-C backward split by the old wave policy"),
@@ -84,7 +86,9 @@ PROFILES = {
 }
 BACKWARD_ARMS = {"21": "C", "22": "C", "23": "A"}  # the only backward tier each one's setting reaches
 ALIASES = ("1", "10", "13")  # no dispatch line of their own needed
-OWN_FORWARD = ("20", "24")  # meaningless if they launch the default kernel
+OWN_FORWARD = ("20", "24", "32", "33")  # meaningless if they launch the default kernel
+DISTINCT_FROM = {"24": ("11",), "32": ("11", "24"), "33": ("11", "24", "32")}  # nor if they repeat an earlier arm
+TWO_CTA = ("32", "33")  # their tiles leave no room for a third CTA; see launch_bound
 FORWARD_EQUAL = {*ALIASES, *BACKWARD_ARMS}  # one forward kernel by definition; see forward_must_match
 BACKWARD_READ_ROWS = ("kernel.tk.bwd.A", "kernel.tk.bwd.C", "fine_op.tk.A|B|C.b_direct", "full_op.tk.routed.b_direct",
                       "fine_op.tk.A|B|C.f_plus_b", "full_op.tk.routed.f_plus_b")
@@ -139,9 +143,21 @@ def cfg_error(value, source):
         same = table.get(value, table["default"]) == table["default"]
         if same != (value not in OWN_FORWARD):
             return f"REP_TK_FWD_CFG={value} launches {table.get(value, table['default'])}, default {table['default']}"
-    if value == "24" and fwd_dispatch(source).get("24") == fwd_dispatch(source).get("11"):
-        return "REP_TK_FWD_CFG=24 launches the same kernel as CFG11, without the two-stage softmax"
+    table = fwd_dispatch(source)
+    for other in DISTINCT_FROM.get(value, ()):
+        if table.get(value) == table.get(other):
+            return f"REP_TK_FWD_CFG={value} launches the same kernel as CFG{other}"
+    if value in TWO_CTA and launch_bound(table.get(value), source) != "2":
+        return f"REP_TK_FWD_CFG={value} is a two-CTA arm; {table.get(value)} has launch bound " \
+               f"{launch_bound(table.get(value), source)}"
     return None
+
+
+def launch_bound(kernel, source):
+    """The minimum blocks in `kernel`'s __launch_bounds__, as written in the source, or None."""
+    name = re.match(r"rep_tk::(\w+)", kernel or "")
+    found = name and re.search(rf"__launch_bounds__\(\s*\d+\s*,\s*([^)]*?)\s*\)\s*void\s+{name.group(1)}\b", source)
+    return found.group(1) if found else None
 
 
 def fwd_kernel_name(value, source):

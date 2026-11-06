@@ -37,11 +37,11 @@ def test_configs_keep_their_semantics():
         {"REP_TK_FWD_CFG": "1", "REP_TK_BWDC_SPLITS": "8"}
     for cfg in "23457":
         assert rejected(f"REP_TK_FWD_CFG={cfg}", "representative"), "a diagnostic passed as production"
-    for cfg in ("0", "1", "2", "6", "8", "9", "10", "11", "13", "20", "21", "22", "23", "24"):
+    for cfg in ("0", "1", "2", "6", "8", "9", "10", "11", "13", "20", "21", "22", "23", "24", "32", "33"):
         assert rejected(f"REP_TK_FWD_CFG={cfg}", "controlled-softmax"), "only CFG 4/5/7 are this diagnostic"
     for cfg in "457":
         assert parse_config(f"REP_TK_FWD_CFG={cfg}", "controlled-softmax")
-    for cfg in ("8", "9", "10", "11", "13", "20", "21", "22", "23", "24"):
+    for cfg in ("8", "9", "10", "11", "13", "20", "21", "22", "23", "24", "32", "33"):
         assert parse_config(f"REP_TK_FWD_CFG={cfg}", "representative")
     assert rejected("REP_TK_FWD_CFG=25", "representative"), "the kernel would silently run its default path"
     assert parse_config("REP_TK_FWD_CFG=1,REP_TK_BWDC_SPLITS=wave", "representative"), "the kernel accepts wave"
@@ -116,6 +116,31 @@ def test_two_stage_arm_is_its_own_forward():
     assert assemble({}, "representative", pair, [], [a, b])["claims"]["output_validated"] is False, "the generic check still gates it"
     assert arms_error({"baseline": {"REP_TK_FWD_CFG": "24"}, "candidate": {"REP_TK_FWD_CFG": "21"}}), "two variables"
     assert arms_error({"baseline": {"REP_TK_FWD_CFG": "11"}, "candidate": {"REP_TK_FWD_CFG": "24"}}) is None
+
+
+def deep(*branches, bound="2"):
+    return kernel(BULK, *branches) + f"__global__ __launch_bounds__(128, {bound}) void fwd_deep_ker(const G g) {{}}\n"
+
+
+def test_deep_pipeline_arms_are_two_cta_forwards():
+    two = "(cfg == 32) {\n    rep_tk::fwd_deep_ker<D, 2><<<g>>>(x);\n  }"
+    three = "(cfg == 33) {\n    rep_tk::fwd_deep_ker<D, 3><<<g>>>(x);\n  }"
+    assert cfg_error("32", deep(two, three)) is None and cfg_error("33", deep(two, three)) is None
+    assert fwd_kernel_name("33", deep(two, three)) == "fwd_deep_ker"
+    assert cfg_error("33", deep(two)), "must not pass before the kernel has it"
+    assert cfg_error("33", deep(two, "(cfg == 33) {\n    rep_tk::fwd_deep_ker<D, 2><<<g>>>(x);\n  }")), "CFG32 again"
+    assert cfg_error("32", deep("(cfg == 32) launch(rep_tk::fwd_ker<D, 3, false, false, true>);")), "the default"
+    assert "launch bound 3" in cfg_error("32", deep(two, three, bound="3")), "a three-CTA kernel under a two-CTA label"
+    assert cfg_error("32", kernel(BULK, two)), "a bound that cannot be read must not pass"
+    for value in ("32", "33"):
+        pair = {"baseline": {"REP_TK_FWD_CFG": "1"}, "candidate": {"REP_TK_FWD_CFG": value}}
+        assert not forward_must_match(pair) and arms_error(pair) is None
+        a, b = child("baseline", 1), child("candidate", 1)
+        a["forward_output"], b["forward_output"] = {"B": dict(o="x")}, {"B": dict(o="y")}
+        assert assemble({}, "representative", pair, [], [a, b])["status"] == "ok", "their forward may differ"
+        b["output_check"] = [dict(name="o", ok=False)]
+        assert assemble({}, "representative", pair, [], [a, b])["claims"]["output_validated"] is False
+    assert arms_error({"baseline": {"REP_TK_FWD_CFG": "33"}, "candidate": {"REP_TK_FWD_CFG": "21"}}), "two variables"
 
 
 def test_backward_arm_is_single_variable():
@@ -252,6 +277,7 @@ if __name__ == "__main__":
     test_standalone_scripts_see_what_runs()
     test_arm_meanings_hold_in_the_source()
     test_two_stage_arm_is_its_own_forward()
+    test_deep_pipeline_arms_are_two_cta_forwards()
     test_backward_arm_is_single_variable()
     test_backward_arm_reaches_only_its_tier()
     test_forward_change_under_backward_arm_is_invalid()
