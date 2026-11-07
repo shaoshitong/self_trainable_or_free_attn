@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <cstdlib>
 #include <cmath>
 #include <map>
 #include <string>
@@ -32,6 +33,14 @@ void vsa2_tk_fine_bwd(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::
 using namespace vsa2;
 
 namespace {
+
+// ECHOSPARSE_VSA_FUSED_COLS=1 (off by default): the global top-k builds its kv->q CSR with one kernel instead of
+// topk_cols / topk_colscan / topk_cols (launch_global_topk's fused_cols; integers only, bit-identical lists).
+// Read per call so the two paths can be compared in one process.
+bool fused_cols_enabled() {
+  const char* e = std::getenv("ECHOSPARSE_VSA_FUSED_COLS");
+  return e != nullptr && e[0] == '1' && e[1] == '\0';
+}
 
 #define CHECK_DEV(x) TORCH_CHECK((x).is_cuda() && (x).is_contiguous(), #x " must be a contiguous CUDA tensor")
 #define CHECK_I32(x) TORCH_CHECK((x).is_cuda() && (x).is_contiguous() && (x).scalar_type() == torch::kInt32, \
@@ -157,7 +166,7 @@ void global_topk_into(torch::Tensor scores, int64_t budget, int64_t bh0, torch::
   topk_carve_workspace(ws.data_ptr(), bhc, NB, &w);
   TopkParams p{scores.data_ptr<float>(), NB, (int)bh0, bhc, budget, q2k_ptr.data_ptr<int>(),
                q2k_idx.data_ptr<int>(), k2q_ptr.data_ptr<int>(), k2q_idx.data_ptr<int>()};
-  launch_global_topk(p, w, cur_stream());
+  launch_global_topk(p, w, cur_stream(), fused_cols_enabled());
   check_launch();
 }
 
@@ -193,6 +202,7 @@ std::vector<torch::Tensor> route(torch::Tensor qr, torch::Tensor kr, torch::Tens
   auto ws = torch::empty({(long long)topk_workspace_bytes(chunk, NB)}, qr.options().dtype(torch::kUInt8));
   TopkWorkspace w;
   topk_carve_workspace(ws.data_ptr(), chunk, NB, &w);
+  const bool fused_cols = fused_cols_enabled();
   for (int bh0 = 0; bh0 < BH; bh0 += chunk) {
     int cnt = std::min(chunk, BH - bh0);
     p.scores = scores.data_ptr<float>();
@@ -201,7 +211,7 @@ std::vector<torch::Tensor> route(torch::Tensor qr, torch::Tensor kr, torch::Tens
     launch_router_scores(p, D, dtype_of(qr), cur_stream());
     TopkParams tp{scores.data_ptr<float>(), NB, bh0, cnt, budget, q2k_ptr.data_ptr<int>(),
                   q2k_idx.data_ptr<int>(), k2q_ptr.data_ptr<int>(), k2q_idx.data_ptr<int>()};
-    launch_global_topk(tp, w, cur_stream());
+    launch_global_topk(tp, w, cur_stream(), fused_cols);
     check_launch();
   }
   return {q2k_ptr, q2k_idx, k2q_ptr, k2q_idx};
@@ -759,10 +769,14 @@ std::vector<torch::Tensor> tk_fine_fwd_tasks(torch::Tensor q, torch::Tensor k, t
 }
 
 static void check_tk_bwd_opts(int64_t opts) {
-  TORCH_CHECK(opts >= 0 && opts <= 7, "TK backward opts are bits 1 (dQ read-wait), 2 (rotate), 4 (skip dQ, diagnostic)");
+  // Bit 8 (kMinb3, a launch-bound probe of the representative experiment) is not exposed here.
+  TORCH_CHECK(opts >= 0 && (opts & ~int64_t(1 | 2 | 4 | 16)) == 0,
+              "TK backward opts are bits 1 (dQ read-wait), 2 (rotate), 4 (skip dQ, diagnostic), "
+              "16 (single-writer dK/dV store; unsplit launch only)");
 }
 
-// TK fine backward over planned k2q tasks; split chunks reduce-add into the same fp32 accumulators.
+// TK fine backward over planned k2q tasks; split chunks reduce-add into the same fp32 accumulators. The kernel
+// ignores bit 16 here (several tasks can own one kv block), so kg / vg must be zeroed for every option.
 void tk_fine_bwd_tasks(torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor dout_f, torch::Tensor lse,
                        torch::Tensor delta, torch::Tensor col_idx, torch::Tensor blk_cnt, torch::Tensor tasks,
                        torch::Tensor info, torch::Tensor qg, torch::Tensor kg, torch::Tensor vg, int64_t opts) {

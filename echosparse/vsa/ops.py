@@ -18,6 +18,16 @@ Preblocked layout contract (layout.py builds it from real tokens):
   gate    : optional pre-activation, [B, H, L] (per token/head, VSA2) or
             [B, H, L, D] (per element, original VSA). O = O_f + act(gate) * O_c.
   blk_cnt : int32 [NB], 1..64 valid tokens per block.
+
+Opt-in speed toggles (environment, read per call; each one off by default, "1" turns it on):
+  ECHOSPARSE_VSA_COARSE_META_CACHE  reuse the coarse branch's shape-only CSR metadata across calls of
+                                    the same (B, H, NB) instead of rebuilding it every forward. Exact.
+  ECHOSPARSE_VSA_FUSED_COLS         the router's kv->q CSR column stage as one kernel instead of three
+                                    (csrc/vsa/router/topk.cu, fused_cols). Integers only, bit-identical.
+  ECHOSPARSE_VSA_TK_BWD_STORE       adds TK_BWD_STORE_KV (16) to the TK backward options: on the unsplit
+                                    path each kv block's single owner CTA stores its dK/dV instead of
+                                    reduce-adding into zeroed accumulators, which are then allocated
+                                    uninitialised. dQ unchanged; dK/dV may differ only in the sign of zero.
 """
 
 from __future__ import annotations
@@ -36,9 +46,17 @@ _bwd_override: Optional[int] = None
 _tk_bwd_opts: Optional[int] = None
 
 # TK backward options (fine_tk_h100.cu): 1 = dQ reduce-add waits only for the shared-memory read, 2 = rotated
-# k2q walk start. 0 is the original kernel. Bit 4 (skip dQ) is a diagnostic of the raw binding only.
-TK_BWD_OPTS = (0, 1, 2, 3)
+# k2q walk start, 16 = single-writer dK/dV store (TK_BWD_STORE_KV). 0 is the original kernel. Bit 4 (skip dQ)
+# is a diagnostic of the raw binding only, bit 8 (launch-bound probe) is not exposed.
+TK_BWD_STORE_KV = 16
+TK_BWD_OPTS = (0, 1, 2, 3, 16, 17, 18, 19)
 TK_BWD_OPTS_ENV = "ECHOSPARSE_VSA_TK_BWD_OPTS"
+TK_BWD_STORE_ENV = "ECHOSPARSE_VSA_TK_BWD_STORE"
+COARSE_META_CACHE_ENV = "ECHOSPARSE_VSA_COARSE_META_CACHE"
+
+
+def _env_on(name: str) -> bool:
+    return os.environ.get(name) == "1"
 
 
 def ext():
@@ -116,6 +134,25 @@ def _coarse_meta(B: int, H: int, nb: int, nbc_pad: int, device) -> Tuple[torch.T
     return cnt.contiguous(), ptr, idx
 
 
+_COARSE_META_CACHE = {}
+
+
+def _coarse_meta_for(B: int, H: int, nb: int, nbc_pad: int, device):
+    """_coarse_meta, reused per shape and device when ECHOSPARSE_VSA_COARSE_META_CACHE=1 (off by default).
+
+    The three tensors depend only on (B, H, nb, nbc_pad) and are only read (attn_fwd / attn_bwd), so one copy
+    serves every call of a shape; rebuilding them is a handful of small launches inside each forward.
+    """
+    if not _env_on(COARSE_META_CACHE_ENV):
+        return _coarse_meta(B, H, nb, nbc_pad, device)
+    key = (B, H, nb, nbc_pad, str(device))
+    hit = _COARSE_META_CACHE.get(key)
+    if hit is None:
+        hit = _coarse_meta(B, H, nb, nbc_pad, device)
+        _COARSE_META_CACHE[key] = hit
+    return hit
+
+
 def resolve_backend(backend: str, q: torch.Tensor) -> bool:
     """Returns True when the SM90 ThunderKittens fine kernels should be used."""
     C = ext()
@@ -132,7 +169,8 @@ def resolve_backend(backend: str, q: torch.Tensor) -> bool:
 
 
 def set_tk_bwd_opts(v: Optional[int]) -> None:
-    """Process-wide TK backward options (TK_BWD_OPTS); None restores ECHOSPARSE_VSA_TK_BWD_OPTS, default 0."""
+    """Process-wide TK backward options (TK_BWD_OPTS); None restores the environment (ECHOSPARSE_VSA_TK_BWD_OPTS,
+    default 0, plus TK_BWD_STORE_KV when ECHOSPARSE_VSA_TK_BWD_STORE=1). An explicit value is used as given."""
     global _tk_bwd_opts
     if v is not None and v not in TK_BWD_OPTS:
         raise ValueError(f"set_tk_bwd_opts must be one of {TK_BWD_OPTS}, got {v!r}")
@@ -143,15 +181,27 @@ def resolve_tk_bwd_opts() -> int:
     if _tk_bwd_opts is not None:
         return _tk_bwd_opts
     env = os.environ.get(TK_BWD_OPTS_ENV)
-    if env is None:
-        return 0
-    try:
-        v = int(env)
-    except ValueError:
-        v = -1
-    if v not in TK_BWD_OPTS:
-        raise ValueError(f"{TK_BWD_OPTS_ENV} must be one of {TK_BWD_OPTS}, got {env!r}")
-    return v
+    v = 0
+    if env is not None:
+        try:
+            v = int(env)
+        except ValueError:
+            v = -1
+        if v not in TK_BWD_OPTS:
+            raise ValueError(f"{TK_BWD_OPTS_ENV} must be one of {TK_BWD_OPTS}, got {env!r}")
+    return v | (TK_BWD_STORE_KV if _env_on(TK_BWD_STORE_ENV) else 0)
+
+
+def _tk_kv_accumulators(q: torch.Tensor, opts: int, split) -> Tuple[torch.Tensor, torch.Tensor]:
+    """fp32 dK/dV accumulators for the TK backward. Uninitialised only when the kernel will store every row:
+    TK_BWD_STORE_KV on the unsplit k2q launch, where the grid is (NB, H, B) and the kernel is MHA, so each
+    (b, h, kv block) has exactly one owner CTA, which stores its tiles or, with an empty list, zeros. The
+    split (task) launch can give one kv block several CTAs; the kernel ignores the bit there and reduce-adds,
+    so its accumulators stay zeroed."""
+    store = bool(opts & TK_BWD_STORE_KV) and (split is None or not split.bwd)
+    alloc = torch.empty if store else torch.zeros
+    return (alloc(q.shape, device=q.device, dtype=torch.float32),
+            alloc(q.shape, device=q.device, dtype=torch.float32))
 
 
 def set_bwd_variant(v: Optional[int]) -> None:
@@ -358,7 +408,8 @@ def tk_split_fine_fwd(C, q, k, v, q2k_ptr, q2k_idx, blk_cnt, split: SplitKV):
 
 def tk_fine_bwd(C, q, k, v, dout_f, lse, delta, k2q_ptr, k2q_idx, blk_cnt, qg, kg, vg, split: Optional[SplitKV],
                 opts: int = 0):
-    """TK fine backward into zeroed fp32 accumulators, unsplit or over a k2q split plan (no partial memory)."""
+    """TK fine backward, unsplit or over a k2q split plan (no partial memory). qg is zeroed; kg / vg come from
+    _tk_kv_accumulators (zeroed unless the unsplit TK_BWD_STORE_KV path stores every row)."""
     if split is None or not split.bwd:
         return C.tk_fine_bwd(q, k, v, dout_f, lse, delta, k2q_ptr, k2q_idx, blk_cnt, qg, kg, vg, opts)
     tasks, _, info, _ = split_plan_for(C, q, k2q_ptr, k2q_idx, split, True, "bwd_kv", None)
@@ -438,7 +489,7 @@ class _Function(torch.autograd.Function):
         B, H, L, D = q.shape
         nb = L // 64
         qr, kr, qc, kc, vc = C.pool_fwd(q, k, v, blk_cnt, R)
-        c_cnt, c_ptr, c_idx = _coarse_meta(B, H, nb, qc.shape[2], q.device)
+        c_cnt, c_ptr, c_idx = _coarse_meta_for(B, H, nb, qc.shape[2], q.device)
         oc, lse_c = C.attn_fwd(qc, kc, vc, c_ptr, c_idx, c_cnt, False)
         if sel_in is None and router[0] == "rows":
             q2k_ptr, q2k_idx, k2q_ptr, k2q_idx = C.route_rows(qc, kc, nb, router[1], max_score_bytes)
@@ -484,8 +535,7 @@ class _Function(torch.autograd.Function):
         # fine branch on the exact forward selection, + coarse unpooling
         if ctx.use_tk:
             dq_acc = torch.zeros(q.shape, device=q.device, dtype=torch.float32)
-            dk_acc = torch.zeros(q.shape, device=q.device, dtype=torch.float32)
-            dv_acc = torch.zeros(q.shape, device=q.device, dtype=torch.float32)
+            dk_acc, dv_acc = _tk_kv_accumulators(q, ctx.tk_bwd_opts, ctx.split)
             tk_fine_bwd(C, q, k, v, dout_f, lse_f, delta_f, k2q_ptr, k2q_idx, blk_cnt, dq_acc, dk_acc, dv_acc,
                         ctx.split, ctx.tk_bwd_opts)
             dk = C.finalize(dk_acc, dkc, blk_cnt, k)
@@ -605,8 +655,7 @@ class _FineFunction(torch.autograd.Function):
             dout_f = dout
         if ctx.use_tk:
             dq_acc = torch.zeros(q.shape, device=q.device, dtype=torch.float32)
-            dk_acc = torch.zeros_like(dq_acc)
-            dv_acc = torch.zeros_like(dq_acc)
+            dk_acc, dv_acc = _tk_kv_accumulators(q, ctx.tk_bwd_opts, ctx.split)
             tk_fine_bwd(C, q, k, v, dout_f, lse, delta_f, kp, ki, blk_cnt, dq_acc, dk_acc, dv_acc, ctx.split,
                         ctx.tk_bwd_opts)
             dk = C.finalize(dk_acc, None, blk_cnt, k)

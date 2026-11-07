@@ -471,13 +471,13 @@ def test_tk_split_forward_deterministic():
 # --------------------------------------------------------------------------- TK backward options (H100)
 
 
-@pytest.mark.parametrize("opts", [1, 2, 3])
+@pytest.mark.parametrize("opts", [1, 2, 3, 16, 19])
 @pytest.mark.parametrize("mask_kind", ["random", "hotkv", "hotqkv"])
 @pytest.mark.parametrize("chunk", [None, 2])
 @pytest.mark.parametrize("D", [64, 128])
 def test_tk_bwd_opts(opts, mask_kind, chunk, D):
-    """dQ read-wait / rotated k2q walk (unsplit and split): same operator; O and all grads vs the oracle and vs
-    opts=0 on the same mask."""
+    """dQ read-wait / rotated k2q walk / single-writer dK/dV store (unsplit and split): same operator; O and all
+    grads vs the oracle and vs opts=0 on the same mask."""
     _need_tk()
     gen = torch.Generator().manual_seed(71 + D)
     B, H, nb = 2, 2, 12
@@ -503,6 +503,11 @@ def test_tk_bwd_opts(opts, mask_kind, chunk, D):
     for n, a, b in zip(["dq", "dk", "dv", "dgate"], grads, res[0][1]):
         check(f"tk_opts_vs_opts0_{n}", a, b, 2e-2, opts=opts, mask_kind=mask_kind, chunk=chunk, D=D)
     assert torch.equal(o, res[0][0]), "the options change only the backward"
+    if opts == ops.TK_BWD_STORE_KV:
+        # a plain store of each owner's dK/dV equals 0 + x, so every gradient matches opts=0 exactly up to the
+        # sign of zero (== treats -0 and +0 as equal); split launches ignore the bit and reduce-add into zeros
+        for n, a, b in zip(["dq", "dk", "dv", "dgate"], grads, res[0][1]):
+            assert (a == b).all(), f"store path changed {n}"
 
 
 def test_tk_bwd_opts_precedence_and_checks(monkeypatch):
@@ -522,6 +527,20 @@ def test_tk_bwd_opts_precedence_and_checks(monkeypatch):
             ops.resolve_tk_bwd_opts()
     with pytest.raises(ValueError):
         ops.set_tk_bwd_opts(4)  # skip-dQ is a raw-binding diagnostic only
+    # ECHOSPARSE_VSA_TK_BWD_STORE adds the store bit to the environment value; an explicit setting wins
+    monkeypatch.setenv(ops.TK_BWD_OPTS_ENV, "1")
+    monkeypatch.setenv(ops.TK_BWD_STORE_ENV, "1")
+    assert ops.resolve_tk_bwd_opts() == 1 | ops.TK_BWD_STORE_KV
+    try:
+        ops.set_tk_bwd_opts(2)
+        assert ops.resolve_tk_bwd_opts() == 2
+    finally:
+        ops.set_tk_bwd_opts(None)
+    monkeypatch.setenv(ops.TK_BWD_STORE_ENV, "0")
+    assert ops.resolve_tk_bwd_opts() == 1
+    monkeypatch.setenv(ops.TK_BWD_OPTS_ENV, "20")  # store + skip-dQ
+    with pytest.raises(ValueError):
+        ops.resolve_tk_bwd_opts()
 
 
 def test_tk_bwd_skip_dq_diagnostic_binding():

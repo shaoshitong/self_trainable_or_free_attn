@@ -703,3 +703,27 @@ def test_tk_ignores_generic_bwd_variant():
         pytest.skip("needs the SM90 TK backend")
     _, _, o = _small_full(backend="tk", bwd_variant=2)
     assert (o.grad_fn.bwd_variant, o.grad_fn.bwd_source) == (None, "tk")
+
+
+@pytest.mark.parametrize("nb", [12, 70])
+def test_speed_toggles_are_byte_exact(monkeypatch, nb):
+    """ECHOSPARSE_VSA_FUSED_COLS and ECHOSPARSE_VSA_COARSE_META_CACHE change launches, not values: the selection
+    and the forward output must be byte-identical with each toggle off and on (the cache also on a hit)."""
+    gen = torch.Generator().manual_seed(17 + nb)
+    B, H, D = 2, 2, 64
+    cnt = counts(nb, "mixed", gen)
+    q, k, v, gate = inputs(B, H, nb, D, torch.bfloat16, cnt, seed=17)
+    topk = max(1, nb // 4)
+    outs = {}
+    for fused in ("0", "1"):
+        monkeypatch.setenv("ECHOSPARSE_VSA_FUSED_COLS", fused)
+        sel = ops.route(q, k, cnt, R=16, topk=topk)
+        outs[fused] = (sel.q2k_ptr, sel.q2k_idx, sel.k2q_ptr, sel.k2q_idx)
+    for a, b in zip(outs["0"], outs["1"]):
+        assert torch.equal(a, b), "fused column stage changed the selection"
+    monkeypatch.delenv("ECHOSPARSE_VSA_FUSED_COLS")
+    ref_o = ops.vsa2_attention(q, k, v, gate, cnt, topk=topk, backend="generic")
+    monkeypatch.setenv(ops.COARSE_META_CACHE_ENV, "1")
+    for _ in range(2):  # miss, then hit
+        o = ops.vsa2_attention(q, k, v, gate, cnt, topk=topk, backend="generic")
+        assert torch.equal(o, ref_o), "cached coarse metadata changed the output"
