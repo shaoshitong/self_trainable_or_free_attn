@@ -88,8 +88,9 @@ std::vector<torch::Tensor> pool_fwd(torch::Tensor q, torch::Tensor k, torch::Ten
   auto qc = torch::zeros({B, H, NBc_pad, D}, opt);
   auto kc = torch::zeros({B, H, NBc_pad, D}, opt);
   auto vc = torch::zeros({B, H, NBc_pad, D}, opt);
-  PoolParams p{q.data_ptr(), k.data_ptr(), v.data_ptr(), qr.data_ptr(), kr.data_ptr(), qc.data_ptr(),
-               kc.data_ptr(), vc.data_ptr(), blk_cnt.data_ptr<int>(), B * H, L, NB, (int)R, G, Lr_pad, NBc_pad};
+  PoolParams p{q.data_ptr(),  k.data_ptr(),  v.data_ptr(),  qr.data_ptr(), kr.data_ptr(), qc.data_ptr(),
+               kc.data_ptr(), vc.data_ptr(), nullptr,       blk_cnt.data_ptr<int>(), B * H, L, NB, (int)R, G,
+               Lr_pad,        NBc_pad};
   launch_pool(p, D, dtype_of(q), cur_stream());
   check_launch();
   return {qr, kr, qc, kc, vc};
